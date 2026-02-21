@@ -1,3 +1,8 @@
+module purge
+module load 2025
+module load Anaconda3/2025.06-1
+module load CUDA/12.8.0
+cd $HOME/scratch/Hafeez_thesis/Can3Tok
 conda create -n can3tok python=3.11 -y
 
 conda activate can3tok 

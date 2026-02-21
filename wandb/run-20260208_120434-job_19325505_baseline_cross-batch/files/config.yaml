@@ -1,0 +1,77 @@
+_wandb:
+    value:
+        cli_version: 0.24.0
+        e:
+            pw5nq4zevmyfpc0rqj7wjox6flnf9yns:
+                args:
+                    - --log_dir
+                    - logs
+                    - --pattern
+                    - '*.out'
+                    - --project
+                    - Can3Tok-Semantic-All
+                    - --entity
+                    - 3D-SSC
+                    - --tags
+                    - all_experiments
+                codePath: upload_all_logs_to_wandb.py
+                codePathLocal: upload_all_logs_to_wandb.py
+                cpu_count: 48
+                cpu_count_logical: 96
+                disk:
+                    /:
+                        total: "107307073536"
+                        used: "9428865024"
+                email: hafeez.khan@student.uva.nl
+                executable: /gpfs/home2/yli11/.conda/envs/can3tok/bin/python
+                git:
+                    commit: 63b1ab7c602b7aaa4e8d74199fb210c4a669d7d7
+                    remote: https://github.com/Hafeezmhk7/Can3Tok.git
+                host: int4.local.snellius.surf.nl
+                memory:
+                    total: "269550804992"
+                os: Linux-5.14.0-570.76.1.el9_6.x86_64-x86_64-with-glibc2.34
+                program: /gpfs/work3/0/prjs1291/Hafeez_thesis/Can3Tok/upload_all_logs_to_wandb.py
+                python: CPython 3.11.14
+                root: /gpfs/work3/0/prjs1291/Hafeez_thesis/Can3Tok
+                startedAt: "2026-02-08T11:04:34.133694Z"
+                writerId: pw5nq4zevmyfpc0rqj7wjox6flnf9yns
+        m: []
+        python_version: 3.11.14
+        t:
+            "3":
+                - 2
+                - 13
+                - 14
+                - 15
+                - 16
+                - 61
+                - 62
+            "4": 3.11.14
+            "5": 0.24.0
+            "12": 0.24.0
+            "13": linux-x86_64
+balanced_sampling:
+    value: false
+batch_size:
+    value: 64
+cross_batch:
+    value: true
+job_id:
+    value: "19325505"
+kl_weight:
+    value: 0.0001
+learning_rate:
+    value: 0.0001
+num_gaussians:
+    value: null
+sampling_method:
+    value: opacity
+semantic_enabled:
+    value: false
+semantic_mode:
+    value: none
+train_scenes:
+    value: 600
+val_scenes:
+    value: 50

@@ -54,7 +54,7 @@ random_rotation = 1
 random_shuffle = 1
 
 resol = 200 # depends on the input size of VAE, or the number of Gaussians per scene
-data_path = f"/your/path/to/DL3DV-10K" 
+data_path = f"/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/train" 
 
 dummy_image_path = "/any/scene/from/DL3DV-10K/07d9f9724ca854fae07cb4c57d7ea22bf667d5decd4058f547728922f909956b/gaussian_splat/"
 
@@ -242,8 +242,29 @@ gs_autoencoder.to(device)
 optimizer = torch.optim.Adam(gs_autoencoder.parameters(), lr=1e-4, betas=[0.9, 0.999])
 
 
-gs_dataset = gs_dataset(data_path, resol = 128, random_permute = True, train=True)
-trainDataLoader = Data.DataLoader(dataset=gs_dataset, batch_size=bch_size, shuffle=True, num_workers=12) 
+# gs_dataset = gs_dataset(data_path, resol = 128, random_permute = True, train=True)
+# trainDataLoader = Data.DataLoader(dataset=gs_dataset, batch_size=bch_size, shuffle=True, num_workers=12) 
+
+# NEW:
+from gs_dataset_scenesplat import gs_dataset
+
+# Load SceneSplat-7K dataset
+gs_dataset_train = gs_dataset(
+    root=data_path,  # SceneSplat train path
+    resol=200,  # 200² = 40K Gaussians
+    random_permute=True,  # Data augmentation
+    train=True,
+    sampling_method='hybrid'  # Best quality
+)
+
+trainDataLoader = Data.DataLoader(
+    dataset=gs_dataset_train, 
+    batch_size=32,  # Adjust based on GPU memory (was 200)
+    shuffle=True, 
+    num_workers=4  # Adjust based on CPU cores
+)
+
+print(f"✅ Loaded {len(gs_dataset_train)} scenes from SceneSplat-7K")
 
 gen_vxs_from_pts = PointToVoxel(vsize_xyz=[0.2, 0.2, 0.2],
                    coors_range_xyz=[-8, -8, -8, 8, 8, 8],

@@ -1,0 +1,186 @@
+_wandb:
+    value:
+        cli_version: 0.24.0
+        e:
+            6ly3bqknny7xi04c5c9104ewslq9tyxu:
+                args:
+                    - --batch_size
+                    - "100"
+                    - --num_epochs
+                    - "1000"
+                    - --lr
+                    - "1e-3"
+                    - --kl_weight
+                    - "1e-3"
+                    - --eval_every
+                    - "20"
+                    - --failure_threshold
+                    - "1000"
+                    - --train_scenes
+                    - "600"
+                    - --val_scenes
+                    - "50"
+                    - --sampling_method
+                    - opacity
+                    - --segment_loss_weight
+                    - "0.2"
+                    - --instance_loss_weight
+                    - "0.0"
+                    - --semantic_temperature
+                    - "0.07"
+                    - --semantic_subsample
+                    - "2000"
+                    - --use_wandb
+                    - --wandb_project
+                    - Can3Tok-Semantic
+                    - --wandb_entity
+                    - 3D-SSC
+                codePath: gs_can3tok_2.py
+                codePathLocal: gs_can3tok_2.py
+                cpu_count: 64
+                cpu_count_logical: 64
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "405460799488"
+                        used: "6276128768"
+                email: hafeez.khan@student.uva.nl
+                executable: /home/yli11/.conda/envs/can3tok/bin/python
+                git:
+                    commit: 3d87fc63f29eeaf92a35cb824310c18d199f90b7
+                    remote: https://github.com/Hafeezmhk7/Can3Tok.git
+                gpu: NVIDIA H100
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "100485038080"
+                      name: NVIDIA H100
+                      uuid: GPU-05a2f73f-f377-6cd8-6b35-7e4f0fd3dcb8
+                host: gcn102.local.snellius.surf.nl
+                memory:
+                    total: "811317743616"
+                os: Linux-5.14.0-570.76.1.el9_6.x86_64-x86_64-with-glibc2.34
+                program: /gpfs/work3/0/prjs1291/Hafeez_thesis/Can3Tok/gs_can3tok_2.py
+                python: CPython 3.11.14
+                root: /gpfs/work3/0/prjs1291/Hafeez_thesis/Can3Tok
+                slurm:
+                    cluster_name: snellius
+                    conf: /var/spool/slurm/slurmd/conf-cache/slurm.conf
+                    cpus_on_node: "16"
+                    cpus_per_task: "9"
+                    eclibr: "0"
+                    ecplug: "1"
+                    erlast: sbatch
+                    ersbac: "1"
+                    export_env: ALL
+                    get_user_env: "1"
+                    gpus: "1"
+                    gpus_on_node: "1"
+                    gtids: "0"
+                    job_account: gusei16254
+                    job_cpus_per_node: "16"
+                    job_end_time: "1770178300"
+                    job_gid: "75272"
+                    job_gpus: "2"
+                    job_id: "19134942"
+                    job_name: can3tok_semantic
+                    job_nodelist: gcn102
+                    job_num_nodes: "1"
+                    job_partition: gpu_h100
+                    job_qos: normal
+                    job_start_time: "1770149499"
+                    job_uid: "75812"
+                    job_user: yli11
+                    jobid: "19134942"
+                    localid: "0"
+                    mem_per_node: "65536"
+                    nnodes: "1"
+                    nodeid: "0"
+                    nodelist: gcn102
+                    nprocs: "1"
+                    ntasks: "1"
+                    oom_kill_step: "0"
+                    prio_process: "0"
+                    procid: "0"
+                    script_context: prolog_task
+                    step_gres: gres/cpu:0
+                    submit_dir: /gpfs/work3/0/prjs1291/Hafeez_thesis/Can3Tok
+                    submit_host: int5.local.snellius.surf.nl
+                    task_pid: "1330743"
+                    tasks_per_node: "1"
+                    topology_addr: root.ibsw40.gcn102
+                    topology_addr_pattern: switch.switch.node
+                    tres_per_task: cpu=9
+                startedAt: "2026-02-03T20:11:52.295003Z"
+                writerId: 6ly3bqknny7xi04c5c9104ewslq9tyxu
+        m: []
+        python_version: 3.11.14
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+                - 5
+                - 9
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 103
+            "3":
+                - 13
+                - 15
+                - 16
+                - 61
+            "4": 3.11.14
+            "5": 0.24.0
+            "12": 0.24.0
+            "13": linux-x86_64
+architecture:
+    value: Can3Tok-Perceiver-VAE
+batch_size:
+    value: 100
+batches_per_epoch:
+    value: 6
+dataset:
+    value: SceneSplat-7K
+epochs:
+    value: 1000
+eval_every:
+    value: 20
+failure_threshold:
+    value: 1000
+instance_loss_weight:
+    value: 0
+kl_weight:
+    value: 0.001
+learning_rate:
+    value: 0.001
+model_config:
+    value: shapevae-256
+num_gaussians:
+    value: 40000
+num_train_scenes:
+    value: 600
+num_val_scenes:
+    value: 50
+sampling_method:
+    value: opacity
+sanity_check_mode:
+    value: false
+segment_loss_weight:
+    value: 0.2
+semantic_subsample:
+    value: 2000
+semantic_temperature:
+    value: 0.07
+train_scenes:
+    value: 600
+use_train_as_val:
+    value: false
+val_scenes:
+    value: 50
+validation_bug_fixed:
+    value: true

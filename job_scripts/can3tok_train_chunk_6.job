@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/can3tok_%j.out
+#SBATCH --output=logs/sw_0.1_geometric_rgb_n_sem_meas.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
@@ -52,7 +52,7 @@ echo ""
 # ────────────────────────────────────────────────────────────────────────────
 
 SEMANTIC_MODE="geometric"
-SEGMENT_WEIGHT=0.1              # ← Set > 0 to enable
+SEGMENT_WEIGHT=0.1             # ← Set > 0 to enable
 INSTANCE_WEIGHT=0.0             # Optional: instance-level loss
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -82,8 +82,9 @@ INSTANCE_WEIGHT=0.0             # Optional: instance-level loss
 # ────────────────────────────────────────────────────────────────────────────
 # Semantic Loss Additional Parameters (only used if SEGMENT_WEIGHT > 0)
 # ────────────────────────────────────────────────────────────────────────────
-SEMANTIC_TEMP=0.07              # Temperature for InfoNCE loss
+SEMANTIC_TEMP=0.1              # Temperature for InfoNCE loss
 SEMANTIC_SUBSAMPLE=10000        # Subsample Gaussians (saves memory/compute)
+SAMPLING_STRATEGY="balanced" # "random" or "balanced" sampling for semantic loss
 
 # ============================================================================
 # TRAINING HYPERPARAMETERS
@@ -95,7 +96,7 @@ LEARNING_RATE=1e-4
 KL_WEIGHT=1e-4               # VAE KL divergence weight
 RECON_SCALE=1.0              # Scale reconstruction loss
 EVAL_EVERY=10                   # Evaluate every N epochs
-FAILURE_THRESHOLD=150         # L2 error threshold for failure
+FAILURE_THRESHOLD=100         # L2 error threshold for failure
 
 # ============================================================================
 # DATASET CONFIGURATION
@@ -329,6 +330,7 @@ TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
 # W&B parameters
 if [ "$USE_WANDB" = "True" ]; then

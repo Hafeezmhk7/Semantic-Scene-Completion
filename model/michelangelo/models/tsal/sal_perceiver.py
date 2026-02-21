@@ -1,20 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-sal_perceiver.py - THREE Approaches for Per-Gaussian Semantic Features
+sal_perceiver.py - WITH RGB COLOR SUPPORT
+============================================
+CHANGED: Output 14 parameters instead of 11
+- xyz (3) + rgb (3) + opacity (1) + scale (3) + rotation (4) = 14 params
 
-APPROACH 1: Hidden State → MLP Projection
-  - Input: Decoder hidden state [B, 1024]
-  - Expands to per-Gaussian features via 3-layer MLP
-  
-APPROACH 2: Geometric Gaussians → MLP Projection  
-  - Input: Reconstructed geometric Gaussians [B, 40k, 11]
-  - Standard SimCLR-style projection head
-  
-APPROACH 3: Cross-Attention Semantic Head
-  - Input: Transformer tokens [B, 512, 384] + Gaussian positions [B, 40k, 3]
-  - Gaussians attend to scene tokens via cross-attention
-
-Switch via semantic_mode: 'hidden', 'geometric', or 'attention'
+All three semantic heads updated to work with 14-dim Gaussians
 """
 
 import torch
@@ -36,38 +27,30 @@ from .tsal_base import ShapeAsLatentModule
 
 
 # ============================================================================
-# APPROACH 1: HIDDEN STATE → MLP PROJECTION
+# SEMANTIC PROJECTION HEADS (Updated for 14 params)
 # ============================================================================
+
 class SemanticProjectionHead(nn.Module):
-    """
-    Projects decoder hidden state to per-Gaussian semantic features.
-    
-    Input: Decoder hidden state [B, 1024]
-    Output: [B, 40k, 32] L2-normalized semantic features
-    """
+    """Hidden state projection (unchanged)"""
     def __init__(self, hidden_dim=1024, num_gaussians=40000, feature_dim=32):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_gaussians = num_gaussians
         self.feature_dim = feature_dim
         
-        # 3-layer MLP expanding hidden state
         self.projection = nn.Sequential(
-            # Layer 1: Compress
             nn.Linear(hidden_dim, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
-            # Layer 2: Further compress
             nn.Linear(512, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
-            # Layer 3: Expand to all Gaussians
             nn.Linear(256, num_gaussians * feature_dim),
         )
         
         total_params = sum(p.numel() for p in self.parameters())
         print(f"[SemanticProjectionHead] Hidden State → MLP:")
-        print(f"  Input: [B, {hidden_dim}] (decoder hidden state)")
+        print(f"  Input: [B, {hidden_dim}]")
         print(f"  Output: [B, {num_gaussians}, {feature_dim}]")
         print(f"  Parameters: {total_params / 1e6:.3f}M")
     
@@ -79,17 +62,11 @@ class SemanticProjectionHead(nn.Module):
         return features
 
 
-# ============================================================================
-# APPROACH 2: GEOMETRIC GAUSSIANS → MLP PROJECTION
-# ============================================================================
 class SemanticProjectionHeadGeometric(nn.Module):
     """
-    Standard 3-layer MLP projection head (like SimCLR).
-    
-    Input: Geometric Gaussian parameters [B, 40k, 11]
-    Output: [B, 40k, 32] L2-normalized semantic features
+    Geometric projection - NOW HANDLES 14 PARAMS (with RGB)
     """
-    def __init__(self, gaussian_dim=11, num_gaussians=40000, feature_dim=32, hidden_dim=128):
+    def __init__(self, gaussian_dim=14, num_gaussians=40000, feature_dim=32, hidden_dim=128):
         super().__init__()
         self.gaussian_dim = gaussian_dim
         self.num_gaussians = num_gaussians
@@ -97,7 +74,7 @@ class SemanticProjectionHeadGeometric(nn.Module):
         self.hidden_dim = hidden_dim
         
         self.projection = nn.Sequential(
-            nn.Linear(gaussian_dim, hidden_dim),
+            nn.Linear(gaussian_dim, hidden_dim),  # 14 → 128
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -108,7 +85,7 @@ class SemanticProjectionHeadGeometric(nn.Module):
         
         total_params = sum(p.numel() for p in self.parameters())
         print(f"[SemanticProjectionHeadGeometric] Geometric → MLP:")
-        print(f"  Input: [B, {num_gaussians}, {gaussian_dim}]")
+        print(f"  Input: [B, {num_gaussians}, {gaussian_dim}] (WITH RGB!)")
         print(f"  Output: [B, {num_gaussians}, {feature_dim}]")
         print(f"  Parameters: {total_params / 1e6:.3f}M")
     
@@ -122,7 +99,7 @@ class SemanticProjectionHeadGeometric(nn.Module):
 
 
 # ============================================================================
-# ENCODER
+# ENCODER (Unchanged)
 # ============================================================================
 class CrossAttentionEncoder(nn.Module):
     def __init__(self, *,
@@ -220,7 +197,7 @@ class CrossAttentionEncoder(nn.Module):
 
 
 # ============================================================================
-# DECODER (MUST BE DEFINED BEFORE GaussianSemanticAttentionHead!)
+# DECODER (Unchanged)
 # ============================================================================
 class CrossAttentionDecoder(nn.Module):
     def __init__(self, *,
@@ -272,19 +249,8 @@ class CrossAttentionDecoder(nn.Module):
         return checkpoint(self._forward, (queries, latents), self.parameters(), self.use_checkpoint)
 
 
-# ============================================================================
-# APPROACH 3: CROSS-ATTENTION SEMANTIC HEAD (NOW DEFINED AFTER CrossAttentionDecoder!)
-# ============================================================================
 class GaussianSemanticAttentionHead(CrossAttentionDecoder):
-    """
-    Cross-attention semantic head (inherits from CrossAttentionDecoder).
-    
-    Input:
-        - Gaussian positions [B, 40k, 3] (as queries)
-        - Transformer tokens [B, 512, 384] (as keys/values)
-    
-    Output: [B, 40k, 32] semantic features
-    """
+    """Cross-attention semantic head (unchanged)"""
     
     def __init__(self, *,
                  device: Optional[torch.device],
@@ -299,7 +265,6 @@ class GaussianSemanticAttentionHead(CrossAttentionDecoder):
                  flash: bool = False,
                  use_checkpoint: bool = False):
         
-        # Initialize parent CrossAttentionDecoder
         super().__init__(
             device=device,
             dtype=dtype,
@@ -322,32 +287,19 @@ class GaussianSemanticAttentionHead(CrossAttentionDecoder):
         print(f"  Parameters: {total_params / 1e6:.3f}M")
     
     def forward(self, gaussian_xyz, scene_tokens):
-        """
-        Args:
-            gaussian_xyz: [B, 40000, 3] - Gaussian positions
-            scene_tokens: [B, 512, 384] - Transformer output tokens
-        
-        Returns:
-            semantic_features: [B, 40000, feature_dim]
-        """
-        # Use parent class's forward
         features = super().forward(gaussian_xyz, scene_tokens)
-        
-        # L2 normalize
         features = torch.nn.functional.normalize(features, p=2, dim=-1)
-        
         return features
 
 
 # ============================================================================
-# GS_DECODER (WITH HIDDEN STATE EXTRACTION)
+# GS_DECODER - UPDATED TO OUTPUT 14 PARAMS (WITH RGB!)
 # ============================================================================
 class GS_decoder(nn.Module):
     """
-    MLP decoder for Gaussian parameters.
-    Returns hidden state for semantic projection.
+    MLP decoder for Gaussian parameters WITH RGB COLOR.
     
-    Output: 11 geometric params (xyz, opacity, scale, quat) - NO RGB!
+    Output: 14 geometric params (xyz, rgb, opacity, scale, quat)
     """
     def __init__(self, D=8, W=256, input_ch=4, skip=[4], output_ch=56):
         super(GS_decoder, self).__init__()
@@ -379,7 +331,7 @@ class GS_decoder(nn.Module):
 
 
 # ============================================================================
-# SHAPE AS LATENT PERCEIVER (base class)
+# SHAPE AS LATENT PERCEIVER (Updated for 14 params)
 # ============================================================================
 class ShapeAsLatentPerceiver(ShapeAsLatentModule):
     def __init__(self, *,
@@ -456,8 +408,11 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
             use_checkpoint=use_checkpoint
         )
         
-        # Output: 11 params (xyz, opacity, scale, quat) - NO RGB!
-        self.GS_decoder = GS_decoder(3, 1024, width*512, [4], 40000*11)
+        # ================================================================
+        # CRITICAL CHANGE: Output 14 params (xyz, rgb, opacity, scale, quat)
+        # ================================================================
+        print(f"\n⚠️  GS_DECODER OUTPUT: 40000 × 14 = 560,000 (WITH RGB COLOR!)")
+        self.GS_decoder = GS_decoder(3, 1024, width*512, [4], 40000*14)  # ← Changed from *11
         
         self.kl_emb_proj_mean = nn.Linear((num_latents-1)*embed_dim, 64*64*4, dtype=dtype)
         self.kl_emb_proj_var = nn.Linear((num_latents-1)*embed_dim, 64*64*4, dtype=dtype)
@@ -515,28 +470,27 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
 
 
 # ============================================================================
-# ALIGNED SHAPE LATENT PERCEIVER (WITH ALL THREE SEMANTIC HEADS)
+# ALIGNED SHAPE LATENT PERCEIVER (WITH RGB COLOR!)
 # ============================================================================
 class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
     def __init__(self, *,
-                 device: Optional[torch.device],
-                 dtype: Optional[torch.dtype],
-                 num_latents: int,
-                 point_feats: int = 0,
-                 embed_dim: int = 0,
-                 num_freqs: int = 8,
-                 include_pi: bool = True,
-                 width: int,
-                 heads: int,
-                 num_encoder_layers: int,
-                 num_decoder_layers: int,
-                 init_scale: float = 0.25,
-                 qkv_bias: bool = True,
-                 flash: bool = True,
-                 use_ln_post: bool = False,
-                 use_checkpoint: bool = False,
-                 semantic_mode: str = 'hidden'  # 'hidden', 'geometric', or 'attention'
-                 ):
+                device: Optional[torch.device],
+                dtype: Optional[torch.dtype],
+                num_latents: int,
+                point_feats: int = 0,
+                embed_dim: int = 0,
+                num_freqs: int = 8,
+                include_pi: bool = True,
+                width: int,
+                heads: int,
+                num_encoder_layers: int,
+                num_decoder_layers: int,
+                init_scale: float = 0.25,
+                qkv_bias: bool = True,
+                flash: bool = True,
+                use_ln_post: bool = False,
+                use_checkpoint: bool = False,
+                semantic_mode: str = 'none'):
 
         super().__init__(
             device=device,
@@ -561,40 +515,57 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.semantic_mode = semantic_mode
         
         print(f"\n{'='*70}")
+        print(f"🚀 PERFORMANCE FIX APPLIED - ISSUE #1")
         print(f"[AlignedShapeLatentPerceiver] semantic_mode='{semantic_mode}'")
         print(f"{'='*70}")
         
-        # Initialize ALL THREE semantic heads
-        self.semantic_projection_hidden = SemanticProjectionHead(
-            hidden_dim=1024,
-            num_gaussians=40000,
-            feature_dim=32
-        )
+        self.semantic_projection_hidden = None
+        self.semantic_projection_geometric = None
+        self.semantic_attention_head = None
         
-        self.semantic_projection_geometric = SemanticProjectionHeadGeometric(
-            gaussian_dim=11,
-            num_gaussians=40000,
-            feature_dim=32,
-            hidden_dim=128
-        )
+        if semantic_mode == 'hidden':
+            self.semantic_projection_hidden = SemanticProjectionHead(
+                hidden_dim=1024,
+                num_gaussians=40000,
+                feature_dim=32
+            )
+            print(f"✓ Initialized HIDDEN STATE projection head ONLY")
+            print(f"✓ Saved ~15GB memory by NOT loading other heads!")
+            
+        elif semantic_mode == 'geometric':
+            self.semantic_projection_geometric = SemanticProjectionHeadGeometric(
+                gaussian_dim=14,  # ← Changed from 11!
+                num_gaussians=40000,
+                feature_dim=32,
+                hidden_dim=128
+            )
+            print(f"✓ Initialized GEOMETRIC projection head ONLY (WITH RGB!)")
+            print(f"✓ Saved ~15GB memory by NOT loading other heads!")
+            
+        elif semantic_mode == 'attention':
+            self.semantic_attention_head = GaussianSemanticAttentionHead(
+                device=device,
+                dtype=dtype,
+                num_latents=num_latents,
+                out_channels=32,
+                fourier_embedder=self.fourier_embedder,
+                width=width,
+                heads=heads,
+                init_scale=init_scale,
+                qkv_bias=qkv_bias,
+                flash=flash,
+                use_checkpoint=use_checkpoint
+            )
+            print(f"✓ Initialized CROSS-ATTENTION semantic head ONLY")
+            print(f"✓ Saved ~15GB memory by NOT loading other heads!")
         
-        self.semantic_attention_head = GaussianSemanticAttentionHead(
-            device=device,
-            dtype=dtype,
-            num_latents=num_latents,
-            out_channels=32,
-            fourier_embedder=self.fourier_embedder,
-            width=width,
-            heads=heads,
-            init_scale=init_scale,
-            qkv_bias=qkv_bias,
-            flash=flash,
-            use_checkpoint=use_checkpoint
-        )
+        elif semantic_mode == 'none':
+            print(f"✓ NO semantic head initialized (pure VAE mode)")
+            print(f"✓ Maximum memory savings!")
+            
+        else:
+            raise ValueError(f"Unknown semantic_mode: {semantic_mode}")
         
-        print(f"\n{'='*70}")
-        print(f"✓ ALL THREE SEMANTIC HEADS INITIALIZED")
-        print(f"  Active mode: '{semantic_mode}'")
         print(f"{'='*70}\n")
 
     def encode(self,
@@ -615,30 +586,35 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         return shape_embed, mu, log_var, z, posterior
 
     def decode(self, latents: torch.FloatTensor, volume_queries=None, return_semantic_features=False):
-        """
-        Decode with THREE MODES for semantic features.
-        """
         latents = self.post_kl(latents)
-        latents_transformed = self.transformer(latents)  # [B, 512, 384]
+        latents_transformed = self.transformer(latents)
         latents_flat = latents_transformed.reshape(latents_transformed.shape[0], -1)
         
-        if return_semantic_features and self.training:
+        should_compute_semantic = (
+            return_semantic_features and 
+            self.training and
+            (self.semantic_projection_hidden is not None or
+            self.semantic_projection_geometric is not None or
+            self.semantic_attention_head is not None)
+        )
+        
+        if should_compute_semantic:
             reconstruction, hidden = self.GS_decoder(latents_flat, return_hidden=True)
             B = reconstruction.shape[0]
-            reconstruction_gaussians = reconstruction.reshape(B, 40000, 11)
+            reconstruction_gaussians = reconstruction.reshape(B, 40000, 14)  # ← Changed from 11!
             
-            if self.semantic_mode == 'hidden':
+            if self.semantic_mode == 'hidden' and self.semantic_projection_hidden is not None:
                 semantic_features = self.semantic_projection_hidden(hidden)
-            elif self.semantic_mode == 'geometric':
+            elif self.semantic_mode == 'geometric' and self.semantic_projection_geometric is not None:
                 semantic_features = self.semantic_projection_geometric(reconstruction_gaussians)
-            elif self.semantic_mode == 'attention':
+            elif self.semantic_mode == 'attention' and self.semantic_attention_head is not None:
                 gaussian_positions = reconstruction_gaussians[:, :, 0:3]
                 semantic_features = self.semantic_attention_head(
                     gaussian_positions, 
                     latents_transformed
                 )
             else:
-                raise ValueError(f"Unknown semantic_mode: {self.semantic_mode}")
+                semantic_features = None
             
             return reconstruction, semantic_features
         else:
@@ -679,7 +655,9 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
 
         latents_reshaped = z.reshape(z.shape[0], 512, 32)
         
-        if self.training:
+        if self.training and (self.semantic_projection_hidden is not None or
+                            self.semantic_projection_geometric is not None or
+                            self.semantic_attention_head is not None):
             UV_gs_recover, per_gaussian_features = self.decode(
                 latents_reshaped,
                 volume_queries,

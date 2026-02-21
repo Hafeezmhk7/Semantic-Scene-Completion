@@ -5,7 +5,7 @@ from torch import nn
 from einops import rearrange
 from transformers import CLIPModel
 
-from Michelangelo.michelangelo.models.tsal.tsal_base import AlignedShapeAsLatentModule
+from model.michelangelo.models.tsal.tsal_base import AlignedShapeAsLatentModule
 
 
 class CLIPAlignedShapeAsLatentModule(AlignedShapeAsLatentModule):
@@ -68,51 +68,55 @@ class CLIPAlignedShapeAsLatentModule(AlignedShapeAsLatentModule):
         x = self.clip_model.get_text_features(text)
         return x
 
-    def forward(self, surface, image, text):
-        """
+    def forward(self,
+            surface: torch.FloatTensor,
+            image: torch.FloatTensor,
+            text: torch.FloatTensor,
+            volume_queries: torch.FloatTensor):
+    
+    pc = surface[..., :4]
+    feats = surface[..., 4:]
+    
+    # Encode
+    shape_embed, mu, log_var, shape_zq, posterior = self.shape_model.encode(
+        pc=surface, feats=surface, sample_posterior=True
+    )
+    
+    # Decode with semantic features if training
+    if self.training:
+        UV_gs_recover, per_gaussian_features = self.shape_model.decode(
+            shape_zq.reshape([shape_zq.shape[0], 512, 32]), 
+            volume_queries,
+            return_semantic_features=True
+        )
+    else:
+        UV_gs_recover = self.shape_model.decode(
+            shape_zq.reshape([shape_zq.shape[0], 512, 32]), 
+            volume_queries,
+            return_semantic_features=False
+        )
+        per_gaussian_features = None
+    
+    return shape_embed, mu, log_var, shape_zq, UV_gs_recover, per_gaussian_features
 
-        Args:
-            surface (torch.FloatTensor):
-            image (torch.FloatTensor): [bs, 3, 224, 224]
-            text (torch.LongTensor): [bs, num_templates, 77]
 
-        Returns:
-            embed_outputs (dict): the embedding outputs, and it contains:
-                - image_embed (torch.FloatTensor):
-                - text_embed (torch.FloatTensor):
-                - shape_embed (torch.FloatTensor):
-                - logit_scale (float):
-        """
+    def encode(self, surface: torch.FloatTensor, sample_posterior=True):
+        pc = surface[..., 0:3]
+        feats = surface[..., 3:]
 
-        # # text embedding
-        # text_embed_all = []
-        # for i in range(text.shape[0]):
-        #     text_for_one_sample = text[i]
-        #     text_embed = self.encode_text_embed(text_for_one_sample)
-        #     text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
-        #     text_embed = text_embed.mean(dim=0)
-        #     text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
-        #     text_embed_all.append(text_embed)
-        # text_embed_all = torch.stack(text_embed_all)
+        shape_embed, mu, log_var, shape_zq, posterior = self.shape_model.encode(
+            pc=pc, feats=feats, sample_posterior=sample_posterior
+        )
 
-        b = text.shape[0]
-        text_tokens = rearrange(text, "b t l -> (b t) l")
-        text_embed = self.encode_text_embed(text_tokens)
-        text_embed = rearrange(text_embed, "(b t) d -> b t d", b=b)
-        text_embed = text_embed.mean(dim=1)
-        text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
+        # No per_gaussian_features during encode anymore
+        return shape_embed, mu, log_var, shape_zq, posterior, None
 
-        # image embedding
-        image_embed = self.encode_image_embed(image)
 
-        # shape embedding
-        shape_embed, shape_latents = self.encode_shape_embed(surface, return_latents=True)
+    def decode(self,
+            z_q,
+            bounds: Union[Tuple[float], List[float], float] = 1.1,
+            octree_depth: int = 7,
+            num_chunks: int = 10000) -> List[Latent2MeshOutput]:
 
-        embed_outputs = {
-            "image_embed": image_embed,
-            "text_embed": text_embed,
-            "shape_embed": shape_embed,
-            "logit_scale": self.clip_model.logit_scale.exp()
-        }
-
-        return embed_outputs, shape_latents
+        latents = self.shape_model.decode(z_q, return_semantic_features=False)
+        return latents

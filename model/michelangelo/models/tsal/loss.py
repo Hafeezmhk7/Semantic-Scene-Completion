@@ -5,9 +5,9 @@ import torch.nn.functional as F
 
 from typing import Optional, Tuple, Dict
 
-from Michelangelo.michelangelo.models.modules.distributions import DiagonalGaussianDistribution
-from Michelangelo.michelangelo.utils.eval import compute_psnr
-from Michelangelo.michelangelo.utils import misc
+from model.michelangelo.models.modules.distributions import DiagonalGaussianDistribution
+from model.michelangelo.utils.eval import compute_psnr
+from model.michelangelo.utils import misc
 
 
 class KLNearFar(nn.Module):

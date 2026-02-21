@@ -1,0 +1,408 @@
+================================================================================
+               CAN3TOK TRAINING - SEMANTIC LEARNING CONTROL
+================================================================================
+Job ID: 19324907
+Node: gcn118
+Start time: Sun Feb  8 00:59:46 CET 2026
+
+════════════════════════════════════════════════════════════════════════════════
+                        CONFIGURATION SUMMARY
+════════════════════════════════════════════════════════════════════════════════
+
+📋 JOB INFORMATION:
+   Job ID:            19324907
+   Partition:         gpu_h100
+   Node:              gcn118
+   GPUs:              1
+   CPUs:              9
+   Memory:            64GB
+   Time Limit:        12:00:00
+
+🧠 SEMANTIC LEARNING:
+   Status:            ✅ ENABLED
+   Mode:              GEOMETRIC
+
+   Loss Weights:
+      Segment (β):    10
+      Instance (γ):   0.0
+      Temperature:    0.07
+      Subsample:      10000 Gaussians
+
+   Architecture Details:
+      Approach:       Geometric Gaussians → MLP (SimCLR-style)
+      Input:          [B, 40k, 11] reconstructed Gaussians
+      Output:         [B, 40k, 32] semantic features
+      Parameters:     ~45K (very lightweight!)
+      Memory Usage:   ~20GB GPU
+      Training Speed: ⚡⚡⚡ Fast
+      Best For:       ⭐ Standard semantic learning
+      Notes:          Most efficient, recommended for most cases
+
+   Loss Composition:
+      Total = (Recon / 1.0) + (1e-4 × KL) + Semantic
+      Semantic = (10 × Segment) + (0.0 × Instance)
+
+⚙️  TRAINING HYPERPARAMETERS:
+   Batch Size:        64
+   Epochs:            100
+   Learning Rate:     1e-4
+   KL Weight:         1e-4
+   Recon Scale:       1.0
+   Eval Every:        10 epochs
+   Failure Thresh:    150
+
+📊 DATASET:
+   Training Scenes:   600
+   Val Scenes:        50
+   Sampling:          OPACITY
+   Dataset:           SceneSplat-7K (ScanNet72 labels)
+   Semantic Classes:  72 categories (38 main + 34 rare)
+
+📈 LOGGING:
+   W&B:               ❌ Disabled
+   Checkpoints:       Every 10 epochs
+   Best Model:        Tracked by val L2 error
+   Output Log:        logs/can3tok_19324907.out
+
+🎯 EXPECTED PERFORMANCE:
+   Initial L2:        ~19,000 (random)
+   Target L2:         ~3,000-5,000 (converged)
+   Failure if:        L2 > 150
+
+   Semantic Loss:
+      Initial:        ~4.28 (log(72), random features)
+      Target:         ~0.5-1.5 (learned clusters)
+      ⚠️  Watch:       Should decrease steadily
+
+════════════════════════════════════════════════════════════════════════════════
+
+🔧 Setting up environment...
+   ✓ Modules loaded
+   ✓ Conda environment: can3tok
+   ✓ Working directory: /home/yli11/scratch/Hafeez_thesis/Can3Tok
+
+
+🚀 Building training command...
+Command:
+python  gs_can3tok_2.py --batch_size 64 --num_epochs 100 --lr 1e-4 --kl_weight 1e-4 --eval_every 10 --failure_threshold 150 --recon_scale 1.0 --train_scenes 600 --val_scenes 50 --sampling_method opacity --semantic_mode geometric --segment_loss_weight 10 --instance_loss_weight 0.0 --semantic_temperature 0.07 --semantic_subsample 10000 --sampling_strategy balanced
+
+════════════════════════════════════════════════════════════════════════════════
+                          STARTING TRAINING
+════════════════════════════════════════════════════════════════════════════════
+
+✗ Weights & Biases disabled
+
+======================================================================
+🚀 CAN3TOK TRAINING - IMPROVED VERSION
+======================================================================
+Configuration:
+  Job ID: 19324907
+  Semantic Mode (requested): geometric
+  Semantic Mode (effective): geometric
+  Semantic Enabled: True
+
+  🧠 SEMANTIC LEARNING: ✅ ENABLED
+     Mode: geometric
+     Segment weight (β): 10.0
+     Instance weight (γ): 0.0
+     Temperature (τ): 0.07
+     Subsample: 10000
+
+  Device: cuda:0
+  Batch size: 64
+  Epochs: 100
+  Learning rate: 0.0001
+  KL weight: 0.0001
+  Save path: /home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/job_19324907_geometric_beta10.0/
+======================================================================
+
+Loading model configuration...
+✓ Loaded YAML config
+✓ Overriding with command-line arguments...
+   semantic_mode: geometric
+
+======================================================================
+INSTANTIATING MODEL
+======================================================================
+
+======================================================================
+🚀 PERFORMANCE FIX APPLIED - ISSUE #1
+[AlignedShapeLatentPerceiver] semantic_mode='geometric'
+======================================================================
+[SemanticProjectionHeadGeometric] Geometric → MLP:
+  Input: [B, 40000, 11]
+  Output: [B, 40000, 32]
+  Parameters: 0.023M
+✓ Initialized GEOMETRIC projection head ONLY
+✓ Saved ~15GB memory by NOT loading other heads!
+======================================================================
+
+✓ Model instantiated successfully
+======================================================================
+
+✓ Model loaded successfully
+
+Loading datasets...
+
+======================================================================
+TRAINING DATASET
+======================================================================
+  Limited to 600 scenes (out of 3888 available)
+✓ Loaded 600 scenes from /home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6
+✓ Sampling method: opacity
+✓ Dataset type: ScanNet72 with 72 categories
+✓ Missing categories in dataset: [13, 53, 61] (never appear)
+✓ Expected InfoNCE loss with random features: log(72) ≈ 4.2767
+======================================================================
+VALIDATION DATASET
+======================================================================
+  Limited to 50 scenes (out of 100 available)
+✓ Loaded 50 scenes from /home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/val
+✓ Sampling method: opacity
+✓ Dataset type: ScanNet72 with 72 categories
+✓ Missing categories in dataset: [13, 53, 61] (never appear)
+✓ Expected InfoNCE loss with random features: log(72) ≈ 4.2767
+======================================================================
+DATASET SUMMARY
+======================================================================
+✓ Training: 600 scenes, 10 batches
+✓ Validation: 50 scenes, 1 batches
+✓ Sampling method: opacity
+======================================================================
+
+======================================================================
+STARTING TRAINING
+🧠 SEMANTIC LEARNING ENABLED (mode: geometric)
+======================================================================
+
+Epoch 0/100 | Loss: 299.17 | Recon: 272.30 | KL: 6527.22 | Semantic: 26.2217
+
+======================================================================
+VALIDATION (Epoch 0)
+======================================================================
+  L2 Error: 199.83 ± 74.99
+  Failure Rate: 64.00%
+  ✓ New best model! (L2: 199.83)
+======================================================================
+
+Epoch 1/100 | Loss: 237.66 | Recon: 212.29 | KL: 875.24 | Semantic: 25.2815
+Epoch 2/100 | Loss: 254.03 | Recon: 228.26 | KL: 565.61 | Semantic: 25.7093
+Epoch 3/100 | Loss: 229.96 | Recon: 205.47 | KL: 407.79 | Semantic: 24.4432
+Epoch 4/100 | Loss: 249.70 | Recon: 224.10 | KL: 321.31 | Semantic: 25.5730
+Epoch 5/100 | Loss: 217.50 | Recon: 191.61 | KL: 262.19 | Semantic: 25.8606
+Epoch 6/100 | Loss: 230.98 | Recon: 205.10 | KL: 219.78 | Semantic: 25.8598
+Epoch 7/100 | Loss: 243.37 | Recon: 218.15 | KL: 189.27 | Semantic: 25.2018
+Epoch 8/100 | Loss: 203.74 | Recon: 177.80 | KL: 164.58 | Semantic: 25.9281
+Epoch 9/100 | Loss: 272.30 | Recon: 248.67 | KL: 144.84 | Semantic: 23.6140
+Epoch 10/100 | Loss: 231.69 | Recon: 206.31 | KL: 127.82 | Semantic: 25.3661
+
+======================================================================
+VALIDATION (Epoch 10)
+======================================================================
+  L2 Error: 193.67 ± 70.50
+  Failure Rate: 54.00%
+  ✓ New best model! (L2: 193.67)
+======================================================================
+
+✓ Checkpoint saved: epoch_10.pth
+Epoch 11/100 | Loss: 221.57 | Recon: 196.85 | KL: 115.21 | Semantic: 24.7041
+Epoch 12/100 | Loss: 264.76 | Recon: 238.60 | KL: 103.48 | Semantic: 26.1486
+Epoch 13/100 | Loss: 216.22 | Recon: 190.63 | KL: 93.16 | Semantic: 25.5867
+Epoch 14/100 | Loss: 274.65 | Recon: 251.01 | KL: 86.01 | Semantic: 23.6361
+Epoch 15/100 | Loss: 217.09 | Recon: 192.85 | KL: 79.35 | Semantic: 24.2333
+Epoch 16/100 | Loss: 236.30 | Recon: 212.28 | KL: 74.62 | Semantic: 24.0171
+Epoch 17/100 | Loss: 241.18 | Recon: 216.46 | KL: 75.17 | Semantic: 24.7207
+Epoch 18/100 | Loss: 234.69 | Recon: 209.15 | KL: 129.72 | Semantic: 25.5338
+Epoch 19/100 | Loss: 226.05 | Recon: 200.43 | KL: 13698.51 | Semantic: 24.2459
+Epoch 20/100 | Loss: 225.08 | Recon: 197.71 | KL: 8254.37 | Semantic: 26.5424
+
+======================================================================
+VALIDATION (Epoch 20)
+======================================================================
+  L2 Error: 183.47 ± 67.42
+  Failure Rate: 50.00%
+  ✓ New best model! (L2: 183.47)
+======================================================================
+
+✓ Checkpoint saved: epoch_20.pth
+Epoch 21/100 | Loss: 220.13 | Recon: 194.68 | KL: 11804.43 | Semantic: 24.2695
+Epoch 22/100 | Loss: 245.51 | Recon: 220.28 | KL: 2064.99 | Semantic: 25.0207
+Epoch 23/100 | Loss: 220.39 | Recon: 194.81 | KL: 2260.80 | Semantic: 25.3473
+Epoch 24/100 | Loss: 207.53 | Recon: 182.41 | KL: 1452.94 | Semantic: 24.9678
+Epoch 25/100 | Loss: 212.45 | Recon: 186.67 | KL: 873.15 | Semantic: 25.6945
+Epoch 26/100 | Loss: 246.60 | Recon: 222.27 | KL: 1246.37 | Semantic: 24.2005
+Epoch 27/100 | Loss: 220.61 | Recon: 195.30 | KL: 1072.69 | Semantic: 25.2034
+Epoch 28/100 | Loss: 262.69 | Recon: 238.67 | KL: 844.10 | Semantic: 23.9371
+Epoch 29/100 | Loss: 169.17 | Recon: 143.14 | KL: 996.35 | Semantic: 25.9230
+Epoch 30/100 | Loss: 211.50 | Recon: 185.70 | KL: 1078.71 | Semantic: 25.6884
+
+======================================================================
+VALIDATION (Epoch 30)
+======================================================================
+  L2 Error: 170.55 ± 58.37
+  Failure Rate: 48.00%
+  ✓ New best model! (L2: 170.55)
+======================================================================
+
+✓ Checkpoint saved: epoch_30.pth
+Epoch 31/100 | Loss: 178.84 | Recon: 153.14 | KL: 1472.37 | Semantic: 25.5527
+Epoch 32/100 | Loss: 192.06 | Recon: 166.40 | KL: 2983.68 | Semantic: 25.3606
+Epoch 33/100 | Loss: 172.83 | Recon: 147.07 | KL: 3092.28 | Semantic: 25.4471
+Epoch 34/100 | Loss: 165.14 | Recon: 138.30 | KL: 11621.48 | Semantic: 25.6814
+Epoch 35/100 | Loss: 176.04 | Recon: 149.08 | KL: 5552.00 | Semantic: 26.4102
+Epoch 36/100 | Loss: 153.26 | Recon: 126.79 | KL: 5051.56 | Semantic: 25.9674
+Epoch 37/100 | Loss: 134.31 | Recon: 107.35 | KL: 6036.11 | Semantic: 26.3575
+Epoch 38/100 | Loss: 190.21 | Recon: 165.46 | KL: 4099.58 | Semantic: 24.3435
+Epoch 39/100 | Loss: 113.79 | Recon: 88.66 | KL: 2620.21 | Semantic: 24.8617
+Epoch 40/100 | Loss: 193.16 | Recon: 168.10 | KL: 2419.41 | Semantic: 24.8157
+
+======================================================================
+VALIDATION (Epoch 40)
+======================================================================
+  L2 Error: 141.27 ± 45.17
+  Failure Rate: 28.00%
+  ✓ New best model! (L2: 141.27)
+======================================================================
+
+✓ Checkpoint saved: epoch_40.pth
+Epoch 41/100 | Loss: 137.21 | Recon: 111.47 | KL: 2045.11 | Semantic: 25.5341
+Epoch 42/100 | Loss: 139.42 | Recon: 112.53 | KL: 2086.59 | Semantic: 26.6749
+Epoch 43/100 | Loss: 147.91 | Recon: 122.24 | KL: 2468.49 | Semantic: 25.4177
+Epoch 44/100 | Loss: 189.87 | Recon: 165.55 | KL: 3207.79 | Semantic: 23.9944
+Epoch 45/100 | Loss: 159.70 | Recon: 134.09 | KL: 3342.79 | Semantic: 25.2822
+Epoch 46/100 | Loss: 146.07 | Recon: 120.67 | KL: 3210.46 | Semantic: 25.0772
+Epoch 47/100 | Loss: 132.48 | Recon: 107.58 | KL: 3129.49 | Semantic: 24.5905
+Epoch 48/100 | Loss: 148.82 | Recon: 122.93 | KL: 2908.41 | Semantic: 25.6018
+Epoch 49/100 | Loss: 144.91 | Recon: 120.34 | KL: 2484.48 | Semantic: 24.3161
+Epoch 50/100 | Loss: 115.10 | Recon: 90.13 | KL: 2118.23 | Semantic: 24.7587
+
+======================================================================
+VALIDATION (Epoch 50)
+======================================================================
+  L2 Error: 137.18 ± 43.70
+  Failure Rate: 26.00%
+  ✓ New best model! (L2: 137.18)
+======================================================================
+
+✓ Checkpoint saved: epoch_50.pth
+Epoch 51/100 | Loss: 119.08 | Recon: 92.03 | KL: 2078.52 | Semantic: 26.8352
+Epoch 52/100 | Loss: 132.91 | Recon: 107.28 | KL: 2153.94 | Semantic: 25.4069
+Epoch 53/100 | Loss: 129.68 | Recon: 103.23 | KL: 2077.80 | Semantic: 26.2359
+Epoch 54/100 | Loss: 129.65 | Recon: 104.56 | KL: 1982.17 | Semantic: 24.8936
+Epoch 55/100 | Loss: 117.56 | Recon: 91.72 | KL: 2223.82 | Semantic: 25.6169
+Epoch 56/100 | Loss: 146.52 | Recon: 120.62 | KL: 2398.32 | Semantic: 25.6541
+Epoch 57/100 | Loss: 130.03 | Recon: 105.62 | KL: 2969.28 | Semantic: 24.1083
+Epoch 58/100 | Loss: 122.52 | Recon: 96.94 | KL: 4100.06 | Semantic: 25.1628
+Epoch 59/100 | Loss: 121.28 | Recon: 95.15 | KL: 5652.05 | Semantic: 25.5565
+Epoch 60/100 | Loss: 128.29 | Recon: 102.58 | KL: 4428.48 | Semantic: 25.2610
+
+======================================================================
+VALIDATION (Epoch 60)
+======================================================================
+  L2 Error: 136.51 ± 43.33
+  Failure Rate: 26.00%
+  ✓ New best model! (L2: 136.51)
+======================================================================
+
+✓ Checkpoint saved: epoch_60.pth
+Epoch 61/100 | Loss: 172.42 | Recon: 147.45 | KL: 3370.40 | Semantic: 24.6305
+Epoch 62/100 | Loss: 124.04 | Recon: 98.48 | KL: 2907.55 | Semantic: 25.2621
+Epoch 63/100 | Loss: 123.74 | Recon: 97.86 | KL: 2572.71 | Semantic: 25.6249
+Epoch 64/100 | Loss: 126.20 | Recon: 99.99 | KL: 2606.76 | Semantic: 25.9492
+Epoch 65/100 | Loss: 141.31 | Recon: 115.35 | KL: 3073.98 | Semantic: 25.6581
+Epoch 66/100 | Loss: 144.94 | Recon: 119.81 | KL: 3022.76 | Semantic: 24.8293
+Epoch 67/100 | Loss: 141.01 | Recon: 115.46 | KL: 2492.63 | Semantic: 25.2995
+Epoch 68/100 | Loss: 133.04 | Recon: 107.95 | KL: 2446.71 | Semantic: 24.8464
+Epoch 69/100 | Loss: 166.55 | Recon: 142.25 | KL: 2646.71 | Semantic: 24.0414
+Epoch 70/100 | Loss: 119.84 | Recon: 95.03 | KL: 2509.24 | Semantic: 24.5661
+
+======================================================================
+VALIDATION (Epoch 70)
+======================================================================
+  L2 Error: 135.65 ± 41.22
+  Failure Rate: 26.00%
+  ✓ New best model! (L2: 135.65)
+======================================================================
+
+✓ Checkpoint saved: epoch_70.pth
+Epoch 71/100 | Loss: 138.19 | Recon: 112.51 | KL: 2628.81 | Semantic: 25.4238
+Epoch 72/100 | Loss: 148.76 | Recon: 122.06 | KL: 2583.93 | Semantic: 26.4496
+Epoch 73/100 | Loss: 130.97 | Recon: 105.36 | KL: 2416.20 | Semantic: 25.3711
+Epoch 74/100 | Loss: 117.85 | Recon: 91.96 | KL: 2439.72 | Semantic: 25.6518
+Epoch 75/100 | Loss: 109.19 | Recon: 85.64 | KL: 2385.68 | Semantic: 23.3155
+Epoch 76/100 | Loss: 113.29 | Recon: 87.20 | KL: 2419.46 | Semantic: 25.8486
+Epoch 77/100 | Loss: 109.34 | Recon: 82.16 | KL: 2420.76 | Semantic: 26.9373
+Epoch 78/100 | Loss: 119.67 | Recon: 94.01 | KL: 2274.78 | Semantic: 25.4361
+Epoch 79/100 | Loss: 117.10 | Recon: 91.51 | KL: 2434.85 | Semantic: 25.3450
+Epoch 80/100 | Loss: 115.41 | Recon: 89.50 | KL: 3064.82 | Semantic: 25.6022
+
+======================================================================
+VALIDATION (Epoch 80)
+======================================================================
+  L2 Error: 137.17 ± 44.13
+  Failure Rate: 26.00%
+======================================================================
+
+✓ Checkpoint saved: epoch_80.pth
+Epoch 81/100 | Loss: 106.96 | Recon: 80.42 | KL: 3340.07 | Semantic: 26.2012
+Epoch 82/100 | Loss: 114.30 | Recon: 89.02 | KL: 3440.75 | Semantic: 24.9367
+Epoch 83/100 | Loss: 112.54 | Recon: 87.16 | KL: 3164.26 | Semantic: 25.0624
+Epoch 84/100 | Loss: 112.15 | Recon: 86.31 | KL: 4907.06 | Semantic: 25.3440
+Epoch 85/100 | Loss: 117.20 | Recon: 91.04 | KL: 4426.81 | Semantic: 25.7193
+Epoch 86/100 | Loss: 118.09 | Recon: 92.41 | KL: 4424.68 | Semantic: 25.2379
+Epoch 87/100 | Loss: 120.17 | Recon: 94.68 | KL: 3875.65 | Semantic: 25.1056
+Epoch 88/100 | Loss: 119.59 | Recon: 94.55 | KL: 2998.35 | Semantic: 24.7464
+Epoch 89/100 | Loss: 118.74 | Recon: 93.55 | KL: 2728.20 | Semantic: 24.9104
+Epoch 90/100 | Loss: 121.80 | Recon: 95.76 | KL: 2358.94 | Semantic: 25.8067
+
+======================================================================
+VALIDATION (Epoch 90)
+======================================================================
+  L2 Error: 135.04 ± 42.22
+  Failure Rate: 26.00%
+  ✓ New best model! (L2: 135.04)
+======================================================================
+
+✓ Checkpoint saved: epoch_90.pth
+Epoch 91/100 | Loss: 105.86 | Recon: 79.02 | KL: 2221.73 | Semantic: 26.6173
+Epoch 92/100 | Loss: 128.89 | Recon: 104.16 | KL: 2395.63 | Semantic: 24.4936
+Epoch 93/100 | Loss: 115.83 | Recon: 90.93 | KL: 2572.90 | Semantic: 24.6397
+Epoch 94/100 | Loss: 108.10 | Recon: 82.91 | KL: 2563.18 | Semantic: 24.9289
+Epoch 95/100 | Loss: 110.24 | Recon: 84.37 | KL: 2529.01 | Semantic: 25.6182
+Epoch 96/100 | Loss: 110.52 | Recon: 85.80 | KL: 2432.17 | Semantic: 24.4781
+Epoch 97/100 | Loss: 114.36 | Recon: 88.73 | KL: 2419.11 | Semantic: 25.3798
+Epoch 98/100 | Loss: 116.13 | Recon: 90.74 | KL: 2362.47 | Semantic: 25.1516
+Epoch 99/100 | Loss: 114.11 | Recon: 89.32 | KL: 2857.05 | Semantic: 24.5069
+
+======================================================================
+VALIDATION (Epoch 99)
+======================================================================
+  L2 Error: 137.24 ± 44.18
+  Failure Rate: 26.00%
+======================================================================
+
+
+======================================================================
+TRAINING COMPLETE
+======================================================================
+
+Final Results:
+  Final L2: 138.09
+  Best L2: 135.04 (epoch 90)
+✓ Saved: /home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/job_19324907_geometric_beta10.0/final.pth
+======================================================================
+
+════════════════════════════════════════════════════════════════════════════════
+                          TRAINING COMPLETE
+════════════════════════════════════════════════════════════════════════════════
+Exit code:     0
+Duration:      208 minutes
+End time:      Sun Feb  8 04:28:40 CET 2026
+
+✅ Training completed successfully!
+
+Next steps:
+   1. Check logs:           cat logs/can3tok_19324907.out
+   2. Find checkpoints:     ls checkpoints/job_19324907_*/
+   3. Load best model:      checkpoints/job_19324907_*/best_model.pth
+════════════════════════════════════════════════════════════════════════════════

@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/can3tok_%j.out
+#SBATCH --output=logs/sw_0.3_hidden_t_0.1_rgb_n_sem_meas_r_100_ps.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
@@ -35,55 +35,37 @@ echo ""
 # ────────────────────────────────────────────────────────────────────────────
 # OPTION 1: NO SEMANTIC LEARNING (Baseline - Fastest, Least Memory)
 # ────────────────────────────────────────────────────────────────────────────
-# Use this for: Baseline comparisons, fastest training, minimal memory
-# Memory: ~20GB | Speed: ⚡⚡⚡ Fastest | Quality: Standard reconstruction
-# ────────────────────────────────────────────────────────────────────────────
-
-# SEMANTIC_MODE="geometric"       # Value doesn't matter when disabled
-# SEGMENT_WEIGHT=0.0              # ← KEY: Set to 0 to disable
-# INSTANCE_WEIGHT=0.0             # ← KEY: Set to 0 to disable
+# SEMANTIC_MODE="geometric"
+# SEGMENT_WEIGHT=0.0
+# INSTANCE_WEIGHT=0.0
 
 # ────────────────────────────────────────────────────────────────────────────
 # OPTION 2: GEOMETRIC MODE (Recommended - Best Balance!)
 # ────────────────────────────────────────────────────────────────────────────
-# Use this for: Standard semantic learning, efficient training
-# Memory: ~20GB | Speed: ⚡⚡⚡ Fast | Quality: Good semantic features
-# Parameters: ~45K | Approach: Uses reconstructed Gaussian parameters
-# ────────────────────────────────────────────────────────────────────────────
-
 # SEMANTIC_MODE="geometric"
-# SEGMENT_WEIGHT=0.1              # ← Set > 0 to enable
-# INSTANCE_WEIGHT=0.0             # Optional: instance-level loss
+# SEGMENT_WEIGHT=0.3
+# INSTANCE_WEIGHT=0.0
 
 # ────────────────────────────────────────────────────────────────────────────
 # OPTION 3: HIDDEN STATE MODE (Best Quality - Slowest)
 # ────────────────────────────────────────────────────────────────────────────
-# Use this for: Maximum semantic quality, rich feature learning
-# Memory: ~35GB | Speed: ⚡⚡ Medium | Quality: Best semantic features
-# Parameters: ~329M | Approach: Uses decoder hidden state
-# ────────────────────────────────────────────────────────────────────────────
-
 SEMANTIC_MODE="hidden"
-SEGMENT_WEIGHT=0.1              # ← Set > 0 to enable
-INSTANCE_WEIGHT=0.0             # Optional: instance-level loss
+SEGMENT_WEIGHT=0.3
+INSTANCE_WEIGHT=0.0
 
 # ────────────────────────────────────────────────────────────────────────────
 # OPTION 4: ATTENTION MODE (Spatial Context)
 # ────────────────────────────────────────────────────────────────────────────
-# Use this for: Learning spatial relationships between Gaussians
-# Memory: ~30GB | Speed: ⚡⚡ Medium | Quality: Good spatial features
-# Parameters: ~158M | Approach: Cross-attention between Gaussians and scene
-# ────────────────────────────────────────────────────────────────────────────
-
 # SEMANTIC_MODE="attention"
-# SEGMENT_WEIGHT=0.1              # ← Set > 0 to enable
-# INSTANCE_WEIGHT=0.0             # Optional: instance-level loss
+# SEGMENT_WEIGHT=0.3
+# INSTANCE_WEIGHT=0.0
 
 # ────────────────────────────────────────────────────────────────────────────
-# Semantic Loss Additional Parameters (only used if SEGMENT_WEIGHT > 0)
+# Semantic Loss Additional Parameters
 # ────────────────────────────────────────────────────────────────────────────
-SEMANTIC_TEMP=0.07              # Temperature for InfoNCE loss
-SEMANTIC_SUBSAMPLE=10000         # Subsample Gaussians (saves memory/compute)
+SEMANTIC_TEMP=0.1
+SEMANTIC_SUBSAMPLE=10000
+SAMPLING_STRATEGY="balanced"
 
 # ============================================================================
 # TRAINING HYPERPARAMETERS
@@ -92,25 +74,41 @@ SEMANTIC_SUBSAMPLE=10000         # Subsample Gaussians (saves memory/compute)
 BATCH_SIZE=64
 NUM_EPOCHS=100
 LEARNING_RATE=1e-4
-KL_WEIGHT=1e-4                 # VAE KL divergence weight
-RECON_SCALE=1.0              # Scale reconstruction loss
-EVAL_EVERY=10                   # Evaluate every N epochs
-FAILURE_THRESHOLD=150          # L2 error threshold for failure
+KL_WEIGHT=1e-5                 # ← Fixed: was 1e-4 (too strong)
+RECON_SCALE=200.0              # ← Fixed: was 1.0 (too dominant)
+EVAL_EVERY=10
+FAILURE_THRESHOLD=150
 
 # ============================================================================
 # DATASET CONFIGURATION
 # ============================================================================
 
-TRAIN_SCENES=600                # Number of training scenes (None = all)
-VAL_SCENES=50                   # Number of validation scenes (None = all)
-SAMPLING_METHOD="opacity"       # "opacity" or "random"
+TRAIN_SCENES=600
+VAL_SCENES=50
+SAMPLING_METHOD="opacity"
+
+# ============================================================================
+# PCA VISUALIZATION CONFIGURATION (CloudCompare)
+# ============================================================================
+
+PCA_VIS_FREQ=10                # Generate PCA PLY files every N epochs
+PCA_NUM_SCENES=10              # Number of scenes to visualize with PCA
+PCA_BRIGHTNESS=1.25            # Color brightness for PCA visualization
+
+# ============================================================================
+# 3DGS RECONSTRUCTION CONFIGURATION (supersplat.at)
+# ============================================================================
+
+RECON_PLY_FREQ=10              # Save reconstructed 3DGS PLY every N epochs
+RECON_PLY_NUM_SCENES=5         # Number of scenes to reconstruct
+RECON_PLY_MAX_SH=3             # Max SH degree (f_rest terms = 0)
 
 # ============================================================================
 # WEIGHTS & BIASES CONFIGURATION
 # ============================================================================
 
 export WANDB_API_KEY="your_key_here"
-USE_WANDB=False                 # Set to True to enable W&B logging
+USE_WANDB=False
 
 # ============================================================================
 # PRINT CONFIGURATION SUMMARY
@@ -121,9 +119,6 @@ echo "                        CONFIGURATION SUMMARY"
 echo "════════════════════════════════════════════════════════════════════════════════"
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Job Information
-# ─────────────────────────────────────────────────────────────────────────────
 echo "📋 JOB INFORMATION:"
 echo "   Job ID:            $SLURM_JOB_ID"
 echo "   Partition:         $SLURM_JOB_PARTITION"
@@ -134,12 +129,8 @@ echo "   Memory:            64GB"
 echo "   Time Limit:        12:00:00"
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Semantic Learning Configuration
-# ─────────────────────────────────────────────────────────────────────────────
 echo "🧠 SEMANTIC LEARNING:"
 
-# Check if semantic learning is enabled
 if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
     echo "   Status:            ✅ ENABLED"
     echo "   Mode:              ${SEMANTIC_MODE^^}"
@@ -151,43 +142,18 @@ if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || (( $(echo "$INSTANCE_WEIGHT > 
     echo "      Subsample:      $SEMANTIC_SUBSAMPLE Gaussians"
     echo ""
     
-    # Mode-specific information
     case "$SEMANTIC_MODE" in
         "geometric")
-            echo "   Architecture Details:"
-            echo "      Approach:       Geometric Gaussians → MLP (SimCLR-style)"
-            echo "      Input:          [B, 40k, 11] reconstructed Gaussians"
-            echo "      Output:         [B, 40k, 32] semantic features"
-            echo "      Parameters:     ~45K (very lightweight!)"
-            echo "      Memory Usage:   ~20GB GPU"
-            echo "      Training Speed: ⚡⚡⚡ Fast"
-            echo "      Best For:       ⭐ Standard semantic learning"
-            echo "      Notes:          Most efficient, recommended for most cases"
+            echo "   Architecture:   Geometric Gaussians → MLP"
+            echo "   Parameters:     ~45K | Memory: ~20GB | Speed: ⚡⚡⚡ Fast"
             ;;
         "hidden")
-            echo "   Architecture Details:"
-            echo "      Approach:       Hidden State → MLP projection"
-            echo "      Input:          [B, 1024] decoder hidden state"
-            echo "      Output:         [B, 40k, 32] semantic features"
-            echo "      Parameters:     ~329M (heavyweight)"
-            echo "      Memory Usage:   ~35GB GPU"
-            echo "      Training Speed: ⚡⚡ Medium"
-            echo "      Best For:       Maximum semantic quality"
-            echo "      Notes:          Richest features, but slower training"
+            echo "   Architecture:   Hidden State → MLP projection"
+            echo "   Parameters:     ~329M | Memory: ~35GB | Speed: ⚡⚡ Medium"
             ;;
         "attention")
-            echo "   Architecture Details:"
-            echo "      Approach:       Cross-attention semantic head"
-            echo "      Input:          [B, 40k, 3] positions × [B, 512, 384] tokens"
-            echo "      Output:         [B, 40k, 32] semantic features"
-            echo "      Parameters:     ~158M (medium weight)"
-            echo "      Memory Usage:   ~30GB GPU"
-            echo "      Training Speed: ⚡⚡ Medium"
-            echo "      Best For:       Spatial semantic relationships"
-            echo "      Notes:          Good for capturing scene context"
-            ;;
-        *)
-            echo "      ⚠️  Unknown semantic mode: $SEMANTIC_MODE"
+            echo "   Architecture:   Cross-attention semantic head"
+            echo "   Parameters:     ~158M | Memory: ~30GB | Speed: ⚡⚡ Medium"
             ;;
     esac
     
@@ -195,27 +161,22 @@ if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || (( $(echo "$INSTANCE_WEIGHT > 
     echo "   Loss Composition:"
     echo "      Total = (Recon / $RECON_SCALE) + ($KL_WEIGHT × KL) + Semantic"
     echo "      Semantic = ($SEGMENT_WEIGHT × Segment) + ($INSTANCE_WEIGHT × Instance)"
-    
+
+    # Approximate loss balance with raw semantic ~4.5
+    echo ""
+    echo "   Approx. Loss Balance (raw semantic ~4.5):"
+    echo "      Recon:    235 / $RECON_SCALE ≈ $(echo "scale=3; 235/$RECON_SCALE" | bc)"
+    echo "      KL:       6000 × $KL_WEIGHT  ≈ $(echo "scale=3; 6000*$KL_WEIGHT" | bc)"
+    echo "      Semantic: 4.5  × $SEGMENT_WEIGHT  ≈ $(echo "scale=3; 4.5*$SEGMENT_WEIGHT" | bc)"
+
 else
-    # Semantic learning is disabled
     echo "   Status:            ❌ DISABLED (Baseline)"
-    echo "   Reason:            All semantic loss weights = 0"
-    echo ""
-    echo "   Benefits:"
-    echo "      Memory Saved:   ~15GB GPU (no semantic head)"
-    echo "      Speed Gain:     ~30% faster training"
-    echo "      Use Case:       ⭐ Baseline comparisons, pure VAE"
-    echo ""
     echo "   Loss Composition:"
     echo "      Total = (Recon / $RECON_SCALE) + ($KL_WEIGHT × KL)"
-    echo "      (No semantic loss)"
 fi
 
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Training Hyperparameters
-# ─────────────────────────────────────────────────────────────────────────────
 echo "⚙️  TRAINING HYPERPARAMETERS:"
 echo "   Batch Size:        $BATCH_SIZE"
 echo "   Epochs:            $NUM_EPOCHS"
@@ -226,44 +187,37 @@ echo "   Eval Every:        $EVAL_EVERY epochs"
 echo "   Failure Thresh:    $FAILURE_THRESHOLD"
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset Configuration
-# ─────────────────────────────────────────────────────────────────────────────
 echo "📊 DATASET:"
 echo "   Training Scenes:   $TRAIN_SCENES"
 echo "   Val Scenes:        $VAL_SCENES"
 echo "   Sampling:          ${SAMPLING_METHOD^^}"
-echo "   Dataset:           SceneSplat-7K (ScanNet72 labels)"
-echo "   Semantic Classes:  72 categories (38 main + 34 rare)"
+echo "   Color Mode:        Normalized [0,1] (no /255 needed)"
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
+echo "🎨 PCA VISUALIZATION (CloudCompare):"
+echo "   Frequency:         Every $PCA_VIS_FREQ epochs"
+echo "   Scenes:            $PCA_NUM_SCENES per epoch"
+echo "   Files/Epoch:       $((PCA_NUM_SCENES * 3)) PLY files (semantic + position + original)"
+echo "   Total Files:       $((NUM_EPOCHS / PCA_VIS_FREQ * PCA_NUM_SCENES * 3)) PLY files"
+echo "   Output:            checkpoints/.../pca_visualizations/epoch_XXX/"
+echo ""
+
+echo "🌐 3DGS RECONSTRUCTION (supersplat.at):"
+echo "   Frequency:         Every $RECON_PLY_FREQ epochs"
+echo "   Scenes:            $RECON_PLY_NUM_SCENES per epoch"
+echo "   Max SH Degree:     $RECON_PLY_MAX_SH (f_rest = 0)"
+echo "   Color Mode:        Pre-normalized [0,1] → f_dc via C0"
+echo "   Total PLY Files:   $((NUM_EPOCHS / RECON_PLY_FREQ * RECON_PLY_NUM_SCENES)) files"
+echo "   Output:            checkpoints/.../reconstructed_gaussians/epoch_XXX/"
+echo "   View At:           https://supersplat.at"
+echo ""
+
 echo "📈 LOGGING:"
 echo "   W&B:               $([ "$USE_WANDB" = "True" ] && echo "✅ Enabled" || echo "❌ Disabled")"
 echo "   Checkpoints:       Every 10 epochs"
 echo "   Best Model:        Tracked by val L2 error"
-echo "   Output Log:        logs/can3tok_${SLURM_JOB_ID}.out"
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Expected Performance
-# ─────────────────────────────────────────────────────────────────────────────
-echo "🎯 EXPECTED PERFORMANCE:"
-echo "   Initial L2:        ~19,000 (random)"
-echo "   Target L2:         ~3,000-5,000 (converged)"
-echo "   Failure if:        L2 > $FAILURE_THRESHOLD"
-
-if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )); then
-    echo ""
-    echo "   Semantic Loss:"
-    echo "      Initial:        ~4.28 (log(72), random features)"
-    echo "      Target:         ~0.5-1.5 (learned clusters)"
-    echo "      ⚠️  Watch:       Should decrease steadily"
-fi
-
-echo ""
 echo "════════════════════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -284,11 +238,11 @@ echo "   ✓ Conda environment: can3tok"
 echo "   ✓ Working directory: $(pwd)"
 echo ""
 
-# W&B setup
+# W&B setup (fixed: removed colon after else)
 if [ "$USE_WANDB" = "True" ]; then
     wandb login $WANDB_API_KEY --relogin 2>/dev/null
     echo "   ✓ Weights & Biases authenticated"
-else:
+else
     echo "   ⊘ Weights & Biases disabled"
 fi
 echo ""
@@ -299,9 +253,9 @@ echo ""
 
 echo "🚀 Building training command..."
 
-TRAIN_CMD="python  gs_can3tok_2.py"
+TRAIN_CMD="python gs_can3tok_2.py"
 
-# Training parameters
+# ─── Training parameters ────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
@@ -310,35 +264,38 @@ TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
 TRAIN_CMD="$TRAIN_CMD --recon_scale $RECON_SCALE"
 
-# Dataset parameters
+# ─── Dataset parameters ─────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
 TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
 
-# ============================================================================
-# SEMANTIC PARAMETERS - THESE CONTROL EVERYTHING!
-# ============================================================================
-# The training script will automatically:
-#   - Disable semantic learning if weights are 0
-#   - Enable semantic learning if weights > 0
-#   - Initialize only the selected semantic head
-# ============================================================================
-
+# ─── Semantic parameters ────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
 TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
-# W&B parameters
+# ─── PCA visualization parameters ───────────────────────────────────────────
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
+TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
+
+# ─── 3DGS reconstruction parameters ─────────────────────────────────────────
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+
+# ─── W&B ────────────────────────────────────────────────────────────────────
 if [ "$USE_WANDB" = "True" ]; then
     TRAIN_CMD="$TRAIN_CMD --use_wandb"
     TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-Semantic"
     TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
 fi
 
-echo "Command:"
-echo "$TRAIN_CMD"
+echo "   Command:"
+echo "   $TRAIN_CMD"
 echo ""
 
 # ============================================================================
@@ -370,11 +327,21 @@ if [ $TRAIN_EXIT -eq 0 ]; then
     echo "✅ Training completed successfully!"
     echo ""
     echo "Next steps:"
-    echo "   1. Check logs:           cat logs/can3tok_${SLURM_JOB_ID}.out"
-    echo "   2. Find checkpoints:     ls checkpoints/job_${SLURM_JOB_ID}_*/"
-    echo "   3. Load best model:      checkpoints/job_${SLURM_JOB_ID}_*/best_model.pth"
+    echo "   1. Check logs:                cat logs/can3tok_${SLURM_JOB_ID}.out"
+    echo "   2. Find checkpoints:          ls checkpoints/RGB_job_${SLURM_JOB_ID}_*/"
+    echo "   3. Load best model:           checkpoints/RGB_job_${SLURM_JOB_ID}_*/best_model.pth"
+    echo ""
+    echo "   PCA Visualizations (CloudCompare):"
+    echo "      Location:   checkpoints/RGB_job_${SLURM_JOB_ID}_*/pca_visualizations/"
+    echo "      Open:       epoch_090/scene_000_semantic_pca.ply"
+    echo ""
+    echo "   3DGS Reconstructions (supersplat.at):"
+    echo "      Location:   checkpoints/RGB_job_${SLURM_JOB_ID}_*/reconstructed_gaussians/"
+    echo "      Open:       epoch_090/scene_000_epoch_090.ply"
+    echo "      Drag & drop to: https://supersplat.at"
     if [ "$USE_WANDB" = "True" ]; then
-        echo "   4. View W&B dashboard:   https://wandb.ai/3D-SSC/Can3Tok-Semantic"
+        echo ""
+        echo "   W&B Dashboard: https://wandb.ai/3D-SSC/Can3Tok-Semantic"
     fi
 else
     echo "❌ Training failed with exit code $TRAIN_EXIT"
@@ -382,7 +349,7 @@ else
     echo "Troubleshooting:"
     echo "   1. Check error log:      cat logs/can3tok_${SLURM_JOB_ID}.err"
     echo "   2. Check GPU memory:     nvidia-smi"
-    echo "   3. Verify dataset path:  ls /home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/"
+    echo "   3. Verify dataset:       ls /home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/"
 fi
 
 echo "════════════════════════════════════════════════════════════════════════════════"
