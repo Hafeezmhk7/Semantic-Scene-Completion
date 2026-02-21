@@ -5,7 +5,7 @@
 
 ---
 
-## 🎯 Project Overview
+##  Project Overview
 
 This project enhances the Can3Tok framework by incorporating semantic information into the latent space of a 3D Gaussian Splatting (3DGS) Variational Autoencoder (VAE). The goal is to enable **semantic-aware 3D scene generation** and **semantic scene completion** by learning semantically meaningful latent representations.
 
@@ -14,7 +14,7 @@ While the original Can3Tok learns geometric representations of 3D scenes, this w
 
 ---
 
-## 🏗️ Architecture Overview
+##  Architecture Overview
 
 ### Base Framework: Can3Tok VAE
 
@@ -68,7 +68,7 @@ We add a **semantic projection head** that extracts per-Gaussian features for co
 
 ---
 
-## 🔬 Three Approaches for Semantic Feature Extraction
+##  Three Approaches for Semantic Feature Extraction
 
 We explored three different strategies to extract per-Gaussian semantic features:
 
@@ -130,16 +130,9 @@ Per-Gaussian features [B, 40k, 32]
 L2 normalization
 ```
 
-**Advantages:**
-- Gaussians attend to scene-level context
-- Inherits from CrossAttentionDecoder (proven architecture)
-- Captures spatial relationships
 
-**When to use:** When you want each Gaussian to "look at" the global scene representation
 
----
-
-## 📊 Dataset: SceneSplat with ScanNet72 Labels
+##  Dataset: SceneSplat with ScanNet72 Labels
 
 ### Dataset Structure
 
