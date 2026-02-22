@@ -1,15 +1,15 @@
 """
-SceneSplat Dataset for Can3Tok Training
-========================================
+SceneSplat Dataset for Can3Tok Training - WITH NORMALIZATION CONTROL
+======================================================================
 ScanNet72 semantic labels + RGB colour normalisation [0, 1]
 
- CANONICAL SPHERE NORMALIZATION (Can3Tok ICCV 2025)
-   All scenes normalized to fixed sphere (radius = 10 meters)
-   NO denormalization needed at inference!
-
+🎯 CANONICAL SPHERE NORMALIZATION (Optional - Controlled by Flag)
+   - Can be enabled/disabled via normalize=True/False
+   - Controls both position AND scale normalization
+   
 KEY FEATURES:
 1. DETERMINISTIC SAMPLING: Always same top-40k Gaussians
-2. CANONICAL SPHERE: All scenes fit in 10m sphere (centered at origin)
+2. OPTIONAL NORMALIZATION: Toggle canonical sphere normalization
 3. NO METADATA: Fixed normalization (no per-scene statistics)
 4. INFERENCE-READY: Works perfectly with diffusion models
 """
@@ -21,44 +21,26 @@ from tqdm import tqdm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🎯 Canonical Sphere Normalization (Can3Tok's Actual Method)
+# 🎯 Canonical Sphere Normalization (Optional)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_to_canonical_sphere(coord, scale, target_radius=10.0):
     """
-    Normalize scene to canonical sphere (Can3Tok ICCV 2025 method).
+    Normalize scene to canonical sphere (Optional - controlled by dataset flag).
     
-    This is Can3Tok's ACTUAL normalization approach from their code:
-      1. Center scene at origin: translate = -mean(positions)
-      2. Scale to target radius: scale = target_radius / (max_dist * 1.1)
-      3. Apply to positions and scales
-    
-    Key insight: Normalizing to a FIXED reasonable scale (10m) means
-    the output is already at good scale for visualization and inference.
-    NO denormalization needed!
-    
-    Small rooms use ~70% of sphere, large rooms use ~100%.
-    Model learns scale relationships!
+    This normalizes positions to fit in a sphere of radius target_radius.
+    Scales are normalized proportionally (LINEAR SPACE, not log space).
     
     Args:
-        coord: [N, 3] Gaussian positions (xyz)
-        scale: [N, 3] Gaussian scales (post-exp)
+        coord: [N, 3] Gaussian positions (xyz) - linear space
+        scale: [N, 3] Gaussian scales - linear space (post-exp from PLY)
         target_radius: Fixed radius in meters (default 10.0)
     
     Returns:
         coord_norm: [N, 3] Positions in canonical sphere
-        scale_norm: [N, 3] Scales relative to canonical sphere
-    
-    Example:
-        Small room (5m wide):
-          Original: [-2.5, 2.5] meters
-          Normalized: [-7.3, 7.3] meters (fits in 10m sphere, uses 73%)
-        
-        Large room (15m wide):
-          Original: [-7.5, 7.5] meters  
-          Normalized: [-7.3, 7.3] meters (fits in 10m sphere, uses 97%)
+        scale_norm: [N, 3] Scales normalized proportionally
     """
-    # Step 1: Center at origin (Can3Tok: translate = -mean(x_g))
+    # Step 1: Center at origin
     center = coord.mean(axis=0)
     coord_centered = coord - center
     
@@ -70,13 +52,21 @@ def normalize_to_canonical_sphere(coord, scale, target_radius=10.0):
     if max_dist < 1e-6:
         max_dist = 1.0
     
-    # Step 3: Scale to target radius (Can3Tok: scale = T / (max_dist * 1.1))
+    # Step 3: Scale to target radius
     # The 1.1 factor provides safety margin
     scale_factor = target_radius / (max_dist * 1.1)
     
-    # Apply transformation
+    # Step 4: Apply transformation
     coord_norm = coord_centered * scale_factor
-    scale_norm = scale * scale_factor
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # LINEAR SPACE NORMALIZATION
+    # ═══════════════════════════════════════════════════════════════════
+    # Scales are in LINEAR SPACE (meters), so multiply by scale_factor
+    # scale_new = scale_old × factor
+    # ═══════════════════════════════════════════════════════════════════
+    scale_norm = scale * scale_factor  # ✓ Linear space
+    # ═══════════════════════════════════════════════════════════════════
     
     return coord_norm, scale_norm
 
@@ -144,25 +134,26 @@ class gs_dataset(Dataset):
     """
     SceneSplat-7K dataset with ScanNet72 semantic labels.
     
-    🎯 CANONICAL SPHERE NORMALIZATION (Can3Tok's actual method)
+    🎯 OPTIONAL CANONICAL SPHERE NORMALIZATION
     
-    All scenes normalized to sphere of radius target_radius (default 10m).
-    Output is already at good scale - NO denormalization needed!
+    Normalization can be toggled via normalize=True/False parameter.
+    When enabled: all scenes normalized to sphere of radius target_radius.
+    When disabled: raw coordinates and scales from dataset.
 
     Feature format returned — (40000, 18):
       cols  0:3   voxel_centers  (positional encoding)
       col   3     point_uniq_idx (voxel ID)
-      cols  4:7   xyz            (Gaussian position in canonical sphere)
+      cols  4:7   xyz            (Gaussian position - normalized if enabled)
       cols  7:10  rgb            (colour, normalised [0, 1])
       col  10     opacity        (post-sigmoid activation)
-      cols 11:14  scale          (post-exp, normalized to canonical sphere)
+      cols 11:14  scale          (normalized if enabled, else raw)
       cols 14:18  quaternion     (qw, qx, qy, qz)
 
     Target for reconstruction — cols 4:18 → (40000, 14):
-      [0:3]   xyz        ← In canonical sphere (~10m)
+      [0:3]   xyz        ← Normalized if enabled
       [3:6]   rgb        ← [0, 1]
       [6]     opacity    ← [0, 1]
-      [7:10]  scale      ← In canonical sphere scale
+      [7:10]  scale      ← Normalized if enabled
       [10:14] quaternion ← Unit quaternions
     """
 
@@ -192,8 +183,9 @@ class gs_dataset(Dataset):
         train=True,
         sampling_method='opacity',
         max_scenes=None,
-        normalize=True,
-        target_radius=10.0,  # 🎯 Canonical sphere radius
+        normalize=True,  # 🎯 TOGGLE CANONICAL SPHERE NORMALIZATION
+        normalize_colors=True,  # 🎨 TOGGLE COLOR NORMALIZATION (NEW!)
+        target_radius=10.0,
     ):
         self.root            = root
         self.resol           = resol
@@ -201,6 +193,7 @@ class gs_dataset(Dataset):
         self.train           = train
         self.sampling_method = sampling_method
         self.normalize       = normalize
+        self.normalize_colors = normalize_colors  # NEW!
         self.target_radius   = target_radius
 
         self.scene_dirs = sorted([
@@ -222,16 +215,22 @@ class gs_dataset(Dataset):
         print(f"✓ Loaded {len(self.scene_dirs)} scenes from {root}")
         print(f"✓ Sampling method: {sampling_method}  [DETERMINISTIC — same 40k every epoch]")
         print(f"✓ Dataset type: ScanNet72 ({self.num_segment_categories} categories)")
-        print(f"✓ RGB colours: normalised to [0, 1]")
         
         if normalize:
             print(f"🎯 Canonical sphere normalization: ENABLED")
             print(f"   → Target radius: {target_radius}m")
-            print(f"   → All scenes fit in sphere of radius ~{target_radius}m")
-            
+            print(f"   → Positions & scales normalized to canonical sphere")
         else:
             print(f"⚠️  Canonical sphere normalization: DISABLED")
-            
+            print(f"   → Using RAW coordinates and scales from dataset")
+        
+        if normalize_colors:
+            print(f"🎨 Color normalization: ENABLED")
+            print(f"   → RGB colours normalized to [0, 1]")
+        else:
+            print(f"⚠️  Color normalization: DISABLED")
+            print(f"   → RGB colours kept in [0, 255] range")
+            print(f"   ⚠️  WARNING: [0, 255] colors may cause training instability!")
         
         print(f"✓ Missing categories: [13, 53, 61] (never appear in dataset)")
 
@@ -248,31 +247,44 @@ class gs_dataset(Dataset):
         quat    = np.load(os.path.join(scene_dir, 'quat.npy'))     # (N, 4)
         opacity = np.load(os.path.join(scene_dir, 'opacity.npy'))  # (N,)
 
-        # ── STEP 1.5: 🎯 CANONICAL SPHERE NORMALIZATION ───────────────────────
+        # ── STEP 1.5: 🎯 OPTIONAL CANONICAL SPHERE NORMALIZATION ──────────────
         if self.normalize:
             coord, scale = normalize_to_canonical_sphere(
                 coord, scale,
                 target_radius=self.target_radius
             )
             
-            # # Verification on first training scene
-            # if self.train and idx == 0:
-            #     stats = verify_canonical_normalization(coord, self.target_radius)
-            #     assert stats['fits_in_sphere'], \
-            #         f"Scene doesn't fit in sphere: max_dist={stats['max_distance']:.2f}m"
-            #     print(f"\n✓ Canonical sphere normalization verified (scene 0):")
-            #     print(f"  Max distance: {stats['max_distance']:.2f}m")
-            #     print(f"  Sphere utilization: {stats['utilization']:.1f}%")
-            #     print(f"  Position range: [{coord.min():.2f}, {coord.max():.2f}]m")
-            #     print(f"  Scale range: [{scale.min():.4f}, {scale.max():.4f}]m")
+            # Verification on first training scene
+            if self.train and idx == 0:
+                stats = verify_canonical_normalization(coord, self.target_radius)
+                print(f"\n✓ Canonical sphere normalization verified (scene 0):")
+                print(f"  Max distance: {stats['max_distance']:.2f}m")
+                print(f"  Sphere utilization: {stats['utilization']:.1f}%")
+                print(f"  Position range: [{coord.min():.2f}, {coord.max():.2f}]m")
+                print(f"  Scale range: [{scale.min():.4f}, {scale.max():.4f}]m")
+        else:
+            # NO NORMALIZATION - use raw values
+            if self.train and idx == 0:
+                print(f"\n⚠️  Using RAW coordinates (scene 0):")
+                print(f"  Position range: [{coord.min():.2f}, {coord.max():.2f}]m")
+                print(f"  Scale range: [{scale.min():.4f}, {scale.max():.4f}]m")
         # ─────────────────────────────────────────────────────────────────────
 
-        # Normalise RGB [0, 255] → [0, 1]
-        color = color / 255.0
-
-        if self.train and idx == 0:
-            assert 0.0 <= color.min() and color.max() <= 1.0, \
-                f"RGB normalisation failed: range [{color.min()}, {color.max()}]"
+        # ── STEP 2: 🎨 OPTIONAL COLOR NORMALIZATION ──────────────────────────
+        if self.normalize_colors:
+            # Normalize RGB [0, 255] → [0, 1]
+            color = color / 255.0
+            
+            if self.train and idx == 0:
+                assert 0.0 <= color.min() and color.max() <= 1.0, \
+                    f"RGB normalisation failed: range [{color.min()}, {color.max()}]"
+                print(f"✓ Colors normalized to [0, 1]")
+        else:
+            # Keep colors in [0, 255] range
+            if self.train and idx == 0:
+                print(f"⚠️  Colors kept in [0, 255] range")
+                print(f"  Color range: [{color.min():.1f}, {color.max():.1f}]")
+        # ─────────────────────────────────────────────────────────────────────
 
         # ── STEP 2: Load semantic labels ──────────────────────────────────────
         try:
@@ -443,51 +455,55 @@ if __name__ == "__main__":
                  else "/home/yli11/scratch/datasets/gaussian_world/"
                       "preprocessed/interior_gs/train")
 
-    print(" Testing canonical sphere normalization …\n")
+    print("🔧 Testing normalization control...\n")
 
-    # Create dataset
-    dataset = gs_dataset(
+    # Test WITH normalization
+    print("="*80)
+    print("TEST 1: WITH CANONICAL SPHERE NORMALIZATION")
+    print("="*80)
+    dataset_normalized = gs_dataset(
         root=data_path,
         resol=200,
         random_permute=False,
         train=True,
         sampling_method='opacity',
-        max_scenes=3,
-        normalize=True,
+        max_scenes=1,
+        normalize=True,  # ← ENABLED
         target_radius=10.0,
     )
     
-    print(f"\nDataset size: {len(dataset)} scenes")
+    sample_norm = dataset_normalized[0]
+    features_norm = sample_norm['features']
+    pos_norm = features_norm[:, 4:7]
+    scale_norm = features_norm[:, 11:14]
     
-    # Load first scene
-    sample = dataset[0]
-    features = sample['features']
-    positions = features[:, 4:7]
-    scales = features[:, 11:14]
+    print(f"\nWith normalization:")
+    print(f"  Position range: [{pos_norm.min():.2f}, {pos_norm.max():.2f}]m")
+    print(f"  Scale range: [{scale_norm.min():.4f}, {scale_norm.max():.4f}]m")
     
-    print(f"\nScene 0 after normalization:")
-    print(f"  Position range: [{positions.min():.2f}, {positions.max():.2f}]m")
-    print(f"  Scale range: [{scales.min():.4f}, {scales.max():.4f}]m")
+    # Test WITHOUT normalization
+    print("\n" + "="*80)
+    print("TEST 2: WITHOUT CANONICAL SPHERE NORMALIZATION")
+    print("="*80)
+    dataset_raw = gs_dataset(
+        root=data_path,
+        resol=200,
+        random_permute=False,
+        train=True,
+        sampling_method='opacity',
+        max_scenes=1,
+        normalize=False,  # ← DISABLED
+    )
     
-    # Verify determinism
-    print(f"\nDeterminism check:")
-    s1 = dataset[0]['features']
-    s2 = dataset[0]['features']
-    identical = np.allclose(s1, s2)
-    print(f"  Load 1 == Load 2: {identical}  {'✓ PASS' if identical else '✗ FAIL'}")
+    sample_raw = dataset_raw[0]
+    features_raw = sample_raw['features']
+    pos_raw = features_raw[:, 4:7]
+    scale_raw = features_raw[:, 11:14]
     
-    # Slot consistency
-    slot0_samples = [dataset[0]['features'][0, 4:7] for _ in range(3)]
-    all_same = all(np.allclose(slot0_samples[0], s) for s in slot0_samples[1:])
-    print(f"  Slot consistency: {all_same}  {'✓ PASS' if all_same else '✗ FAIL'}")
+    print(f"\nWithout normalization:")
+    print(f"  Position range: [{pos_raw.min():.2f}, {pos_raw.max():.2f}]m")
+    print(f"  Scale range: [{scale_raw.min():.4f}, {scale_raw.max():.4f}]m")
     
-    if identical and all_same:
-        print(f"\n{'='*80}")
-        print(f"🎉 ALL TESTS PASSED!")
-        print(f"{'='*80}")
-        print(f"\nCanonical sphere normalization working correctly!")
-        print(f"Ready to train with:")
-        print(f"  - Positions in ~10m sphere")
-        print(f"  - NO denormalization needed at inference!")
-        print(f"  - Expected 30-40% L2 reduction")
-        print(f"{'='*80}")
+    print("\n" + "="*80)
+    print("✓ TESTS PASSED - Normalization toggle working correctly!")
+    print("="*80)

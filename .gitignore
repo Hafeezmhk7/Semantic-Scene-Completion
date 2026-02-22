@@ -1,18 +1,32 @@
-# Ignore all log files in logs/
-logs/*.out
-logs/*.err
+# ===== Large ML outputs (IMPORTANT) =====
+checkpoints/
+reconstructed_gaussians/
+epoch_*/
 
-# Ignore all files in logs/ (if you want to ignore everything in logs)
-# logs/*
+# Gaussian splats
+*.ply
 
-# Ignore other large files or folders as needed
-*.log
-*.npy
+# Model checkpoints
 *.pt
-*.checkpoints
-*.wandb
-*.json
-*.csv
+*.pth
+*.ckpt
+
+# Numpy data
+*.npy
+*.npz
+
+# WandB
+wandb/
+
+# Logs
+logs/
+*.log
+
+# Large datasets
+*.h5
 *.zip
 *.tar.gz
-*.h5
+
+# Misc
+*.csv
+*.json

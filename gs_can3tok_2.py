@@ -1,6 +1,11 @@
 """
-Can3Tok Training - WITH RGB COLOR + INDIVIDUAL PARAMETER TRACKING + PCA VISUALIZATION
-=====================================================================================
+Can3Tok Training - WITH NORMALIZATION CONTROL FLAGS
+====================================================
+RGB COLOR + INDIVIDUAL PARAMETER TRACKING + PCA VISUALIZATION + NORMALIZATION CONTROL
+
+NEW FEATURES:
+- --use_balanced_loss flag: Toggle per-parameter loss normalization
+- Dataset normalization controlled separately in dataset file
 """
 
 import torch
@@ -24,10 +29,10 @@ import torch.utils.data as Data
 # Semantic loss functions
 from semantic_losses import compute_semantic_loss
 
-# PCA Feature Visualization (NEW!)
+# PCA Feature Visualization
 from pca_feature_visualization import visualize_comparison
 
-# 3DGS PLY Reconstruction (NEW! View on supersplat.at)
+# 3DGS PLY Reconstruction
 from gs_ply_reconstructor import save_reconstructed_gaussians
 
 import matplotlib.pyplot as plt
@@ -122,9 +127,6 @@ def compute_individual_losses(prediction, target, batch_size):
     rotation_pred = prediction[:, :, PARAM_SLICES['rotation']]
     rotation_target = target[:, :, PARAM_SLICES['rotation']]
     losses['rotation'] = torch.norm(rotation_pred - rotation_target, p=2) / batch_size
-    # # With this:
-    # dot = torch.sum(rotation_pred * rotation_target, dim=-1).clamp(-1, 1)
-    # losses['rotation'] = (1.0 - dot.abs()).mean()  # geodesic, handles q/-q symmetry
     
     # Total (for verification)
     losses['total_individual'] = sum(losses.values())
@@ -133,10 +135,93 @@ def compute_individual_losses(prediction, target, batch_size):
 
 
 # ============================================================================
+# BALANCED LOSS COMPUTATION FUNCTION (NEW!)
+# ============================================================================
+
+def compute_balanced_loss(prediction, target, batch_size, use_balanced=False, colors_normalized=True):
+    """
+    Compute L2 loss with optional per-parameter normalization.
+    
+    This function can operate in two modes:
+    1. Standard mode (use_balanced=False): Regular L2 loss across all parameters
+    2. Balanced mode (use_balanced=True): Normalizes each parameter type to [0, 1]
+       before computing loss, ensuring equal contribution from all parameters.
+    
+    The balanced mode solves the color collapse and position compression issues by
+    preventing position errors (which are naturally larger) from dominating the loss.
+    
+    Args:
+        prediction: [B, 40000, 14] reconstructed Gaussians
+        target: [B, 40000, 14] ground truth Gaussians
+        batch_size: B
+        use_balanced: Whether to normalize parameters (default: False)
+        colors_normalized: Whether colors are in [0,1] (True) or [0,255] (False)
+    
+    Returns:
+        Total loss value (scalar tensor)
+    
+    Example:
+        >>> # Standard loss (position dominates)
+        >>> loss = compute_balanced_loss(pred, target, 64, use_balanced=False)
+        >>> # Position contributes ~90, color contributes ~12
+        
+        >>> # Balanced loss (equal contributions)
+        >>> loss = compute_balanced_loss(pred, target, 64, use_balanced=True)
+        >>> # Position contributes ~15, color contributes ~15
+    """
+    if not use_balanced:
+        # === STANDARD L2 LOSS (Original behavior) ===
+        # All parameters treated equally in raw space
+        # Position errors dominate due to larger magnitude
+        return torch.norm(prediction - target, p=2) / batch_size
+    
+    # === BALANCED LOSS: Normalize each parameter to [0, 1] ===
+    # This ensures all parameters contribute equally to the total loss
+    
+    # Position: Assume range [-10, 10] → normalize to [0, 1]
+    pos_pred = (prediction[:, :, 0:3] + 10.0) / 20.0
+    pos_target = (target[:, :, 0:3] + 10.0) / 20.0
+    pos_loss = torch.norm(pos_pred - pos_target, p=2)
+    
+    # Color: Handle both [0, 1] and [0, 255] ranges
+    if colors_normalized:
+        # Already in [0, 1] range
+        color_loss = torch.norm(
+            prediction[:, :, 3:6] - target[:, :, 3:6], p=2
+        )
+    else:
+        # Colors in [0, 255] → normalize to [0, 1]
+        color_pred = prediction[:, :, 3:6] / 255.0
+        color_target = target[:, :, 3:6] / 255.0
+        color_loss = torch.norm(color_pred - color_target, p=2)
+    
+    # Opacity: Already in [0, 1] range
+    opacity_loss = torch.norm(
+        prediction[:, :, 6:7] - target[:, :, 6:7], p=2
+    )
+    
+    # Scale: Assume typical range [0.01, 0.5] → normalize to [0, 1]
+    # We use 0.5 as the max expected scale
+    scale_pred = torch.clamp(prediction[:, :, 7:10], 0.0, 0.5) / 0.5
+    scale_target = torch.clamp(target[:, :, 7:10], 0.0, 0.5) / 0.5
+    scale_loss = torch.norm(scale_pred - scale_target, p=2)
+    
+    # Rotation: Quaternions in [-1, 1] → normalize to [0, 1]
+    rot_pred = (prediction[:, :, 10:14] + 1.0) / 2.0
+    rot_target = (target[:, :, 10:14] + 1.0) / 2.0
+    rot_loss = torch.norm(rot_pred - rot_target, p=2)
+    
+    # Equal contribution from all parameters
+    total_loss = (pos_loss + color_loss + opacity_loss + scale_loss + rot_loss) / batch_size
+    
+    return total_loss
+
+
+# ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
 
-parser = argparse.ArgumentParser(description='Can3Tok Training - RGB + Individual Tracking + PCA Visualization')
+parser = argparse.ArgumentParser(description='Can3Tok Training - With Normalization Control')
 parser.add_argument('--use_wandb', action='store_true', default=False)
 parser.add_argument('--wandb_project', type=str, default='Can3Tok-RGB-PCA')
 parser.add_argument('--wandb_entity', type=str, default='3D-SSC')
@@ -170,6 +255,30 @@ parser.add_argument('--recon_ply_num_scenes', type=int, default=5,
                     help='Number of scenes to save as 3DGS PLY (default: 5)')
 parser.add_argument('--recon_ply_max_sh', type=int, default=3,
                     help='Max SH degree for reconstructed PLY (default: 3)')
+
+# ============================================================================
+# NEW: NORMALIZATION CONTROL FLAGS
+# ============================================================================
+parser.add_argument('--use_balanced_loss', action='store_true', default=False,
+                    help='Use per-parameter normalized loss (fixes color collapse)')
+
+# Canonical normalization control (mutually exclusive flags)
+norm_group = parser.add_mutually_exclusive_group()
+norm_group.add_argument('--use_canonical_norm', dest='use_canonical_norm',
+                       action='store_true', default=True,
+                       help='Enable canonical sphere normalization (default)')
+norm_group.add_argument('--no_canonical_norm', dest='use_canonical_norm',
+                       action='store_false',
+                       help='Disable canonical sphere normalization (use raw coordinates)')
+
+# Color normalization control (mutually exclusive flags)
+color_norm_group = parser.add_mutually_exclusive_group()
+color_norm_group.add_argument('--normalize_colors', dest='normalize_colors',
+                             action='store_true', default=True,
+                             help='Normalize colors to [0, 1] (default)')
+color_norm_group.add_argument('--no_normalize_colors', dest='normalize_colors',
+                             action='store_false',
+                             help='Keep colors in [0, 255] range (NOT recommended)')
                     
 args = parser.parse_args()
 
@@ -198,6 +307,10 @@ if args.use_wandb:
         run_name = f"can3tok_RGB_job_{job_id}_{effective_semantic_mode}"
         if enable_semantic:
             run_name += f"_beta{args.segment_loss_weight}"
+        if args.use_balanced_loss:
+            run_name += "_balanced"
+        if not args.use_canonical_norm:
+            run_name += "_raw"
         
         wandb_run = wandb.init(
             entity=args.wandb_entity,
@@ -212,12 +325,14 @@ if args.use_wandb:
                 "kl_weight": args.kl_weight,
                 "semantic_mode": effective_semantic_mode,
                 "enable_semantic": enable_semantic,
-                "num_params": 14,  # With RGB!
+                "num_params": 14,
                 "individual_tracking": True,
                 "pca_visualization": True,
                 "pca_vis_freq": args.pca_vis_freq,
+                "use_balanced_loss": args.use_balanced_loss,
+                "use_canonical_norm": args.use_canonical_norm,
             },
-            tags=["rgb-color", "individual-tracking", "pca-visualization"],
+            tags=["rgb-color", "individual-tracking", "pca-visualization", "normalization-control"],
         )
         print("✓ Weights & Biases enabled")
         wandb_enabled = True
@@ -263,17 +378,25 @@ if job_id:
     checkpoint_folder = f"RGB_job_{job_id}_{effective_semantic_mode}"
     if enable_semantic:
         checkpoint_folder += f"_beta{args.segment_loss_weight}"
+    if args.use_balanced_loss:
+        checkpoint_folder += "_balanced"
+    if not args.use_canonical_norm:
+        checkpoint_folder += "_raw"
 else:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     checkpoint_folder = f"RGB_local_{timestamp}_{effective_semantic_mode}"
     if enable_semantic:
         checkpoint_folder += f"_beta{args.segment_loss_weight}"
+    if args.use_balanced_loss:
+        checkpoint_folder += "_balanced"
+    if not args.use_canonical_norm:
+        checkpoint_folder += "_raw"
 
 save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{checkpoint_folder}/"
 os.makedirs(save_path, exist_ok=True)
 
 print(f"\n{'='*70}")
-print(f"🚀 CAN3TOK TRAINING - RGB + INDIVIDUAL TRACKING + PCA VISUALIZATION")
+print(f"🚀 CAN3TOK TRAINING - WITH NORMALIZATION CONTROL")
 print(f"{'='*70}")
 print(f"Configuration:")
 print(f"  Job ID: {job_id or 'local'}")
@@ -281,9 +404,31 @@ print(f"  Semantic Mode: {effective_semantic_mode}")
 print(f"  Semantic Enabled: {enable_semantic}")
 print(f"  PCA Visualization: ENABLED (every {args.pca_vis_freq} epochs)")
 print(f"  3DGS Reconstruction: ENABLED (every {args.recon_ply_freq} epochs, {args.recon_ply_num_scenes} scenes)")
-# print(f"  View reconstructions at: https://supersplat.at")
 print(f"  Parameters: 14 (WITH RGB COLOR!)")
 print(f"  Individual tracking: ENABLED")
+print(f"")
+print(f"🎯 NORMALIZATION SETTINGS:")
+print(f"  1. Canonical Sphere (Dataset): {'✅ ENABLED' if args.use_canonical_norm else '❌ DISABLED (RAW)'}")
+if args.use_canonical_norm:
+    print(f"     → Positions normalized to [-10, 10]m sphere")
+    print(f"     → Scales normalized proportionally")
+else:
+    print(f"     → Using raw coordinates (scene-dependent)")
+print(f"")
+print(f"  2. Color Normalization (Dataset): {'✅ ENABLED' if args.normalize_colors else '❌ DISABLED'}")
+if args.normalize_colors:
+    print(f"     → RGB colors normalized to [0, 1]")
+else:
+    print(f"     → RGB colors kept in [0, 255] range")
+    print(f"     ⚠️  WARNING: [0, 255] may cause training instability!")
+print(f"")
+print(f"  3. Balanced Loss (Training):   {'✅ ENABLED' if args.use_balanced_loss else '❌ DISABLED (STANDARD L2)'}")
+if args.use_balanced_loss:
+    print(f"     → All parameters contribute equally to loss")
+    print(f"     → Fixes color collapse & position compression")
+else:
+    print(f"     → Position errors will dominate loss")
+print(f"")
 print(f"  Device: {device}")
 print(f"  Save path: {save_path}")
 print(f"{'='*70}\n")
@@ -336,7 +481,8 @@ gs_dataset_train = gs_dataset(
     train=True,
     sampling_method=sampling_method,
     max_scenes=train_scenes,
-    normalize=True,
+    normalize=args.use_canonical_norm,  # ← Controlled by flag
+    normalize_colors=args.normalize_colors,  # ← NEW! Controlled by flag
     target_radius=10.0,
 )
 
@@ -361,7 +507,8 @@ gs_dataset_val = gs_dataset(
     train=True,
     sampling_method=sampling_method,
     max_scenes=val_scenes,
-    normalize=True,
+    normalize=args.use_canonical_norm,  # ← Controlled by flag
+    normalize_colors=args.normalize_colors,  # ← NEW! Controlled by flag
     target_radius=10.0,
 )
 
@@ -380,6 +527,8 @@ print("="*70)
 print(f"✓ Training: {len(gs_dataset_train)} scenes, {len(trainDataLoader)} batches")
 print(f"✓ Validation: {len(gs_dataset_val)} scenes, {len(valDataLoader)} batches")
 print(f"✓ Sampling method: {sampling_method}")
+print(f"✓ Canonical normalization: {'ENABLED' if args.use_canonical_norm else 'DISABLED (RAW)'}")
+print(f"✓ Color normalization: {'[0, 1]' if args.normalize_colors else '[0, 255]'}")
 print("="*70)
 print()
 
@@ -391,16 +540,6 @@ def evaluate_model(model, dataloader, device, failure_threshold,
                    save_path=None, epoch=None, enable_pca_vis=True, num_vis_scenes=10):
     """
     Evaluate model with individual parameter tracking + PCA visualization.
-    
-    Args:
-        model: The model to evaluate
-        dataloader: Validation dataloader
-        device: Device to use
-        failure_threshold: Threshold for failure detection
-        save_path: Directory to save visualizations
-        epoch: Current epoch number
-        enable_pca_vis: Whether to generate PCA visualizations
-        num_vis_scenes: Number of scenes to visualize (default: 10)
     """
     model.eval()
     
@@ -418,12 +557,12 @@ def evaluate_model(model, dataloader, device, failure_threshold,
     total_rotation_loss = 0.0
     
     # PCA visualization: collect first N scenes separately
-    scene_data_list = []  # List of dicts, one per scene
+    scene_data_list = []
     scenes_collected = 0
-    max_scenes_for_visualization = num_vis_scenes  # First 10 scenes
+    max_scenes_for_visualization = num_vis_scenes
 
     # 3DGS reconstruction: collect first M scenes separately
-    recon_preds_list = []   # List of (N, 14) arrays, one per scene
+    recon_preds_list = []
     recon_scenes_collected = 0
     max_scenes_for_recon = args.recon_ply_num_scenes
     
@@ -437,10 +576,15 @@ def evaluate_model(model, dataloader, device, failure_threshold,
                 segment_labels = None
             
             batch_size = UV_gs_batch.shape[0]
+
+            if i_batch == 0:
+                voxel_centers = UV_gs_batch[:, :, 0:3].detach().cpu().numpy()
+                gauss_positions = UV_gs_batch[:, :, 4:7].detach().cpu().numpy()
+                print(f"\n🔍 COORDINATE SYSTEM CHECK:")
+                print(f"  Voxel centers range:      [{voxel_centers.min():.2f}, {voxel_centers.max():.2f}]")
+                print(f"  Gaussian positions range: [{gauss_positions.min():.2f}, {gauss_positions.max():.2f}]")
             
-            # ================================================================
             # Temporarily enable training mode for semantic features
-            # ================================================================
             need_semantic = (enable_pca_vis and 
                            scenes_collected < max_scenes_for_visualization and
                            segment_labels is not None and
@@ -461,35 +605,23 @@ def evaluate_model(model, dataloader, device, failure_threshold,
             # Restore eval mode
             if need_semantic and not was_training:
                 model.eval()
-            # ================================================================
             
             target = UV_gs_batch[:, :, GEOMETRIC_INDICES]
             UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 14)
-
-            # # Normalize to [-1, 1] for loss computation
-            # target_scaled = target.clone()
-            # target_scaled[:, :, 0:3] /= 10.0   # positions now in [-0.9, +0.9]
-
-            # pred_scaled = UV_gs_recover_reshaped.clone()
-            # pred_scaled[:, :, 0:3] /= 10.0     # predictions now in comparable range
-
-            # # recon_loss_raw = torch.norm(pred_scaled - target_scaled, p=2) / batch_size
-
-            # # Total L2 error
-            # batch_l2_error = torch.norm(
-            #     pred_scaled - target_scaled,
-            #     p=2
-            # ) / batch_size
-
-
             
-            # Total L2 error
-            batch_l2_error = torch.norm(
-                UV_gs_recover_reshaped - target,
-                p=2
-            ) / batch_size
+            # ═══════════════════════════════════════════════════════════════
+            # Compute loss using balanced or standard method
+            # ═══════════════════════════════════════════════════════════════
+            batch_l2_error = compute_balanced_loss(
+                UV_gs_recover_reshaped,
+                target,
+                batch_size,
+                use_balanced=args.use_balanced_loss,  # ← Controlled by flag
+                colors_normalized=args.normalize_colors  # ← NEW! Pass color norm flag
+            )
+            # ═══════════════════════════════════════════════════════════════
             
-            # Individual losses
+            # Individual losses (always computed for tracking)
             individual_losses = compute_individual_losses(
                 UV_gs_recover_reshaped,
                 target,
@@ -521,9 +653,7 @@ def evaluate_model(model, dataloader, device, failure_threshold,
             total_scale_loss += individual_losses['scale'].item() * batch_size
             total_rotation_loss += individual_losses['rotation'].item() * batch_size
             
-            # ============================================================
-            # Collect features for PCA visualization (first N scenes)
-            # ============================================================
+            # Collect features for PCA visualization
             if (enable_pca_vis and 
                 scenes_collected < max_scenes_for_visualization and
                 per_gaussian_features is not None and
@@ -532,25 +662,19 @@ def evaluate_model(model, dataloader, device, failure_threshold,
                 epoch % args.pca_vis_freq == 0):
                 
                 try:
-                    # Extract position and color from input
-                    # Format: [voxel(3), idx(1), xyz(3), rgb(3), opacity(1), scale(3), quat(4)]
-                    pos = UV_gs_batch[:, :, 4:7].cpu().numpy()  # [B, 40000, 3]
-                    col = UV_gs_batch[:, :, 7:10].cpu().numpy()  # [B, 40000, 3]
-                    
-                    # Extract semantic features [B, 40000, 32]
+                    pos = UV_gs_batch[:, :, 4:7].cpu().numpy()
+                    col = UV_gs_batch[:, :, 7:10].cpu().numpy()
                     sem_feat = per_gaussian_features.cpu().numpy()
                     
-                    # Process each scene in the batch individually
                     for scene_idx in range(batch_size):
                         if scenes_collected >= max_scenes_for_visualization:
                             break
                         
-                        # Extract data for this scene
                         scene_dict = {
-                            'semantic_features': sem_feat[scene_idx],      # [40000, 32]
-                            'positions': pos[scene_idx],                   # [40000, 3]
-                            'colors': col[scene_idx],                      # [40000, 3]
-                            'coords': pos[scene_idx],                      # [40000, 3] (same as positions)
+                            'semantic_features': sem_feat[scene_idx],
+                            'positions': pos[scene_idx],
+                            'colors': col[scene_idx],
+                            'coords': pos[scene_idx],
                             'scene_id': scenes_collected
                         }
                         
@@ -560,21 +684,18 @@ def evaluate_model(model, dataloader, device, failure_threshold,
                 except Exception as e:
                     print(f"⚠️  Could not extract features for PCA visualization: {e}")
 
-            # ============================================================
             # Collect predictions for 3DGS PLY reconstruction
-            # ============================================================
             if (recon_scenes_collected < max_scenes_for_recon and
                 epoch is not None and
                 epoch % args.recon_ply_freq == 0):
 
                 try:
-                    # UV_gs_recover_reshaped is [B, N, 14]
-                    pred_np = UV_gs_recover_reshaped.cpu().numpy()  # [B, N, 14]
+                    pred_np = UV_gs_recover_reshaped.cpu().numpy()
 
                     for scene_idx in range(batch_size):
                         if recon_scenes_collected >= max_scenes_for_recon:
                             break
-                        recon_preds_list.append(pred_np[scene_idx])  # (N, 14)
+                        recon_preds_list.append(pred_np[scene_idx])
                         recon_scenes_collected += 1
 
                 except Exception as e:
@@ -586,9 +707,7 @@ def evaluate_model(model, dataloader, device, failure_threshold,
     
     per_scene_l2_errors = np.array(per_scene_l2_errors)
     
-    # ============================================================
-    # Generate PCA Visualizations (Per-Scene)
-    # ============================================================
+    # Generate PCA Visualizations
     pca_paths = {}
     if (enable_pca_vis and 
         len(scene_data_list) > 0 and 
@@ -601,16 +720,13 @@ def evaluate_model(model, dataloader, device, failure_threshold,
         print("="*70)
         print(f"Generating PCA visualizations for {len(scene_data_list)} scenes...")
         
-        # Create epoch-specific directory
         vis_dir = Path(save_path) / "pca_visualizations" / f"epoch_{epoch:03d}"
         vis_dir.mkdir(parents=True, exist_ok=True)
         
-        # Generate visualization for each scene
         for scene_idx, scene_data in enumerate(scene_data_list):
             try:
                 print(f"\nProcessing scene {scene_idx}/{len(scene_data_list)-1}...")
                 
-                # Generate comparison visualizations for this scene
                 scene_pca_paths = visualize_comparison(
                     coords=scene_data['coords'],
                     semantic_features=scene_data['semantic_features'],
@@ -621,7 +737,6 @@ def evaluate_model(model, dataloader, device, failure_threshold,
                     brightness=args.pca_brightness
                 )
                 
-                # Store paths
                 pca_paths[f'scene_{scene_idx:03d}'] = scene_pca_paths
                 
             except Exception as e:
@@ -634,9 +749,7 @@ def evaluate_model(model, dataloader, device, failure_threshold,
         print(f"  Location: {vis_dir}")
         print("="*70)
 
-    # ============================================================
-    # Save Reconstructed 3DGS PLY Files (supersplat.at viewable)
-    # ============================================================
+    # Save Reconstructed 3DGS PLY Files
     recon_paths = {}
     if (len(recon_preds_list) > 0 and
         save_path is not None and
@@ -644,10 +757,7 @@ def evaluate_model(model, dataloader, device, failure_threshold,
         epoch % args.recon_ply_freq == 0):
 
         try:
-            # Stack into [M, N, 14]
             all_preds = np.stack(recon_preds_list, axis=0)
-
-            # Save into epoch-specific subdirectory
             recon_dir = Path(save_path) / "reconstructed_gaussians" / f"epoch_{epoch:03d}"
 
             recon_paths = save_reconstructed_gaussians(
@@ -657,7 +767,6 @@ def evaluate_model(model, dataloader, device, failure_threshold,
                 num_scenes=len(recon_preds_list),
                 max_sh_degree=args.recon_ply_max_sh,
                 color_mode="1",
-                # max_scale_act=0.5,  # clamp scale_act before log → max 0.5m splat
                 prefix="scene"
             )
 
@@ -674,15 +783,12 @@ def evaluate_model(model, dataloader, device, failure_threshold,
         'failure_rate': failure_rate,
         'avg_kl': avg_kl,
         'per_scene_errors': per_scene_l2_errors,
-        # Individual losses
         'position_loss': total_position_loss / num_scenes,
         'color_loss': total_color_loss / num_scenes,
         'opacity_loss': total_opacity_loss / num_scenes,
         'scale_loss': total_scale_loss / num_scenes,
         'rotation_loss': total_rotation_loss / num_scenes,
-        # PCA visualization paths
         'pca_paths': pca_paths,
-        # 3DGS reconstruction paths (viewable on supersplat.at)
         'recon_paths': recon_paths,
     }
 
@@ -706,7 +812,7 @@ origin_offset = torch.tensor(
 # ============================================================================
 
 print("="*70)
-print("STARTING TRAINING WITH INDIVIDUAL PARAMETER TRACKING + PCA VISUALIZATION")
+print("STARTING TRAINING WITH NORMALIZATION CONTROL")
 print("="*70)
 print()
 
@@ -773,10 +879,6 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             UV_gs_batch, 
             UV_gs_batch[:, :, :3]
         )
-
-        
-  
-
         
         # Compute losses
         KL_loss = -0.5 * torch.sum(
@@ -786,58 +888,29 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         
         target = UV_gs_batch[:, :, GEOMETRIC_INDICES]
         UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 14)
-
-
-        # Around line 856, after:
-        # shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features = gs_autoencoder(...)
-
         
+        # ═══════════════════════════════════════════════════════════════
+        # Compute reconstruction loss using balanced or standard method
+        # ═══════════════════════════════════════════════════════════════
+        recon_loss_raw = compute_balanced_loss(
+            UV_gs_recover_reshaped,
+            target,
+            UV_gs_batch.shape[0],
+            use_balanced=args.use_balanced_loss,  # ← Controlled by flag
+            colors_normalized=args.normalize_colors  # ← NEW! Pass color norm flag
+        )
+        # ═══════════════════════════════════════════════════════════════
 
-        
-        # Normalize to [-1, 1] for loss computation
-        # target_scaled = target.clone()
-        # target_scaled[:, :, 0:3] /= 10.0   # positions now in [-0.9, +0.9]
-
-        # pred_scaled = UV_gs_recover_reshaped.clone()
-        # pred_scaled[:, :, 0:3] /= 10.0     # predictions now in comparable range
-
-            # recon_loss_raw = torch.norm(pred_scaled - target_scaled, p=2) / batch_size
-
-        # recon_loss_raw = torch.norm(
-        #     pred_scaled - target_scaled,
-        #     p=2
-        # ) / UV_gs_batch.shape[0]
-
-        recon_loss_raw = torch.norm(
-            UV_gs_recover_reshaped - target,
-            p=2
-        ) / UV_gs_batch.shape[0]
-
-
-        # 🔍 ADD THIS DEBUG BLOCK:
+        # Debug output
         if i_batch == 0:
-            UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 14)
             coord_pred = UV_gs_recover_reshaped[:, :, 0:3].detach().cpu().numpy()
             coord_target = target[:, :, 0:3].detach().cpu().numpy()
-
-            # # UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 14)
-            # coord_pred = pred_scaled[:, :, 0:3].detach().cpu().numpy()
-            # coord_target = target_scaled[:, :, 0:3].detach().cpu().numpy()
             
             print(f"\n🔍 EPOCH {epoch} - MODEL OUTPUT DIAGNOSTIC:")
             print(f"  Input (target) coord range:  [{coord_target.min():.2f}, {coord_target.max():.2f}]")
             print(f"  Model output coord range:    [{coord_pred.min():.2f}, {coord_pred.max():.2f}]")
-            
-            # if coord_pred.min() > -1.0 and coord_pred.max() < 2.0:
-            #     # print(f"  ⚠️  MODEL OUTPUTS [0, 1] RANGE!")
-            #     # print(f"  ⚠️  This model was trained with OLD normalization!")
-            #     # print(f"  ⚠️  Need to RETRAIN from scratch with canonical sphere dataset!")
-            # elif coord_pred.min() < -5.0 and coord_pred.max() > 5.0:
-            #     print(f"  ✓ Model outputs canonical sphere range!")
-            # else:
-            #     print(f"  ⚠️  Unexpected output range - might be early in training")
         
-        # Compute individual losses
+        # Compute individual losses (for tracking)
         individual_losses = compute_individual_losses(
             UV_gs_recover_reshaped,
             target,
@@ -895,7 +968,6 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
                 "train/step_loss": loss_value,
                 "train/step_recon_loss": recon_loss_raw_value,
                 "train/step_kl_loss": kl_loss_value,
-                # Individual parameter losses
                 "train/step_position_loss": individual_losses['position'].item(),
                 "train/step_color_loss": individual_losses['color'].item(),
                 "train/step_opacity_loss": individual_losses['opacity'].item(),
@@ -921,12 +993,14 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             if semantic_loss_value > 0:
                 print_msg += f" | Semantic: {semantic_loss_value:.4f}"
             
-            # Print individual losses
             print_msg += f"\n  └─ Pos: {individual_losses['position'].item():.2f} | "
             print_msg += f"Color: {individual_losses['color'].item():.2f} | "
             print_msg += f"Opacity: {individual_losses['opacity'].item():.2f} | "
             print_msg += f"Scale: {individual_losses['scale'].item():.2f} | "
             print_msg += f"Rot: {individual_losses['rotation'].item():.2f}"
+            
+            if args.use_balanced_loss:
+                print_msg += " [BALANCED]"
             
             print(print_msg)
     
@@ -957,7 +1031,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             failure_threshold,
             save_path=save_path,
             epoch=epoch,
-            enable_pca_vis=enable_semantic,  # Only if semantic mode enabled
+            enable_pca_vis=enable_semantic,
             num_vis_scenes=args.pca_num_scenes
         )
         
@@ -982,6 +1056,8 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
                 'val_l2_error': val_metrics['avg_l2_error'],
                 'semantic_mode': effective_semantic_mode,
                 'enable_semantic': enable_semantic,
+                'use_balanced_loss': args.use_balanced_loss,
+                'use_canonical_norm': args.use_canonical_norm,
             }, best_model_path)
             print(f"  ✓ New best model! (L2: {best_val_loss:.2f})")
         
@@ -995,7 +1071,6 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             "train/epoch_kl": avg_train_kl,
             "train/epoch_semantic": avg_train_semantic,
             "train/epoch": epoch,
-            # Individual epoch losses
             "train/epoch_position": avg_position,
             "train/epoch_color": avg_color,
             "train/epoch_opacity": avg_opacity,
@@ -1028,6 +1103,8 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             'train_loss': avg_train_loss,
             'semantic_mode': effective_semantic_mode,
             'enable_semantic': enable_semantic,
+            'use_balanced_loss': args.use_balanced_loss,
+            'use_canonical_norm': args.use_canonical_norm,
         }, checkpoint_path)
         print(f"✓ Checkpoint saved: epoch_{epoch}.pth")
 
@@ -1070,6 +1147,8 @@ torch.save({
     'best_epoch': best_epoch,
     'semantic_mode': effective_semantic_mode,
     'enable_semantic': enable_semantic,
+    'use_balanced_loss': args.use_balanced_loss,
+    'use_canonical_norm': args.use_canonical_norm,
     'individual_losses': {
         'position': final_val_metrics['position_loss'],
         'color': final_val_metrics['color_loss'],
@@ -1089,6 +1168,8 @@ if wandb_enabled:
         "best_epoch": best_epoch,
         "semantic_mode": effective_semantic_mode,
         "enable_semantic": enable_semantic,
+        "use_balanced_loss": args.use_balanced_loss,
+        "use_canonical_norm": args.use_canonical_norm,
         "final_position_loss": final_val_metrics['position_loss'],
         "final_color_loss": final_val_metrics['color_loss'],
         "final_opacity_loss": final_val_metrics['opacity_loss'],
@@ -1098,5 +1179,7 @@ if wandb_enabled:
     
     wandb_run.finish()
 
-print("\n🎉 Training complete with PCA feature visualization!")
-print(f"Check {save_path}/pca_visualizations/ for semantic feature visualizations!")
+print("\n🎉 Training complete with normalization control!")
+print(f"Configuration used:")
+print(f"  - Canonical norm: {args.use_canonical_norm}")
+print(f"  - Balanced loss: {args.use_balanced_loss}")

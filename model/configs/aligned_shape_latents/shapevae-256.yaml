@@ -2,7 +2,7 @@ model:
   target: model.michelangelo.models.tsal.asl_pl_module.AlignedShapeAsLatentPLModule
   params:
     shape_module_cfg:
-      target: model.michelangelo.models.tsal.sal_perceiver.AlignedShapeLatentPerceiver
+      target: model.michelangelo.models.tsal.sal_perceiver_ll_initialization.AlignedShapeLatentPerceiver
       params:
         num_latents: 256 #256 512
         embed_dim: 32

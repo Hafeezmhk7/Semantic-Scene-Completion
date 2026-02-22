@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/baseliner_val=train_cannorm_200e_3k.out
+#SBATCH --output=logs/baseliner_val=train_cannorm_200e_3k_8.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
@@ -74,7 +74,7 @@ SAMPLING_STRATEGY="balanced"
 BATCH_SIZE=64
 NUM_EPOCHS=200
 LEARNING_RATE=1e-4
-KL_WEIGHT=1e-4                 # ← Fixed: was 1e-4 (too strong)
+KL_WEIGHT=1e-5                # ← Fixed: was 1e-4 (too strong)
 RECON_SCALE=1.0              # ← Fixed: was 1.0 (too dominant)
 EVAL_EVERY=10
 FAILURE_THRESHOLD=100
@@ -83,8 +83,8 @@ FAILURE_THRESHOLD=100
 # DATASET CONFIGURATION
 # ============================================================================
 
-TRAIN_SCENES=3000
-VAL_SCENES=10
+TRAIN_SCENES=3500
+VAL_SCENES=30
 SAMPLING_METHOD="opacity"
 
 # ============================================================================
@@ -102,6 +102,22 @@ PCA_BRIGHTNESS=1.25            # Color brightness for PCA visualization
 RECON_PLY_FREQ=5              # Save reconstructed 3DGS PLY every N epochs
 RECON_PLY_NUM_SCENES=5         # Number of scenes to reconstruct
 RECON_PLY_MAX_SH=3             # Max SH degree (f_rest terms = 0)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🎯 NORMALIZATION CONTROL
+# ════════════════════════════════════════════════════════════════════════════
+
+# Dataset normalization (canonical sphere for positions & scales)
+USE_CANONICAL_NORM=True     # True = normalize to [-10, 10], False = raw coordinates
+
+# Loss function normalization (per-parameter balancing)
+USE_BALANCED_LOSS=True      # True = balanced loss, False = standard L2
+
+echo "🎯 NORMALIZATION SETTINGS:"
+echo "   Dataset (canonical sphere): $([ "$USE_CANONICAL_NORM" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
+echo "   Loss (parameter balancing): $([ "$USE_BALANCED_LOSS" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
+echo ""
 
 # ============================================================================
 # WEIGHTS & BIASES CONFIGURATION

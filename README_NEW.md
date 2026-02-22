@@ -72,7 +72,7 @@ We add a **semantic projection head** that extracts per-Gaussian features for co
 
 We explored three different strategies to extract per-Gaussian semantic features:
 
-### Approach 1: Hidden State Projection ⭐ (Current Implementation)
+### Approach 1: Hidden State Projection  (Current Implementation)
 
 **Architecture:**
 ```python
@@ -184,7 +184,6 @@ features = [
 - **Total categories:** 72 (indices 0-71)
 - **Missing categories:** [13, 53, 61] (never appear in dataset)
 - **Most frequent:** Wall, floor, cabinet, bed, chair, sofa, table
-- **Expected random loss:** log(72) ≈ 4.28
 
 **Category distribution example:**
 ```
@@ -198,7 +197,7 @@ Top 5 categories cover ~70% of points:
 
 ---
 
-## 🧠 Semantic Contrastive Learning
+##  Semantic Contrastive Learning
 
 ### Loss Function Architecture
 
@@ -250,7 +249,7 @@ Similar to segment-level but uses instance IDs instead of categories. Currently 
 
 ---
 
-## 🎛️ Training Configuration
+##  Training Configuration
 
 ### Key Modifications from Original Can3Tok
 
@@ -297,15 +296,11 @@ semantic_subsample = 2000
 recon_scale = 1000.0
 ```
 
-### Hardware Requirements
 
-- **GPUs:** 8× NVIDIA GPUs (DataParallel training)
-- **Memory:** ~40GB per GPU (with batch_size=64, hidden state approach)
-- **Training time:** ~2-3 days for 1000 epochs on 7K scenes
 
 ---
 
-## 📈 Evaluation Metrics
+##  Evaluation Metrics
 
 ### Reconstruction Quality
 
@@ -324,23 +319,11 @@ recon_scale = 1000.0
    - Mean, std, min, max, median L2 errors
    - Useful for identifying failure modes
 
-### Semantic Learning Quality
 
-1. **Segment Loss** (InfoNCE)
-   - Should decrease during training
-   - Random baseline: log(72) ≈ 4.28
-
-2. **Category Alignment**
-   - Measure clustering quality in latent space
-   - Use t-SNE visualization (see `tsne_exp*`)
-
-3. **Semantic Consistency**
-   - Check if semantically similar scenes have similar latents
-   - Qualitative evaluation through generation
 
 ---
 
-## 🚀 Usage
+##  Usage
 
 ### Training
 
@@ -379,18 +362,11 @@ python gs_can3tok_2.py \
 --val_scenes INT                              # Limit validation scenes
 ```
 
-### Dataset Inspection
 
-```bash
-# Analyze semantic label distribution
-python gs_dataset_scenesplat.py /path/to/data
-
-# Output: Category statistics, missing labels, coverage analysis
-```
 
 ---
 
-## 📂 Code Structure
+##  Code Structure
 
 ### Core Files
 
@@ -426,202 +402,14 @@ python gs_dataset_scenesplat.py /path/to/data
 
 ---
 
-## 🔬 Experimental Insights
 
-### Findings from Three Approaches
 
-| Approach | Parameters | Speed | Memory | Semantic Quality |
-|----------|-----------|-------|--------|-----------------|
-| **Hidden State** | 329M | Fast | 40GB | ⭐⭐⭐ Best semantic abstraction |
-| **Geometric** | 45K | Fastest | 20GB | ⭐⭐ Good, geometry-grounded |
-| **Attention** | 158M | Medium | 35GB | ⭐⭐⭐ Best spatial reasoning |
 
-### Loss Balancing Challenges
 
-**Problem:** Reconstruction loss (~10,000) >> Semantic loss (~4.0)
 
-**Solution:** Scale reconstruction loss by 1000×
-```python
-recon_loss_scaled = recon_loss_raw / 1000.0
-total_loss = recon_loss_scaled + 0.1 * semantic_loss
-```
 
-**Effect:** 
-- Gradients become comparable in magnitude
-- Semantic loss can influence learning without being overwhelmed
-- Reconstruction quality remains high (L2 ~3000-5000)
 
-### Sampling Strategy Impact
 
-**Opacity-based sampling** (current default):
-- Prioritizes visible Gaussians
-- Better reconstruction quality
-- More relevant semantic information
 
-**Random sampling:**
-- Uniform coverage of scene
-- May include background/noise Gaussians
-- Lower reconstruction quality
 
----
 
-## 🎯 Research Questions & Future Work
-
-### Current Research Questions
-
-1. **Which semantic feature extraction approach is best?**
-   - Hidden state: Global scene context
-   - Geometric: Direct geometry-semantics link
-   - Attention: Spatial relationship modeling
-
-2. **How to balance reconstruction vs. semantics?**
-   - Current: recon_scale=1000, segment_weight=0.1
-   - Need systematic hyperparameter search
-
-3. **Does semantic learning improve generation quality?**
-   - Hypothesis: Semantically-aware latents → better scene completion
-   - Needs evaluation on downstream tasks
-
-### Future Directions
-
-1. **Semantic Scene Completion**
-   - Given partial scene, complete missing regions
-   - Use semantic priors from learned latent space
-
-2. **Category-Conditional Generation**
-   - Generate scenes with specific object categories
-   - Control: "living room with sofa and TV"
-
-3. **Hierarchical Semantic Learning**
-   - Current: Only segment-level
-   - Add: Room-level, object-level, part-level
-
-4. **Multi-Modal Conditioning**
-   - Text-to-3D scene generation
-   - Image-guided scene completion
-
-5. **Diffusion Models in Latent Space**
-   - Train diffusion prior on semantic latents
-   - Enable diverse scene generation
-
----
-
-## 📚 Related Work
-
-### Building Upon
-
-1. **Can3Tok** (ICCV 2025)
-   - First scene-level 3D Gaussian VAE
-   - Canonical tokenization for 3D scenes
-
-2. **3D Gaussian Splatting** (SIGGRAPH 2023)
-   - Explicit 3D representation
-   - Fast rendering via splatting
-
-3. **SceneSplat / DL3DV-10K**
-   - Large-scale 3D scene datasets
-   - ScanNet72 semantic annotations
-
-### Relevant Methods
-
-- **PointNet++**: Per-point feature learning
-- **SimCLR**: Contrastive learning for representations
-- **CLIP**: Multi-modal embedding alignment
-- **Semantic-NeRF**: Semantic field learning
-
----
-
-## 🏆 Contributions
-
-### Novel Aspects
-
-1. **First semantic-aware 3D Gaussian VAE**
-   - Original Can3Tok: Geometry only
-   - This work: Geometry + semantics
-
-2. **Three semantic feature extraction strategies**
-   - Systematic comparison of architectures
-   - Trade-offs analysis (speed, memory, quality)
-
-3. **Contrastive learning for 3DGS**
-   - Adapted InfoNCE loss for per-Gaussian features
-   - ScanNet72 category prototypes
-
-4. **SceneSplat integration**
-   - First work to use SceneSplat for generative modeling
-   - Importance sampling for 40K Gaussians
-
----
-
-## 🙏 Acknowledgments
-
-**Original Can3Tok Authors:**
-- Quankai Gao, Iliyan Georgiev, Tuanfeng Y. Wang, Krishna Kumar Singh, Ulrich Neumann, Jae Shin Yoon
-
-**Datasets:**
-- DL3DV-10K / SceneSplat teams
-- ScanNet dataset creators
-
-**Frameworks:**
-- 3D Gaussian Splatting (INRIA)
-- Michelangelo (Neural Carver)
-- PyTorch Lightning
-
----
-
-## 📧 Contact
-
-For questions about this Master's thesis project, please contact:
-- Student: [Your Name]
-- Supervisor: [Supervisor Name]
-- Institution: [University Name]
-
----
-
-## 📄 Citation
-
-If you use this work, please cite both the original Can3Tok paper and acknowledge this extension:
-
-```bibtex
-@INPROCEEDINGS{gao2025can3tok,
-  author = {Quankai Gao and Iliyan Georgiev and Tuanfeng Y. Wang and Krishna Kumar Singh and Ulrich Neumann and Jae Shin Yoon},
-  title = {Can3Tok: Canonical 3D Tokenization and Latent Modeling of Scene-Level 3D Gaussians},
-  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
-  year = {2025}
-}
-
-@mastersthesis{yourname2025semantic,
-  title = {Semantic-Aware 3D Scene Generation with Can3Tok},
-  author = {Your Name},
-  year = {2025},
-  school = {Your University}
-}
-```
-
----
-
-## 📋 TODO / Known Issues
-
-### High Priority
-- [ ] Systematic hyperparameter search for loss weights
-- [ ] Ablation study: Which approach works best?
-- [ ] Quantitative semantic evaluation metrics
-- [ ] Memory optimization for hidden state approach
-
-### Medium Priority
-- [ ] Implement semantic scene completion pipeline
-- [ ] Add category-conditional generation
-- [ ] t-SNE visualization of learned latents
-- [ ] Comparison with baseline (no semantic loss)
-
-### Low Priority
-- [ ] Support for other semantic taxonomies (not just ScanNet72)
-- [ ] Mixed precision training (FP16)
-- [ ] Distributed training across multiple nodes
-- [ ] Interactive demo for scene editing
-
----
-
-**Last Updated:** February 2026  
-**Status:** Active Development  
-**License:** Same as Can3Tok (check original repository)
