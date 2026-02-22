@@ -1,11 +1,12 @@
 """
-Can3Tok Training - WITH NORMALIZATION CONTROL FLAGS
-====================================================
-RGB COLOR + INDIVIDUAL PARAMETER TRACKING + PCA VISUALIZATION + NORMALIZATION CONTROL
+Can3Tok Training - SIMPLE COLOR WEIGHTING
+==========================================
+RGB COLOR + INDIVIDUAL PARAMETER TRACKING + PCA VISUALIZATION
 
-NEW FEATURES:
-- --use_balanced_loss flag: Toggle per-parameter loss normalization
-- Dataset normalization controlled separately in dataset file
+SIMPLIFIED:
+- Standard L2 loss (no complex balanced loss)
+- Optional color weighting (multiply color loss by weight)
+- Dataset normalization controlled by flags
 """
 
 import torch
@@ -86,142 +87,107 @@ print(f"   Rotation (q):   indices {PARAM_SLICES['rotation']}")
 print()
 
 # ============================================================================
-# INDIVIDUAL LOSS COMPUTATION FUNCTION
+# INDIVIDUAL LOSS COMPUTATION (FOR TRACKING ONLY)
 # ============================================================================
 
-def compute_individual_losses(prediction, target, batch_size):
+def compute_individual_losses(prediction, target):
     """
     Compute L2 loss for each parameter type separately.
+    Used ONLY for monitoring/debugging - not for backprop.
     
     Args:
         prediction: [B, 40000, 14] reconstructed Gaussians
         target: [B, 40000, 14] ground truth Gaussians
-        batch_size: B
     
     Returns:
-        dict with individual losses
+        dict with individual losses (raw L2 norms, not normalized)
     """
     losses = {}
     
     # Position loss (xyz)
-    pos_pred = prediction[:, :, PARAM_SLICES['position']]
-    pos_target = target[:, :, PARAM_SLICES['position']]
-    losses['position'] = torch.norm(pos_pred - pos_target, p=2) / batch_size
+    pos_diff = prediction[:, :, PARAM_SLICES['position']] - target[:, :, PARAM_SLICES['position']]
+    losses['position'] = torch.norm(pos_diff, p=2).item()
     
     # Color loss (rgb)
-    color_pred = prediction[:, :, PARAM_SLICES['color']]
-    color_target = target[:, :, PARAM_SLICES['color']]
-    losses['color'] = torch.norm(color_pred - color_target, p=2) / batch_size
+    color_diff = prediction[:, :, PARAM_SLICES['color']] - target[:, :, PARAM_SLICES['color']]
+    losses['color'] = torch.norm(color_diff, p=2).item()
     
     # Opacity loss (α)
-    opacity_pred = prediction[:, :, PARAM_SLICES['opacity']]
-    opacity_target = target[:, :, PARAM_SLICES['opacity']]
-    losses['opacity'] = torch.norm(opacity_pred - opacity_target, p=2) / batch_size
+    opacity_diff = prediction[:, :, PARAM_SLICES['opacity']] - target[:, :, PARAM_SLICES['opacity']]
+    losses['opacity'] = torch.norm(opacity_diff, p=2).item()
     
     # Scale loss (sx, sy, sz)
-    scale_pred = prediction[:, :, PARAM_SLICES['scale']]
-    scale_target = target[:, :, PARAM_SLICES['scale']]
-    losses['scale'] = torch.norm(scale_pred - scale_target, p=2) / batch_size
+    scale_diff = prediction[:, :, PARAM_SLICES['scale']] - target[:, :, PARAM_SLICES['scale']]
+    losses['scale'] = torch.norm(scale_diff, p=2).item()
     
     # Rotation loss (quaternion)
-    rotation_pred = prediction[:, :, PARAM_SLICES['rotation']]
-    rotation_target = target[:, :, PARAM_SLICES['rotation']]
-    losses['rotation'] = torch.norm(rotation_pred - rotation_target, p=2) / batch_size
-    
-    # Total (for verification)
-    losses['total_individual'] = sum(losses.values())
+    rotation_diff = prediction[:, :, PARAM_SLICES['rotation']] - target[:, :, PARAM_SLICES['rotation']]
+    losses['rotation'] = torch.norm(rotation_diff, p=2).item()
     
     return losses
 
 
 # ============================================================================
-# BALANCED LOSS COMPUTATION FUNCTION (NEW!)
+# SIMPLE RECONSTRUCTION LOSS WITH COLOR WEIGHTING
 # ============================================================================
 
-def compute_balanced_loss(prediction, target, batch_size, use_balanced=False, colors_normalized=True):
+def compute_reconstruction_loss(prediction, target,batch_size, color_weight=1.0):
     """
-    Compute L2 loss with optional per-parameter normalization.
+    Compute L2 reconstruction loss with optional color weighting.
     
-    This function can operate in two modes:
-    1. Standard mode (use_balanced=False): Regular L2 loss across all parameters
-    2. Balanced mode (use_balanced=True): Normalizes each parameter type to [0, 1]
-       before computing loss, ensuring equal contribution from all parameters.
-    
-    The balanced mode solves the color collapse and position compression issues by
-    preventing position errors (which are naturally larger) from dominating the loss.
+    SIMPLE AND CLEAN:
+    - If color_weight=1.0: Standard L2 loss across all parameters
+    - If color_weight>1.0: Color errors weighted more heavily
     
     Args:
         prediction: [B, 40000, 14] reconstructed Gaussians
         target: [B, 40000, 14] ground truth Gaussians
-        batch_size: B
-        use_balanced: Whether to normalize parameters (default: False)
-        colors_normalized: Whether colors are in [0,1] (True) or [0,255] (False)
+        batch_size: int, size of the batch (used for normalization)
+        color_weight: Multiplier for color loss (default: 1.0)
     
     Returns:
-        Total loss value (scalar tensor)
+        Scalar loss tensor
     
     Example:
-        >>> # Standard loss (position dominates)
-        >>> loss = compute_balanced_loss(pred, target, 64, use_balanced=False)
-        >>> # Position contributes ~90, color contributes ~12
+        >>> # Standard L2 loss
+        >>> loss = compute_reconstruction_loss(pred, target, color_weight=1.0)
         
-        >>> # Balanced loss (equal contributions)
-        >>> loss = compute_balanced_loss(pred, target, 64, use_balanced=True)
-        >>> # Position contributes ~15, color contributes ~15
+        >>> # Emphasize color learning (3× weight)
+        >>> loss = compute_reconstruction_loss(pred, target, color_weight=3.0)
     """
-    if not use_balanced:
-        # === STANDARD L2 LOSS (Original behavior) ===
-        # All parameters treated equally in raw space
-        # Position errors dominate due to larger magnitude
-        return torch.norm(prediction - target, p=2) / batch_size
     
-    # === BALANCED LOSS: Normalize each parameter to [0, 1] ===
-    # This ensures all parameters contribute equally to the total loss
+    if color_weight == 1.0:
+        # ═══════════════════════════════════════════════════════════════
+        # STANDARD L2 LOSS - All parameters weighted equally
+        # ═══════════════════════════════════════════════════════════════
+        diff = prediction - target
+        loss = torch.norm(diff, p=2)
+        return loss
     
-    # Position: Assume range [-10, 10] → normalize to [0, 1]
-    pos_pred = (prediction[:, :, 0:3] + 10.0) / 20.0
-    pos_target = (target[:, :, 0:3] + 10.0) / 20.0
-    pos_loss = torch.norm(pos_pred - pos_target, p=2)
-    
-    # Color: Handle both [0, 1] and [0, 255] ranges
-    if colors_normalized:
-        # Already in [0, 1] range
-        color_loss = torch.norm(
-            prediction[:, :, 3:6] - target[:, :, 3:6], p=2
-        )
     else:
-        # Colors in [0, 255] → normalize to [0, 1]
-        color_pred = prediction[:, :, 3:6] / 255.0
-        color_target = target[:, :, 3:6] / 255.0
-        color_loss = torch.norm(color_pred - color_target, p=2)
-    
-    # Opacity: Already in [0, 1] range
-    opacity_loss = torch.norm(
-        prediction[:, :, 6:7] - target[:, :, 6:7], p=2
-    )
-    
-    # Scale: Assume typical range [0.01, 0.5] → normalize to [0, 1]
-    # We use 0.5 as the max expected scale
-    scale_pred = torch.clamp(prediction[:, :, 7:10], 0.0, 0.5) / 0.5
-    scale_target = torch.clamp(target[:, :, 7:10], 0.0, 0.5) / 0.5
-    scale_loss = torch.norm(scale_pred - scale_target, p=2)
-    
-    # Rotation: Quaternions in [-1, 1] → normalize to [0, 1]
-    rot_pred = (prediction[:, :, 10:14] + 1.0) / 2.0
-    rot_target = (target[:, :, 10:14] + 1.0) / 2.0
-    rot_loss = torch.norm(rot_pred - rot_target, p=2)
-    
-    # Equal contribution from all parameters
-    total_loss = (pos_loss + color_loss + opacity_loss + scale_loss + rot_loss) / batch_size
-    
-    return total_loss
+        # ═══════════════════════════════════════════════════════════════
+        # COLOR-WEIGHTED L2 LOSS
+        # ═══════════════════════════════════════════════════════════════
+        # Separate parameters
+        diff_pos = prediction[:, :, 0:3] - target[:, :, 0:3]
+        diff_color = prediction[:, :, 3:6] - target[:, :, 3:6]
+        diff_other = prediction[:, :, 6:] - target[:, :, 6:]
+        
+        # Compute L2 norms
+        loss_pos = torch.norm(diff_pos, p=2)
+        loss_color = torch.norm(diff_color, p=2) * color_weight  # ← Weighted!
+        loss_other = torch.norm(diff_other, p=2)
+        
+        # Combine
+        total_loss = loss_pos + loss_color + loss_other
+        return total_loss / batch_size  # Normalize by batch size
 
 
 # ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
 
-parser = argparse.ArgumentParser(description='Can3Tok Training - With Normalization Control')
+parser = argparse.ArgumentParser(description='Can3Tok Training - Simple Color Weighting')
 parser.add_argument('--use_wandb', action='store_true', default=False)
 parser.add_argument('--wandb_project', type=str, default='Can3Tok-RGB-PCA')
 parser.add_argument('--wandb_entity', type=str, default='3D-SSC')
@@ -238,7 +204,6 @@ parser.add_argument('--segment_loss_weight', type=float, default=0.0)
 parser.add_argument('--instance_loss_weight', type=float, default=0.0)
 parser.add_argument('--semantic_temperature', type=float, default=0.07)
 parser.add_argument('--semantic_subsample', type=int, default=2000)
-parser.add_argument('--recon_scale', type=float, default=1000.0)
 parser.add_argument('--semantic_mode', type=str, default='none', 
                     choices=['none', 'hidden', 'geometric', 'attention'])
 parser.add_argument('--sampling_strategy', type=str, default='balanced',
@@ -257,12 +222,12 @@ parser.add_argument('--recon_ply_max_sh', type=int, default=3,
                     help='Max SH degree for reconstructed PLY (default: 3)')
 
 # ============================================================================
-# NEW: NORMALIZATION CONTROL FLAGS
+# COLOR WEIGHTING & NORMALIZATION FLAGS
 # ============================================================================
-parser.add_argument('--use_balanced_loss', action='store_true', default=False,
-                    help='Use per-parameter normalized loss (fixes color collapse)')
+parser.add_argument('--color_loss_weight', type=float, default=1.0,
+                    help='Weight for color loss (default: 1.0, try 3.0-5.0 for better color learning)')
 
-# Canonical normalization control (mutually exclusive flags)
+# Canonical normalization control
 norm_group = parser.add_mutually_exclusive_group()
 norm_group.add_argument('--use_canonical_norm', dest='use_canonical_norm',
                        action='store_true', default=True,
@@ -271,7 +236,7 @@ norm_group.add_argument('--no_canonical_norm', dest='use_canonical_norm',
                        action='store_false',
                        help='Disable canonical sphere normalization (use raw coordinates)')
 
-# Color normalization control (mutually exclusive flags)
+# Color normalization control
 color_norm_group = parser.add_mutually_exclusive_group()
 color_norm_group.add_argument('--normalize_colors', dest='normalize_colors',
                              action='store_true', default=True,
@@ -307,8 +272,8 @@ if args.use_wandb:
         run_name = f"can3tok_RGB_job_{job_id}_{effective_semantic_mode}"
         if enable_semantic:
             run_name += f"_beta{args.segment_loss_weight}"
-        if args.use_balanced_loss:
-            run_name += "_balanced"
+        if args.color_loss_weight > 1.0:
+            run_name += f"_color{args.color_loss_weight}"
         if not args.use_canonical_norm:
             run_name += "_raw"
         
@@ -318,7 +283,7 @@ if args.use_wandb:
             name=run_name,
             config={
                 "learning_rate": args.lr,
-                "architecture": "Can3Tok-RGB-Individual-Tracking-PCA",
+                "architecture": "Can3Tok-RGB-Simple",
                 "dataset": "SceneSplat-7K",
                 "batch_size": args.batch_size,
                 "epochs": args.num_epochs,
@@ -326,13 +291,10 @@ if args.use_wandb:
                 "semantic_mode": effective_semantic_mode,
                 "enable_semantic": enable_semantic,
                 "num_params": 14,
-                "individual_tracking": True,
-                "pca_visualization": True,
-                "pca_vis_freq": args.pca_vis_freq,
-                "use_balanced_loss": args.use_balanced_loss,
+                "color_loss_weight": args.color_loss_weight,
                 "use_canonical_norm": args.use_canonical_norm,
             },
-            tags=["rgb-color", "individual-tracking", "pca-visualization", "normalization-control"],
+            tags=["rgb-color", "simple-loss", "color-weighting"],
         )
         print("✓ Weights & Biases enabled")
         wandb_enabled = True
@@ -353,7 +315,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # CONFIGURATION
 # ============================================================================
 
-loss_usage = "L1"
+loss_usage = "L2"
 random_permute = 0
 random_rotation = 0
 
@@ -378,8 +340,8 @@ if job_id:
     checkpoint_folder = f"RGB_job_{job_id}_{effective_semantic_mode}"
     if enable_semantic:
         checkpoint_folder += f"_beta{args.segment_loss_weight}"
-    if args.use_balanced_loss:
-        checkpoint_folder += "_balanced"
+    if args.color_loss_weight > 1.0:
+        checkpoint_folder += f"_color{args.color_loss_weight}"
     if not args.use_canonical_norm:
         checkpoint_folder += "_raw"
 else:
@@ -387,8 +349,8 @@ else:
     checkpoint_folder = f"RGB_local_{timestamp}_{effective_semantic_mode}"
     if enable_semantic:
         checkpoint_folder += f"_beta{args.segment_loss_weight}"
-    if args.use_balanced_loss:
-        checkpoint_folder += "_balanced"
+    if args.color_loss_weight > 1.0:
+        checkpoint_folder += f"_color{args.color_loss_weight}"
     if not args.use_canonical_norm:
         checkpoint_folder += "_raw"
 
@@ -396,7 +358,7 @@ save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{checkpoint_
 os.makedirs(save_path, exist_ok=True)
 
 print(f"\n{'='*70}")
-print(f"🚀 CAN3TOK TRAINING - WITH NORMALIZATION CONTROL")
+print(f"🚀 CAN3TOK TRAINING - SIMPLE COLOR WEIGHTING")
 print(f"{'='*70}")
 print(f"Configuration:")
 print(f"  Job ID: {job_id or 'local'}")
@@ -407,11 +369,19 @@ print(f"  3DGS Reconstruction: ENABLED (every {args.recon_ply_freq} epochs, {arg
 print(f"  Parameters: 14 (WITH RGB COLOR!)")
 print(f"  Individual tracking: ENABLED")
 print(f"")
+print(f"🎯 TRAINING SETTINGS:")
+print(f"  1. Loss Type: Standard L2")
+print(f"  2. Color Weight: {args.color_loss_weight}×")
+if args.color_loss_weight > 1.0:
+    print(f"     → Color errors weighted {args.color_loss_weight}× more than other params")
+else:
+    print(f"     → All parameters weighted equally")
+print(f"")
 print(f"🎯 NORMALIZATION SETTINGS:")
 print(f"  1. Canonical Sphere (Dataset): {'✅ ENABLED' if args.use_canonical_norm else '❌ DISABLED (RAW)'}")
 if args.use_canonical_norm:
     print(f"     → Positions normalized to [-10, 10]m sphere")
-    print(f"     → Scales normalized proportionally")
+    print(f"     → Scales in log-space")
 else:
     print(f"     → Using raw coordinates (scene-dependent)")
 print(f"")
@@ -421,13 +391,6 @@ if args.normalize_colors:
 else:
     print(f"     → RGB colors kept in [0, 255] range")
     print(f"     ⚠️  WARNING: [0, 255] may cause training instability!")
-print(f"")
-print(f"  3. Balanced Loss (Training):   {'✅ ENABLED' if args.use_balanced_loss else '❌ DISABLED (STANDARD L2)'}")
-if args.use_balanced_loss:
-    print(f"     → All parameters contribute equally to loss")
-    print(f"     → Fixes color collapse & position compression")
-else:
-    print(f"     → Position errors will dominate loss")
 print(f"")
 print(f"  Device: {device}")
 print(f"  Save path: {save_path}")
@@ -481,8 +444,8 @@ gs_dataset_train = gs_dataset(
     train=True,
     sampling_method=sampling_method,
     max_scenes=train_scenes,
-    normalize=args.use_canonical_norm,  # ← Controlled by flag
-    normalize_colors=args.normalize_colors,  # ← NEW! Controlled by flag
+    normalize=args.use_canonical_norm,
+    normalize_colors=args.normalize_colors,
     target_radius=10.0,
 )
 
@@ -507,8 +470,8 @@ gs_dataset_val = gs_dataset(
     train=True,
     sampling_method=sampling_method,
     max_scenes=val_scenes,
-    normalize=args.use_canonical_norm,  # ← Controlled by flag
-    normalize_colors=args.normalize_colors,  # ← NEW! Controlled by flag
+    normalize=args.use_canonical_norm,
+    normalize_colors=args.normalize_colors,
     target_radius=10.0,
 )
 
@@ -533,14 +496,12 @@ print("="*70)
 print()
 
 # ============================================================================
-# EVALUATION FUNCTION WITH PCA VISUALIZATION
+# EVALUATION FUNCTION
 # ============================================================================
 
 def evaluate_model(model, dataloader, device, failure_threshold, 
                    save_path=None, epoch=None, enable_pca_vis=True, num_vis_scenes=10):
-    """
-    Evaluate model with individual parameter tracking + PCA visualization.
-    """
+    """Evaluate model with individual parameter tracking + PCA visualization."""
     model.eval()
     
     total_l2_error = 0.0
@@ -556,12 +517,12 @@ def evaluate_model(model, dataloader, device, failure_threshold,
     total_scale_loss = 0.0
     total_rotation_loss = 0.0
     
-    # PCA visualization: collect first N scenes separately
+    # PCA visualization: collect first N scenes
     scene_data_list = []
     scenes_collected = 0
     max_scenes_for_visualization = num_vis_scenes
 
-    # 3DGS reconstruction: collect first M scenes separately
+    # 3DGS reconstruction: collect first M scenes
     recon_preds_list = []
     recon_scenes_collected = 0
     max_scenes_for_recon = args.recon_ply_num_scenes
@@ -609,23 +570,18 @@ def evaluate_model(model, dataloader, device, failure_threshold,
             target = UV_gs_batch[:, :, GEOMETRIC_INDICES]
             UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 14)
             
-            # ═══════════════════════════════════════════════════════════════
-            # Compute loss using balanced or standard method
-            # ═══════════════════════════════════════════════════════════════
-            batch_l2_error = compute_balanced_loss(
+            # Compute reconstruction loss
+            batch_l2_error = compute_reconstruction_loss(
                 UV_gs_recover_reshaped,
                 target,
-                batch_size,
-                use_balanced=args.use_balanced_loss,  # ← Controlled by flag
-                colors_normalized=args.normalize_colors  # ← NEW! Pass color norm flag
+                batch_size=batch_size,
+                color_weight=args.color_loss_weight
             )
-            # ═══════════════════════════════════════════════════════════════
             
-            # Individual losses (always computed for tracking)
+            # Individual losses (for tracking only)
             individual_losses = compute_individual_losses(
                 UV_gs_recover_reshaped,
-                target,
-                batch_size
+                target
             )
             
             per_scene_norms = torch.norm(
@@ -640,18 +596,18 @@ def evaluate_model(model, dataloader, device, failure_threshold,
                 dim=1
             )
             
-            total_l2_error += batch_l2_error.item() * batch_size
+            total_l2_error += batch_l2_error.item()
             total_kl += kl_loss.sum().item()
             per_scene_l2_errors.extend(per_scene_errors_scaled.cpu().numpy().tolist())
             num_failures += (per_scene_errors_scaled.cpu().numpy() > failure_threshold).sum()
             num_scenes += batch_size
             
             # Accumulate individual losses
-            total_position_loss += individual_losses['position'].item() * batch_size
-            total_color_loss += individual_losses['color'].item() * batch_size
-            total_opacity_loss += individual_losses['opacity'].item() * batch_size
-            total_scale_loss += individual_losses['scale'].item() * batch_size
-            total_rotation_loss += individual_losses['rotation'].item() * batch_size
+            total_position_loss += individual_losses['position']
+            total_color_loss += individual_losses['color']
+            total_opacity_loss += individual_losses['opacity']
+            total_scale_loss += individual_losses['scale']
+            total_rotation_loss += individual_losses['rotation']
             
             # Collect features for PCA visualization
             if (enable_pca_vis and 
@@ -812,7 +768,7 @@ origin_offset = torch.tensor(
 # ============================================================================
 
 print("="*70)
-print("STARTING TRAINING WITH NORMALIZATION CONTROL")
+print("STARTING TRAINING - SIMPLE L2 WITH COLOR WEIGHTING")
 print("="*70)
 print()
 
@@ -880,7 +836,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             UV_gs_batch[:, :, :3]
         )
         
-        # Compute losses
+        # Compute KL loss
         KL_loss = -0.5 * torch.sum(
             1.0 + log_var - mu.pow(2) - log_var.exp(), 
             dim=1
@@ -890,14 +846,13 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 14)
         
         # ═══════════════════════════════════════════════════════════════
-        # Compute reconstruction loss using balanced or standard method
+        # RECONSTRUCTION LOSS - Simple L2 with optional color weighting
         # ═══════════════════════════════════════════════════════════════
-        recon_loss_raw = compute_balanced_loss(
+        recon_loss = compute_reconstruction_loss(
             UV_gs_recover_reshaped,
             target,
-            UV_gs_batch.shape[0],
-            use_balanced=args.use_balanced_loss,  # ← Controlled by flag
-            colors_normalized=args.normalize_colors  # ← NEW! Pass color norm flag
+            batch_size=UV_gs_batch.shape[0],
+            color_weight=args.color_loss_weight
         )
         # ═══════════════════════════════════════════════════════════════
 
@@ -910,14 +865,11 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             print(f"  Input (target) coord range:  [{coord_target.min():.2f}, {coord_target.max():.2f}]")
             print(f"  Model output coord range:    [{coord_pred.min():.2f}, {coord_pred.max():.2f}]")
         
-        # Compute individual losses (for tracking)
+        # Compute individual losses (for tracking only)
         individual_losses = compute_individual_losses(
             UV_gs_recover_reshaped,
-            target,
-            UV_gs_batch.shape[0]
+            target
         )
-        
-        recon_loss = recon_loss_raw / args.recon_scale
         
         # Semantic contrastive loss
         semantic_loss = torch.tensor(0.0, device=device)
@@ -941,7 +893,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         
         # Save values for logging
         loss_value = loss.item()
-        recon_loss_raw_value = recon_loss_raw.item()
+        recon_loss_value = recon_loss.item()
         kl_loss_value = KL_loss.item()
         semantic_loss_value = semantic_loss.item()
         
@@ -951,28 +903,28 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         
         # Accumulate losses
         epoch_loss += loss_value
-        epoch_recon_loss += recon_loss_raw_value
+        epoch_recon_loss += recon_loss_value
         epoch_kl_loss += kl_loss_value
         epoch_semantic_loss += semantic_loss_value
         
         # Accumulate individual losses
-        epoch_position_loss += individual_losses['position'].item()
-        epoch_color_loss += individual_losses['color'].item()
-        epoch_opacity_loss += individual_losses['opacity'].item()
-        epoch_scale_loss += individual_losses['scale'].item()
-        epoch_rotation_loss += individual_losses['rotation'].item()
+        epoch_position_loss += individual_losses['position']
+        epoch_color_loss += individual_losses['color']
+        epoch_opacity_loss += individual_losses['opacity']
+        epoch_scale_loss += individual_losses['scale']
+        epoch_rotation_loss += individual_losses['rotation']
         
         # Log to wandb
         if wandb_enabled:
             log_dict = {
                 "train/step_loss": loss_value,
-                "train/step_recon_loss": recon_loss_raw_value,
+                "train/step_recon_loss": recon_loss_value,
                 "train/step_kl_loss": kl_loss_value,
-                "train/step_position_loss": individual_losses['position'].item(),
-                "train/step_color_loss": individual_losses['color'].item(),
-                "train/step_opacity_loss": individual_losses['opacity'].item(),
-                "train/step_scale_loss": individual_losses['scale'].item(),
-                "train/step_rotation_loss": individual_losses['rotation'].item(),
+                "train/step_position_loss": individual_losses['position'],
+                "train/step_color_loss": individual_losses['color'],
+                "train/step_opacity_loss": individual_losses['opacity'],
+                "train/step_scale_loss": individual_losses['scale'],
+                "train/step_rotation_loss": individual_losses['rotation'],
             }
             
             if semantic_metrics:
@@ -987,20 +939,20 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         if i_batch == 0:
             print_msg = (f"Epoch {epoch}/{num_epochs} | "
                         f"Loss: {loss_value:.2f} | "
-                        f"Recon: {recon_loss_raw_value:.2f} | "
+                        f"Recon: {recon_loss_value:.2f} | "
                         f"KL: {kl_loss_value:.2f}")
             
             if semantic_loss_value > 0:
                 print_msg += f" | Semantic: {semantic_loss_value:.4f}"
             
-            print_msg += f"\n  └─ Pos: {individual_losses['position'].item():.2f} | "
-            print_msg += f"Color: {individual_losses['color'].item():.2f} | "
-            print_msg += f"Opacity: {individual_losses['opacity'].item():.2f} | "
-            print_msg += f"Scale: {individual_losses['scale'].item():.2f} | "
-            print_msg += f"Rot: {individual_losses['rotation'].item():.2f}"
+            print_msg += f"\n  └─ Pos: {individual_losses['position']:.2f} | "
+            print_msg += f"Color: {individual_losses['color']:.2f} | "
+            print_msg += f"Opacity: {individual_losses['opacity']:.2f} | "
+            print_msg += f"Scale: {individual_losses['scale']:.2f} | "
+            print_msg += f"Rot: {individual_losses['rotation']:.2f}"
             
-            if args.use_balanced_loss:
-                print_msg += " [BALANCED]"
+            if args.color_loss_weight > 1.0:
+                print_msg += f" [COLOR_WEIGHT={args.color_loss_weight}]"
             
             print(print_msg)
     
@@ -1056,7 +1008,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
                 'val_l2_error': val_metrics['avg_l2_error'],
                 'semantic_mode': effective_semantic_mode,
                 'enable_semantic': enable_semantic,
-                'use_balanced_loss': args.use_balanced_loss,
+                'color_loss_weight': args.color_loss_weight,
                 'use_canonical_norm': args.use_canonical_norm,
             }, best_model_path)
             print(f"  ✓ New best model! (L2: {best_val_loss:.2f})")
@@ -1103,7 +1055,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             'train_loss': avg_train_loss,
             'semantic_mode': effective_semantic_mode,
             'enable_semantic': enable_semantic,
-            'use_balanced_loss': args.use_balanced_loss,
+            'color_loss_weight': args.color_loss_weight,
             'use_canonical_norm': args.use_canonical_norm,
         }, checkpoint_path)
         print(f"✓ Checkpoint saved: epoch_{epoch}.pth")
@@ -1147,7 +1099,7 @@ torch.save({
     'best_epoch': best_epoch,
     'semantic_mode': effective_semantic_mode,
     'enable_semantic': enable_semantic,
-    'use_balanced_loss': args.use_balanced_loss,
+    'color_loss_weight': args.color_loss_weight,
     'use_canonical_norm': args.use_canonical_norm,
     'individual_losses': {
         'position': final_val_metrics['position_loss'],
@@ -1168,7 +1120,7 @@ if wandb_enabled:
         "best_epoch": best_epoch,
         "semantic_mode": effective_semantic_mode,
         "enable_semantic": enable_semantic,
-        "use_balanced_loss": args.use_balanced_loss,
+        "color_loss_weight": args.color_loss_weight,
         "use_canonical_norm": args.use_canonical_norm,
         "final_position_loss": final_val_metrics['position_loss'],
         "final_color_loss": final_val_metrics['color_loss'],
@@ -1179,7 +1131,7 @@ if wandb_enabled:
     
     wandb_run.finish()
 
-print("\n🎉 Training complete with normalization control!")
+print("\n🎉 Training complete - simple L2 with color weighting!")
 print(f"Configuration used:")
 print(f"  - Canonical norm: {args.use_canonical_norm}")
-print(f"  - Balanced loss: {args.use_balanced_loss}")
+print(f"  - Color weight: {args.color_loss_weight}")

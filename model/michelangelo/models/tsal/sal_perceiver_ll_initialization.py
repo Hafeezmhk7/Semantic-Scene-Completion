@@ -394,10 +394,10 @@ class GS_decoder(nn.Module):
         quat_raw    = raw_output[:, :, 10:14]
         
         # Apply activations
-        color = torch.sigmoid(color_raw)
-        opacity = torch.sigmoid(opacity_raw)
-        scale = F.softplus(scale_raw) + 1e-7
-        quat = F.normalize(quat_raw, p=2, dim=-1)
+        color = torch.clamp(color_raw, 0.0, 1.0)  # Linear gradients!
+        opacity = torch.sigmoid(opacity_raw)       # Keep sigmoid
+        scale = torch.exp(scale_raw)               # Log-space input
+        quat = F.normalize(quat_raw, p=2, dim=-1)  # Keep normalization
         
         # Recombine
         output = torch.cat([

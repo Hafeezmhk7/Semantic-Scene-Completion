@@ -6,14 +6,16 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/baseliner_val=train_cannorm_200e_3k_8.out
+#SBATCH --output=logs/baseliner_val=train_cannorm_200e_3k_9.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
-# CAN3TOK TRAINING - FULL SEMANTIC CONTROL
+# CAN3TOK TRAINING - FULL SEMANTIC CONTROL + COLOR WEIGHTING
 # ============================================================================
 # This job file gives you complete control over semantic learning via flags
 # No need to edit YAML files - everything controlled here!
+# 
+# NEW: Color loss weighting for balanced loss mode
 # ============================================================================
 
 echo "================================================================================"
@@ -75,15 +77,31 @@ BATCH_SIZE=64
 NUM_EPOCHS=200
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-5                # ← Fixed: was 1e-4 (too strong)
-RECON_SCALE=1.0              # ← Fixed: was 1.0 (too dominant)
+# RECON_SCALE=1.0              # ← Fixed: was 1.0 (too dominant)
 EVAL_EVERY=10
 FAILURE_THRESHOLD=100
+
+# ────────────────────────────────────────────────────────────────────────────
+# 🎨 Color Loss Weighting (NEW!)
+# ────────────────────────────────────────────────────────────────────────────
+# Controls color emphasis in balanced loss mode
+# Default: 1.0 (equal weight with other parameters)
+# Higher values: Force model to learn colors better (try 2.0-5.0)
+# Only active when USE_BALANCED_LOSS=True
+# ────────────────────────────────────────────────────────────────────────────
+COLOR_LOSS_WEIGHT=1.0
+
+# Recommended values:
+# 1.0 = Equal weight (default, balanced)
+# 2.0 = Moderate color emphasis (good starting point)
+# 3.0 = Strong color emphasis (recommended for gray collapse)
+# 5.0 = Very strong color emphasis (aggressive color learning)
 
 # ============================================================================
 # DATASET CONFIGURATION
 # ============================================================================
 
-TRAIN_SCENES=3500
+TRAIN_SCENES=500
 VAL_SCENES=30
 SAMPLING_METHOD="opacity"
 
@@ -100,7 +118,7 @@ PCA_BRIGHTNESS=1.25            # Color brightness for PCA visualization
 # ============================================================================
 
 RECON_PLY_FREQ=5              # Save reconstructed 3DGS PLY every N epochs
-RECON_PLY_NUM_SCENES=5         # Number of scenes to reconstruct
+RECON_PLY_NUM_SCENES=2        # Number of scenes to reconstruct
 RECON_PLY_MAX_SH=3             # Max SH degree (f_rest terms = 0)
 
 
@@ -112,7 +130,7 @@ RECON_PLY_MAX_SH=3             # Max SH degree (f_rest terms = 0)
 USE_CANONICAL_NORM=True     # True = normalize to [-10, 10], False = raw coordinates
 
 # Loss function normalization (per-parameter balancing)
-USE_BALANCED_LOSS=True      # True = balanced loss, False = standard L2
+# USE_BALANCED_LOSS=True      # True = balanced loss, False = standard L2
 
 echo "🎯 NORMALIZATION SETTINGS:"
 echo "   Dataset (canonical sphere): $([ "$USE_CANONICAL_NORM" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
@@ -188,6 +206,24 @@ echo "   Eval Every:        $EVAL_EVERY epochs"
 echo "   Failure Thresh:    $FAILURE_THRESHOLD"
 echo ""
 
+# ════════════════════════════════════════════════════════════════════════════
+# 🎨 COLOR LOSS WEIGHTING (NEW!)
+# ════════════════════════════════════════════════════════════════════════════
+echo "🎨 COLOR LOSS CONFIGURATION:"
+echo "   Color Loss Weight: $COLOR_LOSS_WEIGHT"
+if [ "$USE_BALANCED_LOSS" = "True" ]; then
+    echo "   Status:            ✅ ACTIVE (balanced loss enabled)"
+    if (( $(echo "$COLOR_LOSS_WEIGHT > 1.0" | bc -l) )); then
+        echo "   Effect:            🎯 Emphasizing color learning (${COLOR_LOSS_WEIGHT}× weight)"
+    else
+        echo "   Effect:            ⚖️  Equal weight with other parameters"
+    fi
+else
+    echo "   Status:            ⊘ INACTIVE (only active when balanced loss enabled)"
+fi
+echo ""
+# ════════════════════════════════════════════════════════════════════════════
+
 echo "📊 DATASET:"
 echo "   Training Scenes:   $TRAIN_SCENES"
 echo "   Val Scenes:        $VAL_SCENES"
@@ -207,7 +243,8 @@ echo "🌐 3DGS RECONSTRUCTION (supersplat.at):"
 echo "   Frequency:         Every $RECON_PLY_FREQ epochs"
 echo "   Scenes:            $RECON_PLY_NUM_SCENES per epoch"
 echo "   Max SH Degree:     $RECON_PLY_MAX_SH (f_rest = 0)"
-echo "   Color Mode:        Pre-normalized [0,1] → f_dc via C0"
+echo "   Color Mode:        Clamped [0,1] → f_dc via C0 (NO SIGMOID!)"
+echo "   Scale Mode:        Log-space → exp() activation (matches Can3Tok)"
 echo "   Total PLY Files:   $((NUM_EPOCHS / RECON_PLY_FREQ * RECON_PLY_NUM_SCENES)) files"
 echo "   Output:            checkpoints/.../reconstructed_gaussians/epoch_XXX/"
 echo "   View At:           https://supersplat.at"
@@ -263,7 +300,7 @@ TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
 TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
-TRAIN_CMD="$TRAIN_CMD --recon_scale $RECON_SCALE"
+# TRAIN_CMD="$TRAIN_CMD --recon_scale $RECON_SCALE"
 
 # ─── Dataset parameters ─────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
@@ -278,6 +315,9 @@ TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
+# ─── Color loss weighting (NEW!) ────────────────────────────────────────────
+TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
+
 # ─── PCA visualization parameters ───────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
 TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
@@ -287,6 +327,15 @@ TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+
+# ─── Normalization flags ────────────────────────────────────────────────────
+# if [ "$USE_BALANCED_LOSS" = "True" ]; then
+#     TRAIN_CMD="$TRAIN_CMD --use_balanced_loss"
+# fi
+
+if [ "$USE_CANONICAL_NORM" = "False" ]; then
+    TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+fi
 
 # ─── W&B ────────────────────────────────────────────────────────────────────
 if [ "$USE_WANDB" = "True" ]; then

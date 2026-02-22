@@ -185,43 +185,38 @@ def diagnose_scene(coord, rgb, opacity, scale, quat, ply_scales, ply_opacity):
         print(f"  ✓  High (> 0.8) → Splats are opaque")
     
     # ── SCALE ANALYSIS ────────────────────────────────────────────────────────
+    # ── 4. Scale Analysis ────────────────────────────────────────────────────
+    # 'scale' parameter is already the extracted scales from model output (log-space)
+    scales_raw = scale  # Log-space values from model
+    scales_linear = np.exp(scales_raw)  # Convert to meters
+    
     print(f"\n📏 SCALE ANALYSIS:")
-    print(f"  Model output:  [{scale.min():.4f}, {scale.max():.4f}]m")
+    print(f"  Model output (log):  [{scales_raw.min():.4f}, {scales_raw.max():.4f}]")
+    print(f"  After exp (meters):  [{scales_linear.min():.4f}, {scales_linear.max():.4f}]m")
+    print(f"  Mean scale:          {scales_linear.mean():.4f}m = {scales_linear.mean()*100:.1f}cm")
     
-    # Check for negative or zero scales
-    num_negative = np.sum(scale <= 0)
-    if num_negative > 0:
-        print(f"  ⚠️  {num_negative} NEGATIVE/ZERO scales! (impossible for post-exp)")
-        print(f"  → Model initialization problem or activation missing")
-    
-    # After log (for PLY)
-    scale_rendered = np.exp(ply_scales.astype(np.float64))
-    print(f"  After exp:     [{scale_rendered.min():.4f}, {scale_rendered.max():.4f}]m")
-    
-    avg_scale = scale_rendered.mean()
-    print(f"  Mean scale:    {avg_scale:.3f}m = {avg_scale*100:.1f}cm")
-    
-    # Invisible splats (too small)
-    num_tiny = np.sum(ply_scales <= -10)
-    if num_tiny > 0:
-        print(f"  ⚠️  {num_tiny} invisible splats (scale ≤ -10 in PLY)")
-    
-    # Scale interpretation
-    if avg_scale > 0.5:
+    # Check if scales are reasonable
+    if scales_linear.mean() > 0.5:
         print(f"  ⚠️  LARGE! (> 0.5m = 50cm) → Splats blooming into each other")
         print(f"  → Gray cloud appearance")
-        print(f"  → Scale loss should decrease (currently stuck?)")
-    elif avg_scale > 0.2:
-        print(f"  ⚠️  Medium (20-50cm) → Overlapping splats")
+        print(f"  → Model needs to learn smaller log-space values")
+    elif scales_linear.mean() < 0.01:
+        print(f"  ⚠️  TOO SMALL! (< 0.01m = 1cm) → Splats collapsing")
     else:
-        print(f"  ✓  Small (< 20cm) → Appropriate for indoor scenes")
+        print(f"  ✓  Reasonable scale (1-50cm)")
     
-    # Scale distribution
+    # Distribution analysis
+    small_scales = (scales_linear < 0.05).sum()
+    medium_scales = ((scales_linear >= 0.05) & (scales_linear < 0.10)).sum()
+    large_scales = ((scales_linear >= 0.10) & (scales_linear < 0.20)).sum()
+    huge_scales = (scales_linear >= 0.20).sum()
+    total = scales_linear.size
+    
     print(f"  Distribution:")
-    print(f"    < 5cm:   {np.sum(scale_rendered < 0.05)/len(scale_rendered.flatten())*100:.1f}%")
-    print(f"    5-10cm:  {np.sum((scale_rendered >= 0.05) & (scale_rendered < 0.10))/len(scale_rendered.flatten())*100:.1f}%")
-    print(f"    10-20cm: {np.sum((scale_rendered >= 0.10) & (scale_rendered < 0.20))/len(scale_rendered.flatten())*100:.1f}%")
-    print(f"    > 20cm:  {np.sum(scale_rendered >= 0.20)/len(scale_rendered.flatten())*100:.1f}%")
+    print(f"    < 5cm:   {small_scales/total*100:.1f}%")
+    print(f"    5-10cm:  {medium_scales/total*100:.1f}%")
+    print(f"    10-20cm: {large_scales/total*100:.1f}%")
+    print(f"    > 20cm:  {huge_scales/total*100:.1f}%")
     
     # ── ROTATION ANALYSIS ─────────────────────────────────────────────────────
     print(f"\n🔄 ROTATION ANALYSIS:")
@@ -293,7 +288,7 @@ def save_reconstructed_gaussians(
     predictions:   np.ndarray,
     output_dir:    Path,
     epoch:         int,
-    num_scenes:    int = 5,
+    num_scenes:    int = 2,
     max_sh_degree: int = 3,
     color_mode:    str = "1",
     prefix:        str = "scene",

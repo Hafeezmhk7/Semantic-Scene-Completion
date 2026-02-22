@@ -24,12 +24,60 @@ from tqdm import tqdm
 # 🎯 Canonical Sphere Normalization (Optional)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# def normalize_to_canonical_sphere(coord, scale, target_radius=10.0):
+#     """
+#     Normalize scene to canonical sphere (Optional - controlled by dataset flag).
+    
+#     This normalizes positions to fit in a sphere of radius target_radius.
+#     Scales are normalized proportionally (LINEAR SPACE, not log space).
+    
+#     Args:
+#         coord: [N, 3] Gaussian positions (xyz) - linear space
+#         scale: [N, 3] Gaussian scales - linear space (post-exp from PLY)
+#         target_radius: Fixed radius in meters (default 10.0)
+    
+#     Returns:
+#         coord_norm: [N, 3] Positions in canonical sphere
+#         scale_norm: [N, 3] Scales normalized proportionally
+#     """
+#     # Step 1: Center at origin
+#     center = coord.mean(axis=0)
+#     coord_centered = coord - center
+    
+#     # Step 2: Find maximum distance from origin
+#     distances = np.linalg.norm(coord_centered, axis=1)
+#     max_dist = distances.max()
+    
+#     # Handle edge case: empty or degenerate scene
+#     if max_dist < 1e-6:
+#         max_dist = 1.0
+    
+#     # Step 3: Scale to target radius
+#     # The 1.1 factor provides safety margin
+#     scale_factor = target_radius / (max_dist * 1.1)
+    
+#     # Step 4: Apply transformation
+#     coord_norm = coord_centered * scale_factor
+    
+#     # ═══════════════════════════════════════════════════════════════════
+#     # LINEAR SPACE NORMALIZATION
+#     # ═══════════════════════════════════════════════════════════════════
+#     # Scales are in LINEAR SPACE (meters), so multiply by scale_factor
+#     # scale_new = scale_old × factor
+#     # ═══════════════════════════════════════════════════════════════════
+#     scale_norm = scale * scale_factor  # ✓ Linear space
+#     # ═══════════════════════════════════════════════════════════════════
+    
+#     return coord_norm, scale_norm
+
+# REPLACE WITH:
 def normalize_to_canonical_sphere(coord, scale, target_radius=10.0):
     """
     Normalize scene to canonical sphere (Optional - controlled by dataset flag).
     
     This normalizes positions to fit in a sphere of radius target_radius.
-    Scales are normalized proportionally (LINEAR SPACE, not log space).
+    Scales are normalized proportionally in LOG SPACE (matches Can3Tok ICCV 2025).
     
     Args:
         coord: [N, 3] Gaussian positions (xyz) - linear space
@@ -38,7 +86,7 @@ def normalize_to_canonical_sphere(coord, scale, target_radius=10.0):
     
     Returns:
         coord_norm: [N, 3] Positions in canonical sphere
-        scale_norm: [N, 3] Scales normalized proportionally
+        scale_norm: [N, 3] Scales in LOG SPACE normalized proportionally
     """
     # Step 1: Center at origin
     center = coord.mean(axis=0)
@@ -60,12 +108,13 @@ def normalize_to_canonical_sphere(coord, scale, target_radius=10.0):
     coord_norm = coord_centered * scale_factor
     
     # ═══════════════════════════════════════════════════════════════════
-    # LINEAR SPACE NORMALIZATION
+    # LOG-SPACE NORMALIZATION (matches Can3Tok ICCV 2025)
     # ═══════════════════════════════════════════════════════════════════
-    # Scales are in LINEAR SPACE (meters), so multiply by scale_factor
-    # scale_new = scale_old × factor
+    # Convert scales to log-space, then add log(scale_factor)
+    # This matches Can3Tok: scale_norm = log(scale_old) + log(factor)
     # ═══════════════════════════════════════════════════════════════════
-    scale_norm = scale * scale_factor  # ✓ Linear space
+    scale_log = np.log(scale + 1e-7)  # Convert to log-space
+    scale_norm = scale_log + np.log(scale_factor)  # Log-space addition
     # ═══════════════════════════════════════════════════════════════════
     
     return coord_norm, scale_norm
@@ -255,13 +304,14 @@ class gs_dataset(Dataset):
             )
             
             # Verification on first training scene
-            if self.train and idx == 0:
-                stats = verify_canonical_normalization(coord, self.target_radius)
-                print(f"\n✓ Canonical sphere normalization verified (scene 0):")
-                print(f"  Max distance: {stats['max_distance']:.2f}m")
-                print(f"  Sphere utilization: {stats['utilization']:.1f}%")
-                print(f"  Position range: [{coord.min():.2f}, {coord.max():.2f}]m")
-                print(f"  Scale range: [{scale.min():.4f}, {scale.max():.4f}]m")
+            # if self.train and idx == 0:
+            #     stats = verify_canonical_normalization(coord, self.target_radius)
+            #     print(f"\n✓ Canonical sphere normalization verified (scene 0):")
+            #     print(f"  Max distance: {stats['max_distance']:.2f}m")
+            #     print(f"  Sphere utilization: {stats['utilization']:.1f}%")
+            #     print(f"  Position range: [{coord.min():.2f}, {coord.max():.2f}]m")
+            #     print(f"  Scale range (log): [{scale.min():.4f}, {scale.max():.4f}]")
+            #     print(f"  Scale range (exp): [{np.exp(scale.min()):.4f}, {np.exp(scale.max()):.4f}]m")
         else:
             # NO NORMALIZATION - use raw values
             if self.train and idx == 0:
