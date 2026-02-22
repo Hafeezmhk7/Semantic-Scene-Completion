@@ -1,78 +1,377 @@
 # Semantic-Aware Can3Tok: 3D Scene Generation with Semantic Scene Completion
 
-**Master's Thesis Project**  
-**Building on:** Can3Tok (ICCV 2025) - Canonical 3D Tokenization and Latent Modeling of Scene-Level 3D Gaussians
+## Implementation Differences from Original Can3Tok
+
+### 1. Dataset Format and Normalization
+
+**Can3Tok Original:**
+- **Data Format:** Raw 3DGS PLY files
+- **Scale Storage:** Log-space (stores `log(scale_meters)`)
+- **Canonical Normalization:**
+```python
+  # Positions
+  positions_norm = (positions - center) * scale_factor
+  
+  # Scales (log-space arithmetic)
+  scales_norm = scales + log(scale_factor)
+  # Because: log(scale_new) = log(scale_old × factor) 
+  #                          = log(scale_old) + log(factor)
+```
+
+**Our Implementation:**
+- **Data Format:** SceneSplat preprocessed .npy files
+- **Scale Storage:** Linear-space (stores `scale_meters` after exp())
+- **Canonical Normalization:**
+```python
+  # Positions (same as Can3Tok)
+  positions_norm = (positions - center) * scale_factor
+  
+  # Scales (linear-space arithmetic)
+  scales_norm = scales * scale_factor
+  # Direct multiplication because scales are already in meters
+```
+
+**Location:** `normalize_to_canonical_sphere()` function in `gs_dataset_scenesplat.py`
+
+### 2. Model Output
+- **Our Implementation:** 14 parameters including RGB colors (xyz, rgb, opacity, scale, quaternion)
+
+
+### 3. Decoder Architecture
+- **Can3Tok:** Raw outputs without explicit activations
+- **Our Implementation:** Added activation functions in final layer:
+  - Colors: sigmoid → [0, 1]
+  - Opacity: sigmoid → [0, 1]
+  - Scales: softplus → (0, +∞)
+  - Quaternions: L2 normalization → ||q|| = 1.0
+- **Location:** `GS_decoder` class in `sal_perceiver_II_initialization.py` 
+
+### 4. Encoder Structure
+- **Fixed Issue:** Previously missing voxel center Fourier embeddings
+- **Current:** Dual Fourier embeddings (voxel centers + actual xyz positions)
+- **Location:** `CrossAttentionEncoder` in `sal_perceiver_II_initialization.py` 
+
 
 ---
 
-##  Project Overview
+## File Structure and Usage
 
-This project enhances the Can3Tok framework by incorporating semantic information into the latent space of a 3D Gaussian Splatting (3DGS) Variational Autoencoder (VAE). The goal is to enable **semantic-aware 3D scene generation** and **semantic scene completion** by learning semantically meaningful latent representations.
+### Training Files
 
-### Key Innovation
-While the original Can3Tok learns geometric representations of 3D scenes, this work introduces **semantic contrastive learning** to ensure that the learned latent space captures both geometric and semantic properties of indoor scenes.
+**Main Training Script:**
+- `gs_can3tok_2.py` - Primary training script with all loss functions and training loop
 
----
+**Model Architecture:**
+- `model/michelangelo/models/tsal/sal_perceiver_II_initialization.py` - Contains:
+  - `AlignedShapeLatentPerceiver` - Main VAE model with 3 semantic modes
+  - `CrossAttentionEncoder` - Encoder with dual Fourier embeddings
+  - `GS_decoder` - Decoder with activation functions (outputs 14 params)
+  - `SemanticProjectionHead` classes - For semantic feature extraction
 
-##  Architecture Overview
+**Dataset Loading:**
+- `gs_dataset_scenesplat.py` - Loads SceneSplat scenes with ScanNet72 labels
+  - Handles importance sampling (top 40k Gaussians by opacity)
+  - Voxelization for positional encoding
+  - Canonical sphere normalization
 
-### Base Framework: Can3Tok VAE
+**Loss Functions:**
+- `semantic_losses.py` - Contains:
+  - `ScanNet72SemanticLoss` - InfoNCE contrastive loss for semantic learning
+  - Handles segment-level
 
-The Can3Tok architecture consists of three main components:
+**PLY Reconstruction:**
+- `gs_ply_reconstructor.py` - Converts model outputs to 3DGS PLY format
+  - RGB to SH coefficient conversion: `f_dc = (RGB - 0.5) / C0`
+  - Inverts activations: logit(opacity), log(scale)
+  - Normalizes quaternions
+  - 
 
-```
-Input: 3D Gaussians [B, 40k, 18]
-   ↓
-┌─────────────────────────────────────────────────┐
-│  ENCODER (Cross-Attention + Self-Attention)     │
-│  - Fourier embeddings for positional encoding   │
-│  - Cross-attention: queries attend to Gaussians │
-│  - Self-attention: refine latent tokens         │
-│  Output: Latent tokens [B, 512, 384]            │
-└─────────────────────────────────────────────────┘
-   ↓
-┌─────────────────────────────────────────────────┐
-│  LATENT BOTTLENECK (VAE)                        │
-│  - KL divergence regularization                 │
-│  - μ, log_σ² → z [B, 512, 32]                  │
-└─────────────────────────────────────────────────┘
-   ↓
-┌─────────────────────────────────────────────────┐
-│  DECODER (Transformer + MLP)                    │
-│  - Self-attention on latent tokens              │
-│  - 8-layer MLP decoder                          │
-│  Output: Reconstructed Gaussians [B, 40k, 11]  │
-└─────────────────────────────────────────────────┘
-```
+**Visualization:**
+- `visualize_input_scenes.py` - Converts input .npy scenes to PLY for comparison
+  - Applies same canonical normalization as training
+  
 
-### Our Enhancement: Semantic Feature Extraction
+**Configuration:**
+- `model/configs/aligned_shape_latents/shapevae-256.yaml` - VAE architecture config
 
-We add a **semantic projection head** that extracts per-Gaussian features for contrastive learning:
-
-```
-┌─────────────────────────────────────────────────┐
-│  SEMANTIC FEATURE EXTRACTION                    │
-│  (Three different approaches tested)            │
-│                                                 │
-│  Input: Intermediate decoder representations    │
-│  Output: Per-Gaussian features [B, 40k, 32]    │
-└─────────────────────────────────────────────────┘
-   ↓
-┌─────────────────────────────────────────────────┐
-│  CONTRASTIVE LEARNING                           │
-│  - Aggregate features by segment category       │
-│  - Create category prototypes                   │
-│  - InfoNCE loss with ScanNet72 labels          │
-└─────────────────────────────────────────────────┘
-```
+**Job Submission:**
+- `job_can3tok.sh` - SLURM job script for cluster training
 
 ---
 
-##  Three Approaches for Semantic Feature Extraction
+## Training Pipeline Flow
 
-We explored three different strategies to extract per-Gaussian semantic features:
+### 1. Data Loading (gs_dataset_scenesplat.py)
+```
+For each scene:
+1. Load .npy files (coord, color, opacity, scale, quat, segment, instance)
+2. Sample top 40k Gaussians by opacity (deterministic)
+3. Apply canonical sphere normalization:
+   - Center positions at origin
+   - Scale to fit in 10m radius sphere
+   - Scale proportionally applies to scales (linear space)
+4. Voxelize: assign each Gaussian to 40x40x40 grid (resolution=0.4m)
+5. Assemble 18-channel features:
+   [voxel_centers(3), voxel_id(1), xyz(3), color(3), opacity(1), scale(3), quat(4)]
+6. Return: features, segment_labels, instance_labels
+```
 
-### Approach 1: Hidden State Projection  (Current Implementation)
+### 2. Forward Pass (sal_perceiver.py)
+```
+Input: [B, 40k, 18] features
+
+ENCODER:
+1. Extract voxel_centers and xyz from features
+2. Apply dual Fourier embeddings:
+   - voxel_centers → Fourier → coarse spatial encoding
+   - xyz → Fourier → fine spatial encoding
+3. Concatenate [xyz_fourier, voxel_fourier, gaussian_params]
+4. Input projection → transformer width
+5. Cross-attention: queries attend to Gaussian features
+6. Self-attention: refine latent tokens
+   Output: [B, 512, 384] latent tokens
+
+VAE BOTTLENECK:
+1. Split: shape_embed [B, 384] + latents [B, 511, 384]
+2. Project to mean μ and log_var
+3. Sample: z = μ + σ * ε
+   Output: [B, 512, 32] compressed latents
+
+DECODER:
+1. Post-KL projection: [B, 512, 32] → [B, 512, 384]
+2. Transformer self-attention
+3. Flatten: [B, 512*384]
+4. 8-layer MLP decoder with activations:
+   - Raw output: [B, 40k, 14]
+   - Apply sigmoid(colors), sigmoid(opacity), softplus(scales), normalize(quat)
+   Output: [B, 40k, 14] activated Gaussians
+
+SEMANTIC HEAD (if enabled):
+1. Extract features from decoder hidden state or Gaussian params
+2. Project to [B, 40k, 32] per-Gaussian features
+3. L2 normalize features
+   Output: [B, 40k, 32] semantic features
+```
+
+### 3. Loss Computation (gs_can3tok_2.py)
+```
+RECONSTRUCTION LOSS:
+L_recon = ||Gaussians_pred - Gaussians_target||_2 / batch_size
+Scaled by recon_scale (default 1) to balance gradients
+
+KL DIVERGENCE:
+L_KL = KL(q(z|x) || N(0,I)) weighted by kl_weight (default 1e-5)
+
+SEMANTIC LOSS (if semantic_mode != 'none'):
+1. For each scene, extract valid Gaussians with segment labels
+2. Subsample 10k Gaussians for efficiency
+3. Create category prototypes by averaging features per category
+4. Compute InfoNCE loss with temperature=0.07
+L_segment = CrossEntropy(similarity_matrix, target_categories)
+Weighted by segment_loss_weight (0.1-10.0)
+
+TOTAL LOSS:
+L_total = L_recon + L_KL + segment_loss_weight * L_segment
+```
+
+### 4. Training Loop (gs_can3tok_2.py)
+```
+For each epoch:
+  For each batch:
+    1. Load batch of scenes with features and labels
+    2. Forward pass through model
+    3. Compute losses
+    4. Backward pass and optimizer step
+    5. Log metrics (L2 error, individual losses)
+  
+  Every 10 epochs:
+    - Run validation (compute val loss and L2 error)
+    - Save checkpoint
+    - Reconstruct 4 scenes to PLY files
+    - Track best model by validation L2 error
+```
+
+### 5. PLY Reconstruction (gs_ply_reconstructor.py)
+```
+Input: [B, 40k, 14] model predictions (post-activation)
+
+For each scene:
+1. Extract parameters:
+   - positions [40k, 3]
+   - colors [40k, 3] in [0,1]
+   - opacity [40k, 1] in [0,1]
+   - scales [40k, 3] in (0,∞)
+   - quaternions [40k, 4] normalized
+
+2. Convert to PLY format:
+   - colors: f_dc = (RGB - 0.5) / C0  (SH coefficient conversion)
+   - opacity: logit(opacity) = log(p / (1-p))  (inverse sigmoid)
+   - scales: log(scale)  (inverse softplus/exp)
+   - quaternions: already normalized
+
+3. Write to .ply file with proper structure
+4. View in supersplat.at 
+```
+
+---
+
+## Current Training Configuration
+
+### Default Hyperparameters
+```python
+# Architecture
+num_latents = 256
+embed_dim = 32
+width = 384
+num_encoder_layers = 6
+num_decoder_layers = 12
+
+# Optimization
+learning_rate = 1e-4
+batch_size = 64
+epochs = 200-2000
+kl_weight = 1e-5
+
+# Loss scaling
+recon_scale = 1000.0
+segment_loss_weight = 0.1-10.0
+semantic_temperature = 0.07
+semantic_subsample = 2000
+
+# Dataset
+sampling_method = 'opacity'  # Top 40k by opacity
+canonical_normalization = True  # 10m radius sphere
+```
+
+### Semantic Modes
+```bash
+--semantic_mode none        # No semantic learning (pure VAE)
+--semantic_mode hidden      # Hidden state projection (default)
+--semantic_mode geometric   # Geometric parameter projection
+--semantic_mode attention   # Cross-attention semantic head
+```
+
+---
+
+## Running Training
+
+### Basic Training (No Semantics)
+```bash
+python gs_can3tok_2.py \
+    --batch_size 64 \
+    --num_epochs 200 \
+    --lr 1e-4 \
+    --semantic_mode none
+```
+
+### Training with Semantic Learning
+```bash
+python gs_can3tok_2.py \
+    --batch_size 64 \
+    --num_epochs 1000 \
+    --lr 1e-4 \
+    --semantic_mode hidden \
+    --segment_loss_weight 0.1 \
+    --use_wandb
+```
+
+
+
+
+### Check PLY Reconstruction
+```bash
+# Verify PLY writer works correctly
+python gs_ply_reconstructor.py
+# Should print: "All tests passed!"
+
+# Compare input vs reconstructed
+python visualize_input_scenes.py \
+    --dataset-dir data/val_grid1.0cm_chunk8x8_stride6x6 \
+    --output-dir input_scenes_ply \
+    --num-scenes 5
+```
+
+
+## Evaluation Metrics
+
+### Reconstruction Quality
+
+1. **L2 Error** (primary metric)
+```python
+   L2_error = ||G_pred - G_true||_2 / sqrt(batch_size)
+```
+
+
+## Dataset: SceneSplat with ScanNet72 Labels
+
+### Dataset Structure
+
+Each scene directory contains:
+```
+scene_dir/
+├── coord.npy          # [N, 3] Gaussian positions
+├── color.npy          # [N, 3] RGB values
+├── scale.npy          # [N, 3] Anisotropic scales (linear space)
+├── quat.npy           # [N, 4] Rotation quaternions
+├── opacity.npy        # [N] Opacity values [0,1]
+├── segment.npy        # [N] ScanNet72 category labels (0-71)
+└── instance.npy       # [N] Instance IDs (-1 = background)
+```
+
+### ScanNet72 Categories
+
+- **Total categories:** 72 (indices 0-71)
+- **Missing categories:** [13, 53, 61] (never appear in dataset, handled in loss)
+- **Most frequent:** Wall (0), Floor (1), Ceiling (23), Cabinet (2), Window (8)
+
+---
+
+## Output Files
+
+### Checkpoints
+```
+checkpoints/RGB_job_<jobid>_<semantic_mode>/
+├── epoch_010.pth              # Model checkpoint
+├── epoch_020.pth
+├── best_model.pth             # Best model by validation L2
+├── final.pth                  # Final epoch model
+└── reconstructed_gaussians/
+    ├── epoch_010/
+    │   ├── scene_000_epoch_010.ply
+    │   ├── scene_001_epoch_010.ply
+    │   └── ...
+    └── epoch_020/
+        └── ...
+```
+
+### Logs
+```
+logs/
+└── can3tok_<jobid>.out        # Training output with all metrics
+```
+
+## Code Structure
+```
+.
+├── gs_can3tok_2.py                    # Main training script
+├── gs_dataset_scenesplat.py           # Dataset loader
+├── semantic_losses.py                 # Contrastive loss functions
+├── gs_ply_reconstructor.py            # PLY file writer (verified correct)
+├── visualize_input_scenes.py          # Input scene PLY converter
+├── job_can3tok.sh                     # SLURM job script
+└── model/
+    ├── configs/aligned_shape_latents/
+    │   └── shapevae-256.yaml          # Model configuration
+    └── michelangelo/models/tsal/
+        ├── sal_perceiver_II_initialization.py           # Model architecture (main file)
+        └── asl_pl_module.py           # PyTorch Lightning wrapper
+```
+
+---
+
+## Three Approaches for Semantic Feature Extraction
+
+### Approach 1: Hidden State Projection
 
 **Architecture:**
 ```python
@@ -85,35 +384,20 @@ Reshape to [B, 40k, 32]
 L2 normalization
 ```
 
-**Advantages:**
-- Extracts features from the deepest learned representation
-- Relatively efficient (329M parameters but manageable)
-- Captures high-level semantic abstractions
-
-**When to use:** When you want features that represent the entire scene's semantic context
-
----
+**When to use:** Default semantic mode, extracts features from deepest learned representation
 
 ### Approach 2: Geometric Parameter Projection
 
 **Architecture:**
 ```python
-Reconstructed Gaussians [B, 40k, 11]
+Reconstructed Gaussians [B, 40k, 14]
     ↓
-Per-Gaussian 3-layer MLP (11 → 128 → 128 → 32)
+Per-Gaussian 3-layer MLP (14 → 128 → 128 → 32)
     ↓
 L2 normalization
 ```
 
-**Advantages:**
-- Directly operates on geometric parameters (xyz, opacity, scale, quat)
-- Similar to SimCLR projection head
-- Most parameter-efficient approach
-- Each Gaussian processed independently
-
 **When to use:** When you want semantic features grounded in geometry
-
----
 
 ### Approach 3: Cross-Attention Semantic Head
 
@@ -126,290 +410,22 @@ Transformer tokens [B, 512, 384] (keys/values)
 Cross-attention mechanism
     ↓
 Per-Gaussian features [B, 40k, 32]
-    ↓
-L2 normalization
 ```
 
-
-
-##  Dataset: SceneSplat with ScanNet72 Labels
-
-### Dataset Structure
-
-Each scene contains:
-```
-scene_dir/
-├── coord.npy          # [N, 3] Gaussian positions
-├── color.npy          # [N, 3] RGB values (not used in reconstruction)
-├── scale.npy          # [N, 3] Anisotropic scale
-├── quat.npy           # [N, 4] Rotation quaternions
-├── opacity.npy        # [N] Opacity values
-├── segment.npy        # [N] ScanNet72 category labels (0-71)
-└── instance.npy       # [N] Instance IDs (-1 = background)
-```
-
-### Preprocessing Pipeline
-
-**1. Importance Sampling** (40,000 Gaussians per scene)
-```python
-# Hybrid sampling (current default: opacity-based)
-if sampling_method == 'opacity':
-    importance = opacity  # Prioritize visible Gaussians
-elif sampling_method == 'hybrid':
-    importance = 0.7*opacity + 0.3*scale_magnitude
-```
-
-**2. Voxelization** (40×40×40 grid, resolution=0.4)
-```python
-# Assign Gaussians to voxel centers for positional encoding
-voxel_centers = compute_voxel_centers(coord, resolution=0.4)
-point_uniq_idx = voxelize(coord)  # FNV hash for unique voxel IDs
-```
-
-**3. Feature Assembly** (18-channel representation)
-```python
-features = [
-    voxel_centers,      # [3] Positional encoding
-    point_uniq_idx,     # [1] Voxel ID
-    coord,              # [3] Gaussian xyz
-    color,              # [3] RGB (for reference, not reconstructed)
-    opacity,            # [1] Opacity
-    scale,              # [3] Anisotropic scale
-    quat                # [4] Rotation quaternion
-]  # Total: 18 channels
-```
-
-### ScanNet72 Semantic Categories
-
-- **Total categories:** 72 (indices 0-71)
-- **Missing categories:** [13, 53, 61] (never appear in dataset)
-- **Most frequent:** Wall, floor, cabinet, bed, chair, sofa, table
-
-**Category distribution example:**
-```
-Top 5 categories cover ~70% of points:
-  1. Wall (category 0): 28.3%
-  2. Floor (category 1): 18.7%
-  3. Ceiling (category 23): 12.1%
-  4. Cabinet (category 2): 6.5%
-  5. Window (category 8): 4.8%
-```
+**When to use:** Most computationally expensive but most expressive
 
 ---
 
-##  Semantic Contrastive Learning
-
-### Loss Function Architecture
-
-**Total Loss:**
-```python
-L_total = α·L_recon + β·L_KL + γ·L_segment + δ·L_instance
-
-where:
-  L_recon    = ||G_pred - G_true||₂  (geometric reconstruction)
-  L_KL       = KL(q(z|x) || p(z))    (VAE regularization)
-  L_segment  = InfoNCE(segment)       (category-level contrast)
-  L_instance = InfoNCE(instance)      (instance-level contrast)
-```
-
-### Segment-Level Contrastive Loss (Primary)
-
-**Objective:** Gaussians with the same semantic category should have similar features.
-
-**Algorithm:**
-```python
-for each scene in batch:
-    # 1. Extract valid Gaussians with labels
-    valid_mask = segment_labels >= 0
-    embeddings = per_gaussian_features[valid_mask]  # [M, 32]
-    labels = segment_labels[valid_mask]             # [M]
-    
-    # 2. Create category prototypes
-    for each category C in unique_categories:
-        prototype_C = mean(embeddings where label == C)
-        prototype_C = L2_normalize(prototype_C)
-    
-    # 3. Compute similarity matrix
-    similarity = (embeddings @ prototypes.T) / temperature
-    
-    # 4. InfoNCE loss
-    loss = CrossEntropy(similarity, target_category_indices)
-```
-
-**Key hyperparameters:**
-- `temperature` (τ): 0.07 (controls softmax sharpness)
-- `segment_weight` (γ): 0.1-10.0 (relative importance)
-- `subsample`: 2000 Gaussians per scene (for efficiency)
-
-### Instance-Level Contrastive Loss (Optional)
-
-**Objective:** Gaussians from the same object instance should cluster together.
-
-Similar to segment-level but uses instance IDs instead of categories. Currently set to weight=0.0 but can be enabled for finer-grained learning.
-
----
-
-##  Training Configuration
-
-### Key Modifications from Original Can3Tok
-
-1. **No Color Reconstruction**
-   - Output: 11 parameters (xyz, opacity, scale, quat)
-   - Original: 14 parameters (+ RGB)
-   - Reason: Focus on geometry and semantics, as advised by supervisor
-
-2. **Loss Scaling**
-   ```python
-   recon_loss_raw = ||prediction - target||₂ / batch_size
-   recon_loss = recon_loss_raw / recon_scale  # scale=1000
-   ```
-   - Balances gradient magnitudes between reconstruction and semantic losses
-
-3. **Semantic Mode Selection**
-   ```python
-   --semantic_mode hidden      # Approach 1 (default)
-   --semantic_mode geometric   # Approach 2
-   --semantic_mode attention   # Approach 3
-   ```
-
-### Training Hyperparameters
-
-```python
-# Architecture
-num_latents = 256          # VAE latent tokens
-embed_dim = 32             # Latent embedding dimension
-width = 384                # Transformer width
-num_encoder_layers = 6     # Encoder depth
-num_decoder_layers = 12    # Decoder depth
-
-# Optimization
-learning_rate = 1e-4
-batch_size = 64
-epochs = 1000
-kl_weight = 1e-5
-
-# Semantic loss
-segment_loss_weight = 0.1-10.0
-instance_loss_weight = 0.0
-semantic_temperature = 0.07
-semantic_subsample = 2000
-recon_scale = 1000.0
-```
-
-
-
----
-
-##  Evaluation Metrics
-
-### Reconstruction Quality
-
-1. **L2 Error** (primary metric)
-   ```python
-   L2_error = ||G_pred - G_true||₂ / sqrt(batch_size)
-   ```
-
-2. **Failure Rate**
-   ```python
-   failure_rate = (# scenes with L2 > threshold) / total_scenes
-   threshold = 8000.0  # default
-   ```
-
-3. **Per-scene Statistics**
-   - Mean, std, min, max, median L2 errors
-   - Useful for identifying failure modes
-
-
-
----
-
-##  Usage
-
-### Training
-
+## Key Arguments
 ```bash
-# Hidden state approach (default)
-python gs_can3tok_2.py \
-    --batch_size 64 \
-    --num_epochs 1000 \
-    --lr 1e-4 \
-    --segment_loss_weight 0.1 \
-    --semantic_mode hidden \
-    --use_wandb
-
-# Geometric approach
-python gs_can3tok_2.py \
-    --semantic_mode geometric \
-    --segment_loss_weight 1.0
-
-# Attention approach
-python gs_can3tok_2.py \
-    --semantic_mode attention \
-    --segment_loss_weight 0.5
+--semantic_mode {hidden,geometric,attention,none}  # Feature extraction method
+--segment_loss_weight FLOAT                        # Segment contrast weight
+--instance_loss_weight FLOAT                       # Instance contrast weight
+--semantic_temperature FLOAT                       # Temperature for softmax
+--semantic_subsample INT                           # Gaussians to sample for loss
+--recon_scale FLOAT                                # Scale factor for recon loss
+--sampling_method {opacity,random,hybrid}          # Importance sampling strategy
+--train_scenes INT                                 # Limit training scenes
+--val_scenes INT                                   # Limit validation scenes
+--use_wandb                                        # Enable Weights & Biases logging
 ```
-
-### Key Arguments
-
-```bash
---semantic_mode {hidden,geometric,attention}  # Feature extraction method
---segment_loss_weight FLOAT                   # β: Segment contrast weight
---instance_loss_weight FLOAT                  # δ: Instance contrast weight
---semantic_temperature FLOAT                  # τ: Temperature for softmax
---semantic_subsample INT                      # Gaussians to sample for loss
---recon_scale FLOAT                           # Scale factor for recon loss
---sampling_method {opacity,random,hybrid}     # Importance sampling strategy
---train_scenes INT                            # Limit training scenes
---val_scenes INT                              # Limit validation scenes
-```
-
-
-
----
-
-##  Code Structure
-
-### Core Files
-
-```
-├── gs_can3tok_2.py                    # Main training script
-├── gs_dataset_scenesplat.py           # Dataset loader with semantics
-├── semantic_losses.py                 # Contrastive loss functions
-└── model/
-    ├── configs/
-    │   └── aligned_shape_latents/
-    │       └── shapevae-256.yaml      # VAE configuration
-    └── michelangelo/models/tsal/
-        ├── sal_perceiver.py           # Model architecture (3 approaches)
-        └── asl_pl_module.py           # PyTorch Lightning wrapper
-```
-
-### Key Classes
-
-**`AlignedShapeLatentPerceiver`** (sal_perceiver.py)
-- Main VAE model
-- Implements all three semantic feature extraction approaches
-- Switch via `semantic_mode` parameter
-
-**`gs_dataset`** (gs_dataset_scenesplat.py)
-- Loads SceneSplat scenes with ScanNet72 labels
-- Importance sampling and voxelization
-- Returns: features, segment_labels, instance_labels
-
-**`ScanNet72SemanticLoss`** (semantic_losses.py)
-- Optimized contrastive loss for ScanNet72
-- Handles missing categories [13, 53, 61]
-- Efficient prototype aggregation
-
----
-
-
-
-
-
-
-
-
-
-
-
-
