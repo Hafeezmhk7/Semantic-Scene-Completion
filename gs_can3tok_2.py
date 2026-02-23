@@ -162,7 +162,7 @@ def compute_reconstruction_loss(prediction, target,batch_size, color_weight=1.0)
         # ═══════════════════════════════════════════════════════════════
         diff = prediction - target
         loss = torch.norm(diff, p=2)
-        return loss
+        return loss/batch_size
     
     else:
         # ═══════════════════════════════════════════════════════════════
@@ -199,7 +199,7 @@ parser.add_argument('--eval_every', type=int, default=10)
 parser.add_argument('--failure_threshold', type=float, default=8000.0)
 parser.add_argument('--train_scenes', type=int, default=None)
 parser.add_argument('--val_scenes', type=int, default=None)
-parser.add_argument('--sampling_method', type=str, default='opacity', choices=['random', 'opacity'])
+parser.add_argument('--sampling_method', type=str, default='opacity', choices=['random', 'opacity', 'hybrid'])
 parser.add_argument('--segment_loss_weight', type=float, default=0.0)
 parser.add_argument('--instance_loss_weight', type=float, default=0.0)
 parser.add_argument('--semantic_temperature', type=float, default=0.07)
@@ -226,6 +226,10 @@ parser.add_argument('--recon_ply_max_sh', type=int, default=3,
 # ============================================================================
 parser.add_argument('--color_loss_weight', type=float, default=1.0,
                     help='Weight for color loss (default: 1.0, try 3.0-5.0 for better color learning)')
+
+parser.add_argument('--scale_norm_mode', type=str, default='linear',
+                    choices=['log', 'linear'],
+                    help='Scale normalization: log=Can3Tok style, linear=original')
 
 # Canonical normalization control
 norm_group = parser.add_mutually_exclusive_group()
@@ -372,6 +376,11 @@ print(f"")
 print(f"🎯 TRAINING SETTINGS:")
 print(f"  1. Loss Type: Standard L2")
 print(f"  2. Color Weight: {args.color_loss_weight}×")
+# In the config print block:
+print(f"  Scale Norm Mode: {args.scale_norm_mode}")
+
+# In torch.save() for best_model.pth and final.pth, add:
+# 'scale_norm_mode': args.scale_norm_mode,
 if args.color_loss_weight > 1.0:
     print(f"     → Color errors weighted {args.color_loss_weight}× more than other params")
 else:
@@ -447,6 +456,7 @@ gs_dataset_train = gs_dataset(
     normalize=args.use_canonical_norm,
     normalize_colors=args.normalize_colors,
     target_radius=10.0,
+    scale_norm_mode=args.scale_norm_mode,   # ← ADD THIS
 )
 
 trainDataLoader = Data.DataLoader(
@@ -473,6 +483,7 @@ gs_dataset_val = gs_dataset(
     normalize=args.use_canonical_norm,
     normalize_colors=args.normalize_colors,
     target_radius=10.0,
+    scale_norm_mode=args.scale_norm_mode,   # ← ADD THIS
 )
 
 valDataLoader = Data.DataLoader(

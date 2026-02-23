@@ -6,16 +6,17 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/baseliner_val=train_cannorm_200e_3k_9.out
+#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
-# CAN3TOK TRAINING - FULL SEMANTIC CONTROL + COLOR WEIGHTING
+# CAN3TOK TRAINING - FULL SEMANTIC CONTROL + COLOR WEIGHTING + SCALE MODE
 # ============================================================================
-# This job file gives you complete control over semantic learning via flags
-# No need to edit YAML files - everything controlled here!
-# 
-# NEW: Color loss weighting for balanced loss mode
+# Controls available via flags — no YAML edits needed.
+#
+# NEW FLAGS:
+#   SCALE_NORM_MODE  — 'log' (Can3Tok) or 'linear' (original)
+#   COLOR_LOSS_WEIGHT — upweight color loss to fight gray collapse
 # ============================================================================
 
 echo "================================================================================"
@@ -27,44 +28,37 @@ echo "Start time: $(date)"
 echo ""
 
 # ============================================================================
-# 🎯 SEMANTIC LEARNING CONFIGURATION - CHOOSE YOUR OPTION!
+# 🎯 SEMANTIC LEARNING CONFIGURATION
 # ============================================================================
 
-# ┌────────────────────────────────────────────────────────────────────────┐
-# │  UNCOMMENT THE OPTION YOU WANT TO USE                                   │
-# └────────────────────────────────────────────────────────────────────────┘
-
 # ────────────────────────────────────────────────────────────────────────────
-# OPTION 1: NO SEMANTIC LEARNING (Baseline - Fastest, Least Memory)
+# OPTION 1: NO SEMANTIC LEARNING (Baseline)
 # ────────────────────────────────────────────────────────────────────────────
 SEMANTIC_MODE="geometric"
 SEGMENT_WEIGHT=0.0
 INSTANCE_WEIGHT=0.0
 
 # ────────────────────────────────────────────────────────────────────────────
-# OPTION 2: GEOMETRIC MODE (Recommended - Best Balance!)
+# OPTION 2: GEOMETRIC MODE (Recommended balance)
 # ────────────────────────────────────────────────────────────────────────────
 # SEMANTIC_MODE="geometric"
 # SEGMENT_WEIGHT=0.3
 # INSTANCE_WEIGHT=0.0
 
 # ────────────────────────────────────────────────────────────────────────────
-# OPTION 3: HIDDEN STATE MODE (Best Quality - Slowest)
+# OPTION 3: HIDDEN STATE MODE (Best quality, slowest)
 # ────────────────────────────────────────────────────────────────────────────
 # SEMANTIC_MODE="hidden"
 # SEGMENT_WEIGHT=0.3
 # INSTANCE_WEIGHT=0.0
 
 # ────────────────────────────────────────────────────────────────────────────
-# OPTION 4: ATTENTION MODE (Spatial Context)
+# OPTION 4: ATTENTION MODE (Spatial context)
 # ────────────────────────────────────────────────────────────────────────────
 # SEMANTIC_MODE="attention"
 # SEGMENT_WEIGHT=0.3
 # INSTANCE_WEIGHT=0.0
 
-# ────────────────────────────────────────────────────────────────────────────
-# Semantic Loss Additional Parameters
-# ────────────────────────────────────────────────────────────────────────────
 SEMANTIC_TEMP=0.1
 SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
@@ -74,71 +68,83 @@ SAMPLING_STRATEGY="balanced"
 # ============================================================================
 
 BATCH_SIZE=64
-NUM_EPOCHS=200
+NUM_EPOCHS=500
 LEARNING_RATE=1e-4
-KL_WEIGHT=1e-5                # ← Fixed: was 1e-4 (too strong)
-# RECON_SCALE=1.0              # ← Fixed: was 1.0 (too dominant)
-EVAL_EVERY=10
+KL_WEIGHT=1e-5
+EVAL_EVERY=5
 FAILURE_THRESHOLD=100
 
-# ────────────────────────────────────────────────────────────────────────────
-# 🎨 Color Loss Weighting (NEW!)
-# ────────────────────────────────────────────────────────────────────────────
-# Controls color emphasis in balanced loss mode
-# Default: 1.0 (equal weight with other parameters)
-# Higher values: Force model to learn colors better (try 2.0-5.0)
-# Only active when USE_BALANCED_LOSS=True
-# ────────────────────────────────────────────────────────────────────────────
+# ============================================================================
+# 🎨 COLOR LOSS WEIGHTING
+# ============================================================================
+# Upweight color loss to fight gray collapse without balanced loss.
+#
+# Recommended values:
+#   1.0  = Equal weight with other params (default)
+#   3.0  = Strong color emphasis (good starting point for gray collapse)
+#   5.0  = Very strong color emphasis (aggressive)
+#  10.0  = Maximum emphasis (use if 5.0 still collapses)
+# ============================================================================
 COLOR_LOSS_WEIGHT=1.0
 
-# Recommended values:
-# 1.0 = Equal weight (default, balanced)
-# 2.0 = Moderate color emphasis (good starting point)
-# 3.0 = Strong color emphasis (recommended for gray collapse)
-# 5.0 = Very strong color emphasis (aggressive color learning)
+# ============================================================================
+# 📏 SCALE NORMALIZATION MODE  ← KEY EXPERIMENT FLAG
+# ============================================================================
+# Controls how Gaussian scales are stored in the dataset and what the
+# model learns to predict.
+#
+# 'log'    → Can3Tok ICCV 2025 style
+#            scale_stored = log(scale_metres) + log(scene_factor)
+#            → Ground truth is NEGATIVE (e.g. -7 to -1)
+#            → Decoder must use exp() activation
+#            → Pro: Physically principled, matches paper exactly
+#            → Con: Large scale loss early in training (targets are negative,
+#                   exp() output starts positive → large error until converged)
+#
+# 'linear' → Original style
+#            scale_stored = scale_metres * scene_factor
+#            → Ground truth is SMALL POSITIVE (e.g. 0.01 – 0.2m)
+#            → Decoder uses softplus() activation
+#            → Pro: Easier to learn from scratch (targets near expected range)
+#            → Con: Different from Can3Tok paper
+#
+# RECOMMENDATION: Start with 'linear' to confirm the rest of the pipeline
+# works (colors, positions), then switch to 'log' for final experiments.
+# ============================================================================
+SCALE_NORM_MODE="linear"   # "log" | "linear"
 
 # ============================================================================
 # DATASET CONFIGURATION
 # ============================================================================
 
-TRAIN_SCENES=500
+TRAIN_SCENES=300
 VAL_SCENES=30
-SAMPLING_METHOD="opacity"
+SAMPLING_METHOD="opacity"  # "random" | "grid"
 
 # ============================================================================
 # PCA VISUALIZATION CONFIGURATION (CloudCompare)
 # ============================================================================
 
-PCA_VIS_FREQ=10                # Generate PCA PLY files every N epochs
-PCA_NUM_SCENES=5             # Number of scenes to visualize with PCA
-PCA_BRIGHTNESS=1.25            # Color brightness for PCA visualization
+PCA_VIS_FREQ=10
+PCA_NUM_SCENES=5
+PCA_BRIGHTNESS=1.25
 
 # ============================================================================
 # 3DGS RECONSTRUCTION CONFIGURATION (supersplat.at)
 # ============================================================================
 
-RECON_PLY_FREQ=5              # Save reconstructed 3DGS PLY every N epochs
-RECON_PLY_NUM_SCENES=2        # Number of scenes to reconstruct
-RECON_PLY_MAX_SH=3             # Max SH degree (f_rest terms = 0)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 🎯 NORMALIZATION CONTROL
-# ════════════════════════════════════════════════════════════════════════════
-
-# Dataset normalization (canonical sphere for positions & scales)
-USE_CANONICAL_NORM=True     # True = normalize to [-10, 10], False = raw coordinates
-
-# Loss function normalization (per-parameter balancing)
-# USE_BALANCED_LOSS=True      # True = balanced loss, False = standard L2
-
-echo "🎯 NORMALIZATION SETTINGS:"
-echo "   Dataset (canonical sphere): $([ "$USE_CANONICAL_NORM" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
-echo "   Loss (parameter balancing): $([ "$USE_BALANCED_LOSS" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
-echo ""
+RECON_PLY_FREQ=5
+RECON_PLY_NUM_SCENES=2
+RECON_PLY_MAX_SH=3
 
 # ============================================================================
-# WEIGHTS & BIASES CONFIGURATION
+# 🎯 NORMALIZATION CONTROL
+# ============================================================================
+
+USE_CANONICAL_NORM=True    # True = normalize to canonical sphere | False = raw
+
+# ============================================================================
+# WEIGHTS & BIASES
 # ============================================================================
 
 export WANDB_API_KEY="your_key_here"
@@ -164,36 +170,42 @@ echo "   Time Limit:        12:00:00"
 echo ""
 
 echo "🧠 SEMANTIC LEARNING:"
-
-if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
+if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || \
+   (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
     echo "   Status:            ✅ ENABLED"
     echo "   Mode:              ${SEMANTIC_MODE^^}"
-    echo ""
-    echo "   Loss Weights:"
-    echo "      Segment (β):    $SEGMENT_WEIGHT"
-    echo "      Instance (γ):   $INSTANCE_WEIGHT"
-    echo "      Temperature:    $SEMANTIC_TEMP"
-    echo "      Subsample:      $SEMANTIC_SUBSAMPLE Gaussians"
-    echo ""
-    
-    echo ""
-    echo "   Loss Composition:"
-    echo "      Total = (Recon / $RECON_SCALE) + ($KL_WEIGHT × KL) + Semantic"
-    echo "      Semantic = ($SEGMENT_WEIGHT × Segment) + ($INSTANCE_WEIGHT × Instance)"
-
-    # Approximate loss balance with raw semantic ~4.5
-    echo ""
-    echo "   Approx. Loss Balance (raw semantic ~4.5):"
-    echo "      Recon:    235 / $RECON_SCALE ≈ $(echo "scale=3; 235/$RECON_SCALE" | bc)"
-    echo "      KL:       6000 × $KL_WEIGHT  ≈ $(echo "scale=3; 6000*$KL_WEIGHT" | bc)"
-    echo "      Semantic: 4.5  × $SEGMENT_WEIGHT  ≈ $(echo "scale=3; 4.5*$SEGMENT_WEIGHT" | bc)"
-
+    echo "   Segment weight:    $SEGMENT_WEIGHT"
+    echo "   Instance weight:   $INSTANCE_WEIGHT"
 else
     echo "   Status:            ❌ DISABLED (Baseline)"
-    echo "   Loss Composition:"
-    echo "      Total = (Recon / $RECON_SCALE) + ($KL_WEIGHT × KL)"
 fi
+echo ""
 
+echo "📏 SCALE NORMALIZATION:"
+echo "   Mode:              $SCALE_NORM_MODE"
+if [ "$SCALE_NORM_MODE" = "log" ]; then
+    echo "   Style:             Can3Tok ICCV 2025"
+    echo "   Formula:           scale_stored = log(scale) + log(factor)"
+    echo "   GT range:          Negative values (e.g. -7 to -1)"
+    echo "   Decoder act:       exp()"
+    echo "   ⚠️  Expect large scale loss early in training"
+else
+    echo "   Style:             Original (linear)"
+    echo "   Formula:           scale_stored = scale × factor"
+    echo "   GT range:          Small positive metres (e.g. 0.01 – 0.2)"
+    echo "   Decoder act:       softplus()"
+    echo "   ✓  Scale loss should be small from early epochs"
+fi
+echo ""
+
+echo "🎨 COLOR CONFIGURATION:"
+echo "   Color Loss Weight: ${COLOR_LOSS_WEIGHT}×"
+if (( $(echo "$COLOR_LOSS_WEIGHT > 1.0" | bc -l) )); then
+    echo "   Effect:            🎯 Color errors weighted ${COLOR_LOSS_WEIGHT}× vs other params"
+else
+    echo "   Effect:            ⚖️  Equal weight with other parameters"
+fi
+echo "   Sigmoid:           ❌ REMOVED (raw output + clamp at PLY write)"
 echo ""
 
 echo "⚙️  TRAINING HYPERPARAMETERS:"
@@ -201,51 +213,30 @@ echo "   Batch Size:        $BATCH_SIZE"
 echo "   Epochs:            $NUM_EPOCHS"
 echo "   Learning Rate:     $LEARNING_RATE"
 echo "   KL Weight:         $KL_WEIGHT"
-echo "   Recon Scale:       $RECON_SCALE"
 echo "   Eval Every:        $EVAL_EVERY epochs"
 echo "   Failure Thresh:    $FAILURE_THRESHOLD"
 echo ""
-
-# ════════════════════════════════════════════════════════════════════════════
-# 🎨 COLOR LOSS WEIGHTING (NEW!)
-# ════════════════════════════════════════════════════════════════════════════
-echo "🎨 COLOR LOSS CONFIGURATION:"
-echo "   Color Loss Weight: $COLOR_LOSS_WEIGHT"
-if [ "$USE_BALANCED_LOSS" = "True" ]; then
-    echo "   Status:            ✅ ACTIVE (balanced loss enabled)"
-    if (( $(echo "$COLOR_LOSS_WEIGHT > 1.0" | bc -l) )); then
-        echo "   Effect:            🎯 Emphasizing color learning (${COLOR_LOSS_WEIGHT}× weight)"
-    else
-        echo "   Effect:            ⚖️  Equal weight with other parameters"
-    fi
-else
-    echo "   Status:            ⊘ INACTIVE (only active when balanced loss enabled)"
-fi
-echo ""
-# ════════════════════════════════════════════════════════════════════════════
 
 echo "📊 DATASET:"
 echo "   Training Scenes:   $TRAIN_SCENES"
 echo "   Val Scenes:        $VAL_SCENES"
 echo "   Sampling:          ${SAMPLING_METHOD^^}"
-echo "   Color Mode:        Normalized [0,1] (no /255 needed)"
+echo "   Canonical Norm:    $([ "$USE_CANONICAL_NORM" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
+echo "   Scale Mode:        $SCALE_NORM_MODE"
 echo ""
 
 echo "🎨 PCA VISUALIZATION (CloudCompare):"
 echo "   Frequency:         Every $PCA_VIS_FREQ epochs"
 echo "   Scenes:            $PCA_NUM_SCENES per epoch"
-echo "   Files/Epoch:       $((PCA_NUM_SCENES * 3)) PLY files (semantic + position + original)"
-echo "   Total Files:       $((NUM_EPOCHS / PCA_VIS_FREQ * PCA_NUM_SCENES * 3)) PLY files"
 echo "   Output:            checkpoints/.../pca_visualizations/epoch_XXX/"
 echo ""
 
 echo "🌐 3DGS RECONSTRUCTION (supersplat.at):"
 echo "   Frequency:         Every $RECON_PLY_FREQ epochs"
 echo "   Scenes:            $RECON_PLY_NUM_SCENES per epoch"
-echo "   Max SH Degree:     $RECON_PLY_MAX_SH (f_rest = 0)"
-echo "   Color Mode:        Clamped [0,1] → f_dc via C0 (NO SIGMOID!)"
-echo "   Scale Mode:        Log-space → exp() activation (matches Can3Tok)"
-echo "   Total PLY Files:   $((NUM_EPOCHS / RECON_PLY_FREQ * RECON_PLY_NUM_SCENES)) files"
+echo "   Max SH Degree:     $RECON_PLY_MAX_SH"
+echo "   Color:             Raw output clamped [0,1] → f_dc via C0"
+echo "   Scale:             Mode=$SCALE_NORM_MODE → $([ "$SCALE_NORM_MODE" = "log" ] && echo "exp() activation" || echo "softplus() activation")"
 echo "   Output:            checkpoints/.../reconstructed_gaussians/epoch_XXX/"
 echo "   View At:           https://supersplat.at"
 echo ""
@@ -266,7 +257,8 @@ echo ""
 echo "🔧 Setting up environment..."
 module purge && module load 2023 && module load CUDA/12.1.1
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
-export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
+site-packages/torch/lib:$LD_LIBRARY_PATH"
 
 cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
 mkdir -p logs checkpoints
@@ -276,7 +268,6 @@ echo "   ✓ Conda environment: can3tok"
 echo "   ✓ Working directory: $(pwd)"
 echo ""
 
-# W&B setup (fixed: removed colon after else)
 if [ "$USE_WANDB" = "True" ]; then
     wandb login $WANDB_API_KEY --relogin 2>/dev/null
     echo "   ✓ Weights & Biases authenticated"
@@ -300,7 +291,6 @@ TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
 TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
-# TRAIN_CMD="$TRAIN_CMD --recon_scale $RECON_SCALE"
 
 # ─── Dataset parameters ─────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
@@ -315,24 +305,23 @@ TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
-# ─── Color loss weighting (NEW!) ────────────────────────────────────────────
+# ─── Color loss weighting ───────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
 
-# ─── PCA visualization parameters ───────────────────────────────────────────
+# ─── Scale normalization mode (NEW!) ────────────────────────────────────────
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+
+# ─── PCA visualization ──────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
 TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
 
-# ─── 3DGS reconstruction parameters ─────────────────────────────────────────
+# ─── 3DGS reconstruction ────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
 
 # ─── Normalization flags ────────────────────────────────────────────────────
-# if [ "$USE_BALANCED_LOSS" = "True" ]; then
-#     TRAIN_CMD="$TRAIN_CMD --use_balanced_loss"
-# fi
-
 if [ "$USE_CANONICAL_NORM" = "False" ]; then
     TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
 fi
@@ -377,17 +366,12 @@ if [ $TRAIN_EXIT -eq 0 ]; then
     echo "✅ Training completed successfully!"
     echo ""
     echo "Next steps:"
-    echo "   1. Check logs:                cat logs/can3tok_${SLURM_JOB_ID}.out"
-    echo "   2. Find checkpoints:          ls checkpoints/RGB_job_${SLURM_JOB_ID}_*/"
-    echo "   3. Load best model:           checkpoints/RGB_job_${SLURM_JOB_ID}_*/best_model.pth"
-    echo ""
-    echo "   PCA Visualizations (CloudCompare):"
-    echo "      Location:   checkpoints/RGB_job_${SLURM_JOB_ID}_*/pca_visualizations/"
-    echo "      Open:       epoch_090/scene_000_semantic_pca.ply"
+    echo "   1. Check logs:       cat logs/can3tok_${SLURM_JOB_ID}.out"
+    echo "   2. Checkpoints:      ls checkpoints/RGB_job_${SLURM_JOB_ID}_*/"
+    echo "   3. Best model:       checkpoints/RGB_job_${SLURM_JOB_ID}_*/best_model.pth"
     echo ""
     echo "   3DGS Reconstructions (supersplat.at):"
     echo "      Location:   checkpoints/RGB_job_${SLURM_JOB_ID}_*/reconstructed_gaussians/"
-    echo "      Open:       epoch_090/scene_000_epoch_090.ply"
     echo "      Drag & drop to: https://supersplat.at"
     if [ "$USE_WANDB" = "True" ]; then
         echo ""
@@ -397,9 +381,9 @@ else
     echo "❌ Training failed with exit code $TRAIN_EXIT"
     echo ""
     echo "Troubleshooting:"
-    echo "   1. Check error log:      cat logs/can3tok_${SLURM_JOB_ID}.err"
-    echo "   2. Check GPU memory:     nvidia-smi"
-    echo "   3. Verify dataset:       ls /home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/"
+    echo "   1. Check error log:  cat logs/can3tok_${SLURM_JOB_ID}.err"
+    echo "   2. Check GPU memory: nvidia-smi"
+    echo "   3. Verify dataset:   ls /home/yli11/scratch/datasets/gaussian_world/"
 fi
 
 echo "════════════════════════════════════════════════════════════════════════════════"

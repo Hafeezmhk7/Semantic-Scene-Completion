@@ -6,12 +6,21 @@ ScanNet72 semantic labels + RGB colour normalisation [0, 1]
 🎯 CANONICAL SPHERE NORMALIZATION (Optional - Controlled by Flag)
    - Can be enabled/disabled via normalize=True/False
    - Controls both position AND scale normalization
-   
+
+📏 SCALE NORMALIZATION MODES (New!)
+   - 'log'    : Can3Tok ICCV 2025 style — convert to log-space, add log(factor)
+                Decoder must use exp() activation
+                Ground truth scales are NEGATIVE numbers (e.g. -4 to -1)
+   - 'linear' : Original style — multiply scale by scale_factor directly
+                Decoder uses softplus() activation
+                Ground truth scales are SMALL POSITIVE numbers (e.g. 0.01-0.2m)
+
 KEY FEATURES:
 1. DETERMINISTIC SAMPLING: Always same top-40k Gaussians
 2. OPTIONAL NORMALIZATION: Toggle canonical sphere normalization
-3. NO METADATA: Fixed normalization (no per-scene statistics)
-4. INFERENCE-READY: Works perfectly with diffusion models
+3. DUAL SCALE MODES: Log-space (Can3Tok) or linear-space (original)
+4. NO METADATA: Fixed normalization (no per-scene statistics)
+5. INFERENCE-READY: Works perfectly with diffusion models
 """
 
 import os
@@ -21,102 +30,73 @@ from tqdm import tqdm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🎯 Canonical Sphere Normalization (Optional)
+#  Canonical Sphere Normalization (Optional)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# def normalize_to_canonical_sphere(coord, scale, target_radius=10.0):
-#     """
-#     Normalize scene to canonical sphere (Optional - controlled by dataset flag).
-    
-#     This normalizes positions to fit in a sphere of radius target_radius.
-#     Scales are normalized proportionally (LINEAR SPACE, not log space).
-    
-#     Args:
-#         coord: [N, 3] Gaussian positions (xyz) - linear space
-#         scale: [N, 3] Gaussian scales - linear space (post-exp from PLY)
-#         target_radius: Fixed radius in meters (default 10.0)
-    
-#     Returns:
-#         coord_norm: [N, 3] Positions in canonical sphere
-#         scale_norm: [N, 3] Scales normalized proportionally
-#     """
-#     # Step 1: Center at origin
-#     center = coord.mean(axis=0)
-#     coord_centered = coord - center
-    
-#     # Step 2: Find maximum distance from origin
-#     distances = np.linalg.norm(coord_centered, axis=1)
-#     max_dist = distances.max()
-    
-#     # Handle edge case: empty or degenerate scene
-#     if max_dist < 1e-6:
-#         max_dist = 1.0
-    
-#     # Step 3: Scale to target radius
-#     # The 1.1 factor provides safety margin
-#     scale_factor = target_radius / (max_dist * 1.1)
-    
-#     # Step 4: Apply transformation
-#     coord_norm = coord_centered * scale_factor
-    
-#     # ═══════════════════════════════════════════════════════════════════
-#     # LINEAR SPACE NORMALIZATION
-#     # ═══════════════════════════════════════════════════════════════════
-#     # Scales are in LINEAR SPACE (meters), so multiply by scale_factor
-#     # scale_new = scale_old × factor
-#     # ═══════════════════════════════════════════════════════════════════
-#     scale_norm = scale * scale_factor  # ✓ Linear space
-#     # ═══════════════════════════════════════════════════════════════════
-    
-#     return coord_norm, scale_norm
+def normalize_to_canonical_sphere(coord, scale, target_radius=10.0, scale_norm_mode='log'):
+    """
+    Normalize scene to canonical sphere.
 
-# REPLACE WITH:
-def normalize_to_canonical_sphere(coord, scale, target_radius=10.0):
-    """
-    Normalize scene to canonical sphere (Optional - controlled by dataset flag).
-    
-    This normalizes positions to fit in a sphere of radius target_radius.
-    Scales are normalized proportionally in LOG SPACE (matches Can3Tok ICCV 2025).
-    
+    Positions are always normalized to fit within a sphere of target_radius.
+    Scale normalization mode is controlled by scale_norm_mode:
+
+    scale_norm_mode='log'  (Can3Tok ICCV 2025 style)
+        scale_norm = log(scale) + log(scale_factor)
+        → Scales stored in log-space (negative values, e.g. -4 to -1)
+        → Decoder must use exp() to recover meters
+        → Matches Can3Tok paper exactly
+
+    scale_norm_mode='linear'  (Original style)
+        scale_norm = scale * scale_factor
+        → Scales stored in linear-space (small positive values, e.g. 0.01-0.2m)
+        → Decoder uses softplus() activation
+        → Easier to learn from scratch (targets are positive, near expected range)
+
     Args:
-        coord: [N, 3] Gaussian positions (xyz) - linear space
-        scale: [N, 3] Gaussian scales - linear space (post-exp from PLY)
-        target_radius: Fixed radius in meters (default 10.0)
-    
+        coord:            [N, 3] Gaussian positions (xyz) in metres
+        scale:            [N, 3] Gaussian scales in metres (post-exp from PLY)
+        target_radius:    float, canonical sphere radius (default 10.0m)
+        scale_norm_mode:  'log' or 'linear'
+
     Returns:
-        coord_norm: [N, 3] Positions in canonical sphere
-        scale_norm: [N, 3] Scales in LOG SPACE normalized proportionally
+        coord_norm:  [N, 3] Positions in canonical sphere
+        scale_norm:  [N, 3] Scales in chosen representation
     """
-    # Step 1: Center at origin
+    # Step 1: Centre at origin
     center = coord.mean(axis=0)
     coord_centered = coord - center
-    
+
     # Step 2: Find maximum distance from origin
     distances = np.linalg.norm(coord_centered, axis=1)
     max_dist = distances.max()
-    
-    # Handle edge case: empty or degenerate scene
     if max_dist < 1e-6:
         max_dist = 1.0
-    
-    # Step 3: Scale to target radius
-    # The 1.1 factor provides safety margin
+
+    # Step 3: Compute scale factor (1.1 provides safety margin)
     scale_factor = target_radius / (max_dist * 1.1)
-    
-    # Step 4: Apply transformation
+
+    # Step 4: Normalize positions
     coord_norm = coord_centered * scale_factor
-    
-    # ═══════════════════════════════════════════════════════════════════
-    # LOG-SPACE NORMALIZATION (matches Can3Tok ICCV 2025)
-    # ═══════════════════════════════════════════════════════════════════
-    # Convert scales to log-space, then add log(scale_factor)
-    # This matches Can3Tok: scale_norm = log(scale_old) + log(factor)
-    # ═══════════════════════════════════════════════════════════════════
-    scale_log = np.log(scale + 1e-7)  # Convert to log-space
-    scale_norm = scale_log + np.log(scale_factor)  # Log-space addition
-    # ═══════════════════════════════════════════════════════════════════
-    
+
+    # Step 5: Normalize scales according to chosen mode
+    if scale_norm_mode == 'log':
+        # ═══════════════════════════════════════════════════════════════
+        # LOG-SPACE NORMALIZATION  (matches Can3Tok ICCV 2025)
+        # scale_norm = log(scale_old) + log(scale_factor)
+        # Result: negative numbers, e.g. [-7, -1]
+        # Decoder activation: exp()
+        # ═══════════════════════════════════════════════════════════════
+        scale_norm = np.log(scale + 1e-7) + np.log(scale_factor)
+    else:
+        # ═══════════════════════════════════════════════════════════════
+        # LINEAR-SPACE NORMALIZATION  (original style)
+        # scale_norm = scale_old * scale_factor
+        # Result: small positive metres, e.g. [0.01, 0.2]
+        # Decoder activation: softplus()
+        # ═══════════════════════════════════════════════════════════════
+        scale_norm = scale * scale_factor
+
     return coord_norm, scale_norm
 
 
@@ -124,7 +104,6 @@ def verify_canonical_normalization(coord_norm, target_radius=10.0):
     """Verify scene fits within target sphere."""
     distances = np.linalg.norm(coord_norm, axis=1)
     max_dist = distances.max()
-    
     return {
         'max_distance': max_dist,
         'target_radius': target_radius,
@@ -182,27 +161,28 @@ def voxelize(coord, voxel_size=0.4, hash_type='fnv'):
 class gs_dataset(Dataset):
     """
     SceneSplat-7K dataset with ScanNet72 semantic labels.
-    
+
     🎯 OPTIONAL CANONICAL SPHERE NORMALIZATION
-    
-    Normalization can be toggled via normalize=True/False parameter.
-    When enabled: all scenes normalized to sphere of radius target_radius.
-    When disabled: raw coordinates and scales from dataset.
+       Toggle via normalize=True/False.
+
+    📏 DUAL SCALE NORMALIZATION MODES
+       scale_norm_mode='log'    → Can3Tok style (log-space, exp() decoder)
+       scale_norm_mode='linear' → Original style (linear-space, softplus() decoder)
 
     Feature format returned — (40000, 18):
       cols  0:3   voxel_centers  (positional encoding)
       col   3     point_uniq_idx (voxel ID)
-      cols  4:7   xyz            (Gaussian position - normalized if enabled)
+      cols  4:7   xyz            (Gaussian position — normalized if enabled)
       cols  7:10  rgb            (colour, normalised [0, 1])
       col  10     opacity        (post-sigmoid activation)
-      cols 11:14  scale          (normalized if enabled, else raw)
+      cols 11:14  scale          (normalized per scale_norm_mode, or raw)
       cols 14:18  quaternion     (qw, qx, qy, qz)
 
     Target for reconstruction — cols 4:18 → (40000, 14):
       [0:3]   xyz        ← Normalized if enabled
       [3:6]   rgb        ← [0, 1]
       [6]     opacity    ← [0, 1]
-      [7:10]  scale      ← Normalized if enabled
+      [7:10]  scale      ← Normalized per scale_norm_mode, or raw
       [10:14] quaternion ← Unit quaternions
     """
 
@@ -232,18 +212,20 @@ class gs_dataset(Dataset):
         train=True,
         sampling_method='opacity',
         max_scenes=None,
-        normalize=True,  # 🎯 TOGGLE CANONICAL SPHERE NORMALIZATION
-        normalize_colors=True,  # 🎨 TOGGLE COLOR NORMALIZATION (NEW!)
+        normalize=True,
+        normalize_colors=True,
         target_radius=10.0,
+        scale_norm_mode='log',    # 'log' = Can3Tok style | 'linear' = original style
     ):
-        self.root            = root
-        self.resol           = resol
-        self.random_permute  = random_permute
-        self.train           = train
-        self.sampling_method = sampling_method
-        self.normalize       = normalize
-        self.normalize_colors = normalize_colors  # NEW!
-        self.target_radius   = target_radius
+        self.root             = root
+        self.resol            = resol
+        self.random_permute   = random_permute
+        self.train            = train
+        self.sampling_method  = sampling_method
+        self.normalize        = normalize
+        self.normalize_colors = normalize_colors
+        self.target_radius    = target_radius
+        self.scale_norm_mode  = scale_norm_mode   # ← NEW
 
         self.scene_dirs = sorted([
             os.path.join(root, d)
@@ -262,17 +244,25 @@ class gs_dataset(Dataset):
         self.num_segment_categories = 72
 
         print(f"✓ Loaded {len(self.scene_dirs)} scenes from {root}")
-        print(f"✓ Sampling method: {sampling_method}  [DETERMINISTIC — same 40k every epoch]")
+        print(f"✓ Sampling method: {sampling_method}  "
+              f"[DETERMINISTIC — same 40k every epoch]")
         print(f"✓ Dataset type: ScanNet72 ({self.num_segment_categories} categories)")
-        
+
         if normalize:
             print(f"🎯 Canonical sphere normalization: ENABLED")
             print(f"   → Target radius: {target_radius}m")
-            print(f"   → Positions & scales normalized to canonical sphere")
+            if scale_norm_mode == 'log':
+                print(f"   → Scale mode: LOG-SPACE (Can3Tok ICCV 2025 style)")
+                print(f"     scales = log(scale) + log(factor)  →  negative values")
+                print(f"     decoder activation: exp()")
+            else:
+                print(f"   → Scale mode: LINEAR-SPACE (original style)")
+                print(f"     scales = scale × factor  →  small positive metres")
+                print(f"     decoder activation: softplus()")
         else:
             print(f"⚠️  Canonical sphere normalization: DISABLED")
             print(f"   → Using RAW coordinates and scales from dataset")
-        
+
         if normalize_colors:
             print(f"🎨 Color normalization: ENABLED")
             print(f"   → RGB colours normalized to [0, 1]")
@@ -280,7 +270,7 @@ class gs_dataset(Dataset):
             print(f"⚠️  Color normalization: DISABLED")
             print(f"   → RGB colours kept in [0, 255] range")
             print(f"   ⚠️  WARNING: [0, 255] colors may cause training instability!")
-        
+
         print(f"✓ Missing categories: [13, 53, 61] (never appear in dataset)")
 
     def __len__(self):
@@ -296,50 +286,49 @@ class gs_dataset(Dataset):
         quat    = np.load(os.path.join(scene_dir, 'quat.npy'))     # (N, 4)
         opacity = np.load(os.path.join(scene_dir, 'opacity.npy'))  # (N,)
 
-        # ── STEP 1.5: 🎯 OPTIONAL CANONICAL SPHERE NORMALIZATION ──────────────
+        # ── STEP 2: 🎯 OPTIONAL CANONICAL SPHERE NORMALIZATION ───────────────
         if self.normalize:
             coord, scale = normalize_to_canonical_sphere(
                 coord, scale,
-                target_radius=self.target_radius
+                target_radius=self.target_radius,
+                scale_norm_mode=self.scale_norm_mode,   # ← pass through
             )
-            
-            # Verification on first training scene
-            # if self.train and idx == 0:
-            #     stats = verify_canonical_normalization(coord, self.target_radius)
-            #     print(f"\n✓ Canonical sphere normalization verified (scene 0):")
-            #     print(f"  Max distance: {stats['max_distance']:.2f}m")
-            #     print(f"  Sphere utilization: {stats['utilization']:.1f}%")
-            #     print(f"  Position range: [{coord.min():.2f}, {coord.max():.2f}]m")
-            #     print(f"  Scale range (log): [{scale.min():.4f}, {scale.max():.4f}]")
-            #     print(f"  Scale range (exp): [{np.exp(scale.min()):.4f}, {np.exp(scale.max()):.4f}]m")
+
+            # Debug print on first training scene
+            if self.train and idx == 0:
+                stats = verify_canonical_normalization(coord, self.target_radius)
+                # print(f"\n✓ Canonical sphere normalization verified (scene 0):")
+                # print(f"  Max distance:      {stats['max_distance']:.2f}m")
+                # print(f"  Sphere util:       {stats['utilization']:.1f}%")
+                # print(f"  Position range:    [{coord.min():.2f}, {coord.max():.2f}]m")
+                # if self.scale_norm_mode == 'log':
+                #     print(f"  Scale range (log): [{scale.min():.4f}, {scale.max():.4f}]")
+                #     print(f"  Scale range (exp): "
+                #           f"[{np.exp(scale.min()):.4f}, {np.exp(scale.max()):.4f}]m")
+                # else:
+                #     print(f"  Scale range (lin): [{scale.min():.4f}, {scale.max():.4f}]m")
         else:
-            # NO NORMALIZATION - use raw values
             if self.train and idx == 0:
                 print(f"\n⚠️  Using RAW coordinates (scene 0):")
                 print(f"  Position range: [{coord.min():.2f}, {coord.max():.2f}]m")
-                print(f"  Scale range: [{scale.min():.4f}, {scale.max():.4f}]m")
-        # ─────────────────────────────────────────────────────────────────────
+                print(f"  Scale range:    [{scale.min():.4f}, {scale.max():.4f}]m")
 
-        # ── STEP 2: 🎨 OPTIONAL COLOR NORMALIZATION ──────────────────────────
+        # ── STEP 3: 🎨 OPTIONAL COLOR NORMALIZATION ──────────────────────────
         if self.normalize_colors:
-            # Normalize RGB [0, 255] → [0, 1]
             color = color / 255.0
-            
             if self.train and idx == 0:
                 assert 0.0 <= color.min() and color.max() <= 1.0, \
                     f"RGB normalisation failed: range [{color.min()}, {color.max()}]"
                 print(f"✓ Colors normalized to [0, 1]")
         else:
-            # Keep colors in [0, 255] range
             if self.train and idx == 0:
                 print(f"⚠️  Colors kept in [0, 255] range")
                 print(f"  Color range: [{color.min():.1f}, {color.max():.1f}]")
-        # ─────────────────────────────────────────────────────────────────────
 
-        # ── STEP 2: Load semantic labels ──────────────────────────────────────
+        # ── STEP 4: Load semantic labels ──────────────────────────────────────
         try:
-            segment  = np.load(os.path.join(scene_dir, 'segment.npy'))   # (N,)
-            instance = np.load(os.path.join(scene_dir, 'instance.npy'))  # (N,)
+            segment  = np.load(os.path.join(scene_dir, 'segment.npy'))
+            instance = np.load(os.path.join(scene_dir, 'instance.npy'))
             has_semantics = True
 
             valid = segment[segment >= 0]
@@ -351,34 +340,31 @@ class gs_dataset(Dataset):
             instance      = np.full(len(coord), -1, dtype=np.int32)
             has_semantics = False
 
-        # ── STEP 3: Deterministic top-40k sampling ────────────────────────────
+        # ── STEP 5: Deterministic top-40k sampling ────────────────────────────
         N = len(coord)
-        
+
         if self.sampling_method == 'hybrid':
-            scale_mag  = np.linalg.norm(scale, axis=1)
-            scale_norm = (scale_mag - scale_mag.min()) / \
-                         (scale_mag.max() - scale_mag.min() + 1e-8)
+            scale_mag    = np.linalg.norm(scale, axis=1)
+            scale_norm_s = (scale_mag - scale_mag.min()) / \
+                           (scale_mag.max() - scale_mag.min() + 1e-8)
             opacity_norm = (opacity - opacity.min()) / \
                            (opacity.max() - opacity.min() + 1e-8)
-            importance = 0.7 * opacity_norm + 0.3 * scale_norm
+            importance = 0.8 * opacity_norm + 0.2 * scale_norm_s
         elif self.sampling_method == 'opacity':
             importance = opacity
         else:  # 'random' — still deterministic
             importance = np.arange(N, dtype=np.float32)
 
-        # Sort by importance (ascending)
         sorted_indices = np.argsort(importance)
 
         T = self.TARGET_POINTS
         if N >= T:
-            selected = sorted_indices[-T:]  # Top T
+            selected = sorted_indices[-T:]
         else:
-            # Pad by repeating highest-importance Gaussian
             n_extra  = T - N
             extra    = np.full(n_extra, sorted_indices[-1], dtype=np.int64)
             selected = np.concatenate([sorted_indices, extra])
 
-        # Apply selection
         coord    = coord   [selected]
         color    = color   [selected]
         scale    = scale   [selected]
@@ -387,7 +373,7 @@ class gs_dataset(Dataset):
         segment  = segment [selected]
         instance = instance[selected]
 
-        # ── STEP 4: Voxelisation (positional encoding) ────────────────────────
+        # ── STEP 6: Voxelisation (positional encoding) ────────────────────────
         volume_dims = 40
         resolution  = 16.0 / volume_dims
 
@@ -406,11 +392,11 @@ class gs_dataset(Dataset):
 
         point_uniq_idx = uniq_idx[inv_idx]
 
-        # ── STEP 5: Assemble feature tensor ───────────────────────────────────
+        # ── STEP 7: Assemble feature tensor ───────────────────────────────────
         opacity_col    = opacity[:, np.newaxis]
         point_uniq_col = point_uniq_idx[:, np.newaxis]
 
-        gs_params = np.concatenate(
+        gs_params      = np.concatenate(
             (coord, color, opacity_col, scale, quat), axis=1
         )
         gs_full_params = np.concatenate(
@@ -421,12 +407,12 @@ class gs_dataset(Dataset):
             f"Expected ({T}, 18), got {gs_full_params.shape}"
 
         return {
-            'features':       gs_full_params,
-            'segment_labels': segment,
+            'features':        gs_full_params,
+            'segment_labels':  segment,
             'instance_labels': instance,
-            'scene_idx':      idx,
-            'has_semantics':  has_semantics,
-            'num_categories': self.num_segment_categories,
+            'scene_idx':       idx,
+            'has_semantics':   has_semantics,
+            'num_categories':  self.num_segment_categories,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -505,55 +491,35 @@ if __name__ == "__main__":
                  else "/home/yli11/scratch/datasets/gaussian_world/"
                       "preprocessed/interior_gs/train")
 
-    print("🔧 Testing normalization control...\n")
+    print("🔧 Testing scale normalization modes...\n")
 
-    # Test WITH normalization
-    print("="*80)
-    print("TEST 1: WITH CANONICAL SPHERE NORMALIZATION")
-    print("="*80)
-    dataset_normalized = gs_dataset(
-        root=data_path,
-        resol=200,
-        random_permute=False,
-        train=True,
-        sampling_method='opacity',
-        max_scenes=1,
-        normalize=True,  # ← ENABLED
-        target_radius=10.0,
-    )
-    
-    sample_norm = dataset_normalized[0]
-    features_norm = sample_norm['features']
-    pos_norm = features_norm[:, 4:7]
-    scale_norm = features_norm[:, 11:14]
-    
-    print(f"\nWith normalization:")
-    print(f"  Position range: [{pos_norm.min():.2f}, {pos_norm.max():.2f}]m")
-    print(f"  Scale range: [{scale_norm.min():.4f}, {scale_norm.max():.4f}]m")
-    
-    # Test WITHOUT normalization
-    print("\n" + "="*80)
-    print("TEST 2: WITHOUT CANONICAL SPHERE NORMALIZATION")
-    print("="*80)
-    dataset_raw = gs_dataset(
-        root=data_path,
-        resol=200,
-        random_permute=False,
-        train=True,
-        sampling_method='opacity',
-        max_scenes=1,
-        normalize=False,  # ← DISABLED
-    )
-    
-    sample_raw = dataset_raw[0]
-    features_raw = sample_raw['features']
-    pos_raw = features_raw[:, 4:7]
-    scale_raw = features_raw[:, 11:14]
-    
-    print(f"\nWithout normalization:")
-    print(f"  Position range: [{pos_raw.min():.2f}, {pos_raw.max():.2f}]m")
-    print(f"  Scale range: [{scale_raw.min():.4f}, {scale_raw.max():.4f}]m")
-    
-    print("\n" + "="*80)
-    print("✓ TESTS PASSED - Normalization toggle working correctly!")
-    print("="*80)
+    for mode in ['log', 'linear']:
+        print("=" * 80)
+        print(f"TEST: scale_norm_mode='{mode}'")
+        print("=" * 80)
+        ds = gs_dataset(
+            root=data_path,
+            resol=200,
+            random_permute=False,
+            train=True,
+            sampling_method='opacity',
+            max_scenes=1,
+            normalize=True,
+            target_radius=10.0,
+            scale_norm_mode=mode,
+        )
+        sample = ds[0]
+        features = sample['features']
+        pos   = features[:, 4:7]
+        scale = features[:, 11:14]
+        print(f"\nResults (mode='{mode}'):")
+        print(f"  Position range: [{pos.min():.2f}, {pos.max():.2f}]m")
+        print(f"  Scale raw range:  [{scale.min():.4f}, {scale.max():.4f}]")
+        if mode == 'log':
+            print(f"  Scale (exp) range: [{np.exp(scale.min()):.4f}, "
+                  f"{np.exp(scale.max()):.4f}]m")
+        print()
+
+    print("=" * 80)
+    print("✓ TESTS PASSED")
+    print("=" * 80)

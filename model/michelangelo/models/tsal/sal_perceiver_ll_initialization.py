@@ -13,6 +13,13 @@ Dual spatial encoding in the encoder:
 3. Concatenate: [fourier_voxel, fourier_xyz, gaussian_params] → input_proj
 
 This provides hierarchical spatial understanding without decoder residuals.
+
+SCALE INITIALIZATION FIX:
+--------------------------
+GS_decoder initializes scale head biases to log(0.057) = -2.86 so that
+exp(-2.86) ≈ 0.057m matches the normalized scale median from dataset analysis.
+Without this, exp(0) = 1.0m at init which is 17× too large.
+All 3 scale channels per Gaussian are initialized to -2.86.
 """
 
 import torch
@@ -333,7 +340,7 @@ class GaussianSemanticAttentionHead(CrossAttentionDecoder):
 
 
 # ============================================================================
-# GS_DECODER - WITH ACTIVATION FUNCTIONS
+# GS_DECODER - WITH ACTIVATION FUNCTIONS AND SCALE BIAS INITIALIZATION
 # ============================================================================
 class GS_decoder(nn.Module):
     """
@@ -341,10 +348,23 @@ class GS_decoder(nn.Module):
     
     Output: 14 geometric params (xyz, rgb, opacity, scale, quat)
     ALL parameters are in POST-ACTIVATION format:
-      - Color: sigmoid → [0, 1]
-      - Opacity: sigmoid → [0, 1]
-      - Scale: softplus → (0, +∞)
-      - Quaternion: normalized → ||q|| = 1.0
+      - Position: raw (unbounded)
+      - Color:    clamp(0, 1) → [0, 1], no saturation at init
+      - Opacity:  sigmoid → [0, 1]
+      - Scale:    exp → (0, +∞), bias initialized to -2.86
+      - Quat:     L2 normalized → unit quaternion
+
+    SCALE INITIALIZATION:
+      output_linear bias at scale positions is set to log(0.057) = -2.86
+      so exp(-2.86) ≈ 0.057m = normalized scale median from dataset.
+      Without this, exp(0) = 1.0m at init which is 17× too large.
+
+    PARAM LAYOUT per Gaussian (14 values):
+      [0:3]   position  (xyz)
+      [3:6]   color     (rgb)
+      [6]     opacity
+      [7:10]  scale     (sx, sy, sz)  ← bias initialized to -2.86
+      [10:14] quaternion (qw, qx, qy, qz)
     """
     def __init__(self, D=8, W=256, input_ch=4, skip=[4], output_ch=56):
         super(GS_decoder, self).__init__()
@@ -353,64 +373,119 @@ class GS_decoder(nn.Module):
         self.input_ch = input_ch
         self.skips = skip
         self.output_ch = output_ch
-        
+
+        # ── MLP layers ────────────────────────────────────────────────
         self.pts_linears = nn.ModuleList([nn.Linear(input_ch, W)])
-        for i in range(D-1):
+        for i in range(D - 1):
             self.pts_linears.append(nn.Linear(W, W))
             self.pts_linears.append(nn.LayerNorm(W))
             self.pts_linears.append(nn.ReLU())
-        
+
         self.output_linear = nn.Linear(in_features=W, out_features=output_ch)
-        
+
+        # ── Scale bias initialization ─────────────────────────────────
+        # Dataset analysis (500 scenes, opacity-selected top-40k):
+        #   Normalized scale median = 0.057m
+        #   Target bias = log(0.057) = -2.86
+        #   Result: exp(-2.86) ≈ 0.057m at initialization
+        #
+        # Without this: exp(0) = 1.0m → 17× too large → white blob
+        # With this:    exp(-2.86) = 0.057m → correct size from epoch 1
+        #
+        # Scale params are at positions [7, 8, 9] within each 14-param
+        # Gaussian, so in the flat output_linear bias they are at
+        # indices [7, 8, 9, 21, 22, 23, 35, 36, 37, ...] for N Gaussians.
+        self._initialize_scale_bias()
+
+    def _initialize_scale_bias(self):
+        """
+        Initialize scale output biases so exp(bias) = 0.057m at epoch 0.
+
+        The output_linear produces [N * 14] values which get reshaped to
+        [N, 14]. Scale is at columns [7, 8, 9] in that layout.
+
+        In the flat bias vector of length N*14, scale positions are:
+          gaussian_i → [i*14 + 7, i*14 + 8, i*14 + 9]
+        """
+        TARGET_SCALE_LOG = math.log(0.057)  # = -2.864
+
+        N_GAUSSIANS  = 40_000
+        PARAMS_PER_G = 14
+        SCALE_COLS   = [7, 8, 9]  # within each 14-element block
+
+        with torch.no_grad():
+            bias = self.output_linear.bias  # shape [N_GAUSSIANS * PARAMS_PER_G]
+            for g in range(N_GAUSSIANS):
+                for col in SCALE_COLS:
+                    bias[g * PARAMS_PER_G + col] = TARGET_SCALE_LOG
+
+        print(f"✓ Scale bias initialized: exp({TARGET_SCALE_LOG:.3f}) "
+              f"= {math.exp(TARGET_SCALE_LOG):.4f}m "
+              f"(dataset normalized scale median)")
+
     def forward(self, x, return_hidden=False):
         """
         Forward pass with proper activations to match dataset format.
         
         Args:
-            x: [B, input_ch] latent features
+            x:             [B, input_ch] latent features
             return_hidden: whether to return hidden features for semantic learning
             
         Returns:
             output: [B, N*14] Gaussian parameters in POST-ACTIVATION format
             hidden: (optional) [B, W] hidden features before output projection
         """
-        # MLP forward
-        for i, l in enumerate(self.pts_linears):
-            x = self.pts_linears[i](x)
-        
+        # ── MLP forward ───────────────────────────────────────────────
+        for layer in self.pts_linears:
+            x = layer(x)
+
         hidden = x
         raw_output = self.output_linear(x)
-        
-        # Reshape to [B, N, 14]
+
+        # ── Reshape to [B, N, 14] ─────────────────────────────────────
         B = raw_output.shape[0]
-        N = 40000
+        N = 40_000
         raw_output = raw_output.reshape(B, N, 14)
-        
-        # Split into parameters
+
+        # ── Split parameters ──────────────────────────────────────────
         position    = raw_output[:, :, 0:3]
         color_raw   = raw_output[:, :, 3:6]
         opacity_raw = raw_output[:, :, 6:7]
         scale_raw   = raw_output[:, :, 7:10]
         quat_raw    = raw_output[:, :, 10:14]
-        
-        # Apply activations
-        color = torch.clamp(color_raw, 0.0, 1.0)  # Linear gradients!
-        opacity = torch.sigmoid(opacity_raw)       # Keep sigmoid
-        scale = torch.exp(scale_raw)               # Log-space input
-        quat = F.normalize(quat_raw, p=2, dim=-1)  # Keep normalization
-        
-        # Recombine
+
+        # ── Apply activations ─────────────────────────────────────────
+        #
+        # COLOR: clamp instead of sigmoid
+        #   sigmoid(0) = 0.5 → gray collapse at init
+        #   clamp has no saturation, gradients always flow in [0,1]
+        color = torch.clamp(color_raw, 0.0, 1.0)
+
+        # OPACITY: sigmoid
+        #   Dataset shows 99.8% of selected Gaussians have opacity > 0.9
+        #   Model learns this quickly and correctly
+        opacity = torch.sigmoid(opacity_raw)
+
+        # SCALE: exp  ← standard in all 3DGS literature (Can3Tok, pixelSplat, etc.)
+        #   exp(raw) ensures strictly positive scales (valid covariance matrix)
+        #   Bias initialized to -2.86 so exp(-2.86) = 0.057m at epoch 0
+        scale = torch.exp(scale_raw)
+
+        # QUATERNION: L2 normalize → unit quaternion
+        quat = F.normalize(quat_raw, p=2, dim=-1)
+
+        # ── Recombine ─────────────────────────────────────────────────
         output = torch.cat([
-            position,  # [B, N, 3] - absolute positions (NO residual)
-            color,     # [B, N, 3]
-            opacity,   # [B, N, 1]
-            scale,     # [B, N, 3]
-            quat,      # [B, N, 4]
+            position,   # [B, N, 3]  raw positions
+            color,      # [B, N, 3]  [0, 1]
+            opacity,    # [B, N, 1]  [0, 1]
+            scale,      # [B, N, 3]  (0, +∞) metres, initialized at 0.057m
+            quat,       # [B, N, 4]  unit quaternion
         ], dim=-1)
-        
-        # Flatten back to [B, N*14]
+
+        # ── Flatten back to [B, N*14] ─────────────────────────────────
         output = output.reshape(B, -1)
-        
+
         if return_hidden:
             return output, hidden
         else:
@@ -623,6 +698,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         print(f"{'='*70}")
         print(f"✓ Encoder: Dual Fourier embeddings (voxel + xyz)")
         print(f"✓ Decoder: Direct MLP output (NO residual)")
+        print(f"✓ Scale:   exp() activation, bias initialized to -2.86")
+        print(f"           → exp(-2.86) = 0.057m at epoch 0 (dataset median)")
         print(f"{'='*70}\n")
 
     def encode(self, pc, feats=None, sample_posterior=True):
