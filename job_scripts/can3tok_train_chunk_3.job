@@ -68,10 +68,10 @@ SAMPLING_STRATEGY="balanced"
 # ============================================================================
 
 BATCH_SIZE=64
-NUM_EPOCHS=500
+NUM_EPOCHS=1000
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-5
-EVAL_EVERY=5
+EVAL_EVERY=20
 FAILURE_THRESHOLD=100
 
 # ============================================================================
