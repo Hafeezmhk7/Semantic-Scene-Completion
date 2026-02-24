@@ -1,23 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=can3tok_normexp
+#SBATCH --job-name=can3tok_semantic
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/can3tok_all_normalization_False_%j.out
+#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init_logscaleloss.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
-# CAN3TOK TRAINING - WITH NORMALIZATION CONTROL
+# CAN3TOK TRAINING - FULL SEMANTIC CONTROL + COLOR WEIGHTING + SCALE MODE
 # ============================================================================
-# Complete control over both dataset normalization and loss normalization
-# Test different combinations to find optimal configuration
+# Controls available via flags — no YAML edits needed.
+#
+# NEW FLAGS:
+#   SCALE_NORM_MODE   — 'log' (Can3Tok) or 'linear' (original)
+#   COLOR_LOSS_WEIGHT — upweight color loss to fight gray collapse
+#   LOG_SCALE_LOSS    — use log-space L2 for scale (symmetric penalties)
 # ============================================================================
 
 echo "================================================================================"
-echo "          CAN3TOK TRAINING - NORMALIZATION CONTROL EXPERIMENTS"
+echo "               CAN3TOK TRAINING - SEMANTIC LEARNING CONTROL"
 echo "================================================================================"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
@@ -25,87 +29,37 @@ echo "Start time: $(date)"
 echo ""
 
 # ============================================================================
-# 🎯 NORMALIZATION CONTROL - CHOOSE YOUR EXPERIMENT!
+# 🎯 SEMANTIC LEARNING CONFIGURATION
 # ============================================================================
 
-# ┌────────────────────────────────────────────────────────────────────────┐
-# │  TWO INDEPENDENT NORMALIZATION CONTROLS:                                │
-# │                                                                          │
-# │  1. USE_CANONICAL_NORM: Dataset-level normalization                     │
-# │     True  = Positions normalized to [-10, 10] canonical sphere          │
-# │     False = Raw coordinates from dataset (varies by scene)              │
-# │                                                                          │
-# │  2. USE_BALANCED_LOSS: Training-level loss normalization                │
-# │     True  = Per-parameter normalized loss (fixes color collapse)        │
-# │     False = Standard L2 loss (position dominates)                       │
-# └────────────────────────────────────────────────────────────────────────┘
+# ────────────────────────────────────────────────────────────────────────────
+# OPTION 1: NO SEMANTIC LEARNING (Baseline)
+# ────────────────────────────────────────────────────────────────────────────
+SEMANTIC_MODE="geometric"
+SEGMENT_WEIGHT=0.0
+INSTANCE_WEIGHT=0.0
 
-# ════════════════════════════════════════════════════════════════════════════
-# EXPERIMENT 1: BASELINE (Original Can3Tok behavior)
-# ════════════════════════════════════════════════════════════════════════════
-USE_CANONICAL_NORM=False    # Normalize to canonical sphere
-USE_COLOR_NORM=False        # Normalize colors to [0, 1]
-USE_BALANCED_LOSS=False     # Standard L2 loss
+# ────────────────────────────────────────────────────────────────────────────
+# OPTION 2: GEOMETRIC MODE (Recommended balance)
+# ────────────────────────────────────────────────────────────────────────────
+# SEMANTIC_MODE="geometric"
+# SEGMENT_WEIGHT=0.3
+# INSTANCE_WEIGHT=0.0
 
-# Expected: Position compression, color collapse (gray)
-# Why: Position errors (large magnitude) dominate unbalanced loss
+# ────────────────────────────────────────────────────────────────────────────
+# OPTION 3: HIDDEN STATE MODE (Best quality, slowest)
+# ────────────────────────────────────────────────────────────────────────────
+# SEMANTIC_MODE="hidden"
+# SEGMENT_WEIGHT=0.3
+# INSTANCE_WEIGHT=0.0
 
-# ════════════════════════════════════════════════════════════════════════════
-# EXPERIMENT 2: BALANCED LOSS ONLY
-# ════════════════════════════════════════════════════════════════════════════
-# USE_CANONICAL_NORM=True      # Normalize to canonical sphere
-# USE_COLOR_NORM=True          # Normalize colors to [0, 1]
-# USE_BALANCED_LOSS=True       # Per-parameter balanced loss
+# ────────────────────────────────────────────────────────────────────────────
+# OPTION 4: ATTENTION MODE (Spatial context)
+# ────────────────────────────────────────────────────────────────────────────
+# SEMANTIC_MODE="attention"
+# SEGMENT_WEIGHT=0.3
+# INSTANCE_WEIGHT=0.0
 
-# Expected: Proper spatial spread, colorful reconstructions
-# Why: All parameters contribute equally to loss
-
-# ════════════════════════════════════════════════════════════════════════════
-# EXPERIMENT 3: RAW DATA (No dataset normalization)
-# ════════════════════════════════════════════════════════════════════════════
-# USE_CANONICAL_NORM=False     # Raw coordinates (no normalization)
-# USE_COLOR_NORM=True          # Still normalize colors (recommended)
-# USE_BALANCED_LOSS=False      # Standard L2 loss
-
-# Expected: Scale variance issues, unstable training
-# Why: Different scenes have vastly different coordinate ranges
-
-# ════════════════════════════════════════════════════════════════════════════
-# EXPERIMENT 4: RAW DATA + BALANCED LOSS
-# ════════════════════════════════════════════════════════════════════════════
-# USE_CANONICAL_NORM=False     # Raw coordinates (no normalization)
-# USE_COLOR_NORM=True          # Still normalize colors (recommended)
-# USE_BALANCED_LOSS=True       # Per-parameter balanced loss
-
-# Expected: Better than Exp 3, but still scale issues
-# Why: Balanced loss helps, but raw coords still problematic
-
-# ════════════════════════════════════════════════════════════════════════════
-# EXPERIMENT 5: UNNORMALIZED COLORS (NOT RECOMMENDED!)
-# ════════════════════════════════════════════════════════════════════════════
-# USE_CANONICAL_NORM=True      # Normalize to canonical sphere
-# USE_COLOR_NORM=False         # Keep colors in [0, 255]
-# USE_BALANCED_LOSS=True       # Balanced loss (will handle [0, 255])
-
-# Expected: Training instability, gradient explosions
-# Why: Colors [0, 255] have huge magnitude, will dominate even with balancing
-# NOTE: This is for experimentation only - NOT recommended!
-
-# ════════════════════════════════════════════════════════════════════════════
-# RECOMMENDED: EXPERIMENT 2 (Both normalizations enabled)
-# ════════════════════════════════════════════════════════════════════════════
-# USE_CANONICAL_NORM=True
-# USE_COLOR_NORM=True
-# USE_BALANCED_LOSS=True
-# This should give the best results!
-
-# ════════════════════════════════════════════════════════════════════════════
-# Semantic Learning Configuration
-# ════════════════════════════════════════════════════════════════════════════
-
-SEMANTIC_MODE="geometric"     # Options: none, geometric, hidden, attention
-SEGMENT_WEIGHT=0.0            # 0.0 = disabled, 0.3 = recommended
-INSTANCE_WEIGHT=0.0           # Usually keep at 0.0
 SEMANTIC_TEMP=0.1
 SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
@@ -115,39 +69,100 @@ SAMPLING_STRATEGY="balanced"
 # ============================================================================
 
 BATCH_SIZE=64
-NUM_EPOCHS=200
+NUM_EPOCHS=700
 LEARNING_RATE=1e-4
-KL_WEIGHT=1e-5
-RECON_SCALE=1.0               # Loss divisor (keep at 1.0 for balanced loss)
-EVAL_EVERY=10
+KL_WEIGHT=1e-6
+EVAL_EVERY=20
 FAILURE_THRESHOLD=100
+
+# ============================================================================
+# 🎨 COLOR LOSS WEIGHTING
+# ============================================================================
+# Upweight color loss to fight gray collapse without balanced loss.
+#
+# Recommended values:
+#   1.0  = Equal weight with other params (default)
+#   3.0  = Strong color emphasis (good starting point for gray collapse)
+#   5.0  = Very strong color emphasis (aggressive)
+#  10.0  = Maximum emphasis (use if 5.0 still collapses)
+# ============================================================================
+COLOR_LOSS_WEIGHT=1.0
+
+# ============================================================================
+# 📏 SCALE NORMALIZATION MODE
+# ============================================================================
+# Controls how Gaussian scales are stored in the dataset and what the
+# model learns to predict.
+#
+# 'log'    → Can3Tok ICCV 2025 style
+#            scale_stored = log(scale_metres) + log(scene_factor)
+#            → Ground truth is NEGATIVE (e.g. -7 to -1)
+#            → Decoder must use exp() activation
+#            → Pro: Physically principled, matches paper exactly
+#            → Con: Large scale loss early in training
+#
+# 'linear' → Original style
+#            scale_stored = scale_metres * scene_factor
+#            → Ground truth is SMALL POSITIVE (e.g. 0.01 – 0.2m)
+#            → Decoder uses softplus() activation
+#            → Pro: Easier to learn from scratch
+#            → Con: Different from Can3Tok paper
+#
+# RECOMMENDATION: Keep 'linear' — we fix the scale gradient bias via
+# LOG_SCALE_LOSS instead (symmetric L2 in log-space at loss computation).
+# ============================================================================
+SCALE_NORM_MODE="linear"   # "log" | "linear"
+
+# ============================================================================
+# 📐 LOG-SPACE SCALE LOSS  ← NEW FLAG
+# ============================================================================
+# Controls whether scale loss is computed in linear or log space.
+#
+# True  → L2 loss on log(pred_scale) vs log(target_scale)
+#         Symmetric penalty: 2× too large == 2× too small
+#         Fixes the gradient bias that causes scale collapse to ~3cm
+#         Literature: Kerbl et al. 2023 (3DGS) optimizes scale in log-space
+#
+# False → L2 loss on raw scale values (linear space)
+#         Asymmetric: cheaper to predict small → model collapses to 3cm
+#         (behaviour observed in 500-epoch baseline run)
+#
+# RECOMMENDATION: Set True for this run.
+# ============================================================================
+LOG_SCALE_LOSS=True        # True | False
 
 # ============================================================================
 # DATASET CONFIGURATION
 # ============================================================================
 
-TRAIN_SCENES=3500
+TRAIN_SCENES=300
 VAL_SCENES=30
-SAMPLING_METHOD="opacity"
+SAMPLING_METHOD="opacity"  # "random" | "opacity"
 
 # ============================================================================
 # PCA VISUALIZATION CONFIGURATION (CloudCompare)
 # ============================================================================
 
-PCA_VIS_FREQ=10               # Generate PCA PLY files every N epochs
-PCA_NUM_SCENES=5              # Number of scenes to visualize with PCA
-PCA_BRIGHTNESS=1.25           # Color brightness for PCA visualization
+PCA_VIS_FREQ=10
+PCA_NUM_SCENES=5
+PCA_BRIGHTNESS=1.25
 
 # ============================================================================
 # 3DGS RECONSTRUCTION CONFIGURATION (supersplat.at)
 # ============================================================================
 
-RECON_PLY_FREQ=10             # Save reconstructed 3DGS PLY every N epochs
-RECON_PLY_NUM_SCENES=5        # Number of scenes to reconstruct
-RECON_PLY_MAX_SH=3            # Max SH degree (f_rest terms = 0)
+RECON_PLY_FREQ=5
+RECON_PLY_NUM_SCENES=2
+RECON_PLY_MAX_SH=3
 
 # ============================================================================
-# WEIGHTS & BIASES CONFIGURATION
+# 🎯 NORMALIZATION CONTROL
+# ============================================================================
+
+USE_CANONICAL_NORM=True    # True = normalize to canonical sphere | False = raw
+
+# ============================================================================
+# WEIGHTS & BIASES
 # ============================================================================
 
 export WANDB_API_KEY="your_key_here"
@@ -172,106 +187,44 @@ echo "   Memory:            64GB"
 echo "   Time Limit:        12:00:00"
 echo ""
 
-echo "🎯 NORMALIZATION SETTINGS (CRITICAL!):"
-echo ""
-echo "   1. DATASET NORMALIZATION (Canonical Sphere):"
-if [ "$USE_CANONICAL_NORM" = "True" ]; then
-    echo "      Status:         ✅ ENABLED"
-    echo "      Effect:         Positions normalized to [-10, 10]m sphere"
-    echo "      Scales:         Normalized proportionally (linear space)"
-else
-    echo "      Status:         ❌ DISABLED (RAW)"
-    echo "      Effect:         Using raw coordinates from dataset"
-    echo "      Warning:        Scenes have different coordinate ranges!"
-    echo "      Warning:        May cause training instability!"
-fi
-echo ""
-
-echo "   2. COLOR NORMALIZATION:"
-if [ "$USE_COLOR_NORM" = "True" ]; then
-    echo "      Status:         ✅ ENABLED"
-    echo "      Effect:         RGB colors normalized to [0, 1]"
-    echo "      Recommended:    YES - neural networks expect [0, 1]"
-else
-    echo "      Status:         ❌ DISABLED"
-    echo "      Effect:         RGB colors kept in [0, 255] range"
-    echo "      Warning:        Large color values may cause:"
-    echo "                      - Gradient explosions"
-    echo "                      - Training instability"
-    echo "                      - Colors dominating loss even with balancing"
-    echo "      Recommended:    NO - only for experimentation!"
-fi
-echo ""
-
-echo "   3. LOSS NORMALIZATION (Balanced Loss):"
-if [ "$USE_BALANCED_LOSS" = "True" ]; then
-    echo "      Status:         ✅ ENABLED"
-    echo "      Effect:         All parameters contribute equally to loss"
-    echo "      Fixes:          - Color collapse (no more gray!)"
-    echo "                      - Position compression"
-    echo "                      - Scale variance issues"
-    echo ""
-    echo "      Per-parameter normalization:"
-    echo "         Position:    [-10, 10] → [0, 1]"
-    if [ "$USE_COLOR_NORM" = "True" ]; then
-        echo "         Color:       [0, 1] → [0, 1] (already normalized)"
-    else
-        echo "         Color:       [0, 255] → [0, 1] (balanced loss handles this)"
-    fi
-    echo "         Opacity:     [0, 1] → [0, 1] (already normalized)"
-    echo "         Scale:       [0, 0.5] → [0, 1]"
-    echo "         Rotation:    [-1, 1] → [0, 1]"
-else
-    echo "      Status:         ❌ DISABLED (STANDARD L2)"
-    echo "      Effect:         Position errors dominate loss"
-    echo "      Expected:       - Gray colors (mode collapse)"
-    echo "                      - Compressed positions"
-    echo "                      - Color loss ~12, Position loss ~90"
-fi
-echo ""
-
-# Predict expected behavior
-echo "📊 EXPECTED BEHAVIOR:"
-echo ""
-if [ "$USE_CANONICAL_NORM" = "True" ] && [ "$USE_COLOR_NORM" = "True" ] && [ "$USE_BALANCED_LOSS" = "True" ]; then
-    echo "   Configuration:   ✅ OPTIMAL (All normalizations enabled)"
-    echo "   Expected:        🎨 Colorful reconstructions"
-    echo "                    📐 Proper spatial spread"
-    echo "                    ⚖️  Balanced parameter losses (~10-15 each)"
-    echo "                    🏆 Best overall quality"
-elif [ "$USE_CANONICAL_NORM" = "True" ] && [ "$USE_COLOR_NORM" = "True" ] && [ "$USE_BALANCED_LOSS" = "False" ]; then
-    echo "   Configuration:   ⚠️  BASELINE (Canonical + color norm, no balanced loss)"
-    echo "   Expected:        🌫️  Gray/dull colors (mode collapse)"
-    echo "                    📉 Compressed positions"
-    echo "                    ⚖️  Imbalanced losses (Pos ~90, Color ~12)"
-elif [ "$USE_COLOR_NORM" = "False" ]; then
-    echo "   Configuration:   ❌ EXPERIMENTAL (Unnormalized colors [0, 255])"
-    echo "   Expected:        💥 Training instability"
-    echo "                    📈 Gradient explosions likely"
-    echo "                    ⚠️  Colors will dominate loss"
-    echo "                    ❌ NOT RECOMMENDED - for experimentation only!"
-elif [ "$USE_CANONICAL_NORM" = "False" ] && [ "$USE_BALANCED_LOSS" = "True" ]; then
-    echo "   Configuration:   ⚠️  EXPERIMENTAL (Raw coords + balanced loss)"
-    echo "   Expected:        📏 Scene-dependent coordinate ranges"
-    echo "                    ⚠️  Possible training instability"
-    echo "                    ⚖️  Balanced losses help but not optimal"
-else
-    echo "   Configuration:   ❌ NOT RECOMMENDED"
-    echo "   Expected:        💥 Training instability"
-    echo "                    📏 Inconsistent scene scales"
-    echo "                    ⚖️  Severe loss imbalance"
-fi
-echo ""
-
 echo "🧠 SEMANTIC LEARNING:"
-if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
+if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || \
+   (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
     echo "   Status:            ✅ ENABLED"
     echo "   Mode:              ${SEMANTIC_MODE^^}"
-    echo "   Segment Weight:    $SEGMENT_WEIGHT"
-    echo "   Instance Weight:   $INSTANCE_WEIGHT"
+    echo "   Segment weight:    $SEGMENT_WEIGHT"
+    echo "   Instance weight:   $INSTANCE_WEIGHT"
 else
-    echo "   Status:            ❌ DISABLED"
+    echo "   Status:            ❌ DISABLED (Baseline)"
 fi
+echo ""
+
+echo "📏 SCALE NORMALIZATION:"
+echo "   Mode:              $SCALE_NORM_MODE"
+if [ "$SCALE_NORM_MODE" = "log" ]; then
+    echo "   Style:             Can3Tok ICCV 2025"
+    echo "   Formula:           scale_stored = log(scale) + log(factor)"
+    echo "   GT range:          Negative values (e.g. -7 to -1)"
+    echo "   Decoder act:       exp()"
+    echo "   ⚠️  Expect large scale loss early in training"
+else
+    echo "   Style:             Original (linear)"
+    echo "   Formula:           scale_stored = scale × factor"
+    echo "   GT range:          Small positive metres (e.g. 0.01 – 0.2)"
+    echo "   Decoder act:       softplus()"
+    echo "   ✓  Scale loss should be small from early epochs"
+fi
+echo "   Log Scale Loss:    $([ "$LOG_SCALE_LOSS" = "True" ] && echo "✅ ENABLED (symmetric L2 in log-space)" || echo "❌ DISABLED (linear-space L2)")"
+echo ""
+
+echo "🎨 COLOR CONFIGURATION:"
+echo "   Color Loss Weight: ${COLOR_LOSS_WEIGHT}×"
+if (( $(echo "$COLOR_LOSS_WEIGHT > 1.0" | bc -l) )); then
+    echo "   Effect:            🎯 Color errors weighted ${COLOR_LOSS_WEIGHT}× vs other params"
+else
+    echo "   Effect:            ⚖️  Equal weight with other parameters"
+fi
+echo "   Sigmoid:           ❌ REMOVED (raw output + clamp at PLY write)"
 echo ""
 
 echo "⚙️  TRAINING HYPERPARAMETERS:"
@@ -279,29 +232,38 @@ echo "   Batch Size:        $BATCH_SIZE"
 echo "   Epochs:            $NUM_EPOCHS"
 echo "   Learning Rate:     $LEARNING_RATE"
 echo "   KL Weight:         $KL_WEIGHT"
-echo "   Recon Scale:       $RECON_SCALE"
 echo "   Eval Every:        $EVAL_EVERY epochs"
+echo "   Failure Thresh:    $FAILURE_THRESHOLD"
 echo ""
 
 echo "📊 DATASET:"
 echo "   Training Scenes:   $TRAIN_SCENES"
 echo "   Val Scenes:        $VAL_SCENES"
 echo "   Sampling:          ${SAMPLING_METHOD^^}"
+echo "   Canonical Norm:    $([ "$USE_CANONICAL_NORM" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
+echo "   Scale Mode:        $SCALE_NORM_MODE"
 echo ""
 
-echo "🎨 PCA VISUALIZATION:"
+echo "🎨 PCA VISUALIZATION (CloudCompare):"
 echo "   Frequency:         Every $PCA_VIS_FREQ epochs"
-echo "   Scenes/Epoch:      $PCA_NUM_SCENES"
+echo "   Scenes:            $PCA_NUM_SCENES per epoch"
+echo "   Output:            checkpoints/.../pca_visualizations/epoch_XXX/"
 echo ""
 
-echo "🌐 3DGS RECONSTRUCTION:"
+echo "🌐 3DGS RECONSTRUCTION (supersplat.at):"
 echo "   Frequency:         Every $RECON_PLY_FREQ epochs"
-echo "   Scenes/Epoch:      $RECON_PLY_NUM_SCENES"
-echo "   View at:           https://supersplat.at"
+echo "   Scenes:            $RECON_PLY_NUM_SCENES per epoch"
+echo "   Max SH Degree:     $RECON_PLY_MAX_SH"
+echo "   Color:             Raw output clamped [0,1] → f_dc via C0"
+echo "   Scale:             Mode=$SCALE_NORM_MODE | LogLoss=$([ "$LOG_SCALE_LOSS" = "True" ] && echo "YES" || echo "NO")"
+echo "   Output:            checkpoints/.../reconstructed_gaussians/epoch_XXX/"
+echo "   View At:           https://supersplat.at"
 echo ""
 
 echo "📈 LOGGING:"
 echo "   W&B:               $([ "$USE_WANDB" = "True" ] && echo "✅ Enabled" || echo "❌ Disabled")"
+echo "   Checkpoints:       Every 10 epochs"
+echo "   Best Model:        Tracked by val L2 error"
 echo ""
 
 echo "════════════════════════════════════════════════════════════════════════════════"
@@ -314,7 +276,8 @@ echo ""
 echo "🔧 Setting up environment..."
 module purge && module load 2023 && module load CUDA/12.1.1
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
-export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
+site-packages/torch/lib:$LD_LIBRARY_PATH"
 
 cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
 mkdir -p logs checkpoints
@@ -324,7 +287,6 @@ echo "   ✓ Conda environment: can3tok"
 echo "   ✓ Working directory: $(pwd)"
 echo ""
 
-# W&B setup
 if [ "$USE_WANDB" = "True" ]; then
     wandb login $WANDB_API_KEY --relogin 2>/dev/null
     echo "   ✓ Weights & Biases authenticated"
@@ -339,7 +301,7 @@ echo ""
 
 echo "🚀 Building training command..."
 
-TRAIN_CMD="python gs_can3tok_2.py"
+TRAIN_CMD="python gs_can3tok_1.py"
 
 # ─── Training parameters ────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
@@ -348,7 +310,6 @@ TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
 TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
-TRAIN_CMD="$TRAIN_CMD --recon_scale $RECON_SCALE"
 
 # ─── Dataset parameters ─────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
@@ -363,56 +324,40 @@ TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
-# ─── PCA visualization parameters ───────────────────────────────────────────
+# ─── Color loss weighting ───────────────────────────────────────────────────
+TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
+
+# ─── Scale normalization mode ───────────────────────────────────────────────
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+
+# ─── Log-space scale loss (NEW) ─────────────────────────────────────────────
+if [ "$LOG_SCALE_LOSS" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --log_scale_loss"
+fi
+
+# ─── PCA visualization ──────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
 TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
 
-# ─── 3DGS reconstruction parameters ─────────────────────────────────────────
+# ─── 3DGS reconstruction ────────────────────────────────────────────────────
 TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NORMALIZATION CONTROL FLAGS
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Balanced loss flag
-if [ "$USE_BALANCED_LOSS" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --use_balanced_loss"
-    echo "   ✓ Added: --use_balanced_loss"
-fi
-
-# Canonical normalization flag
+# ─── Normalization flags ────────────────────────────────────────────────────
 if [ "$USE_CANONICAL_NORM" = "False" ]; then
     TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
-    echo "   ✓ Added: --no_canonical_norm (disabling canonical sphere)"
-else
-    # Default is True (canonical normalization enabled)
-    echo "   ✓ Using canonical sphere normalization (default)"
 fi
-
-# Color normalization flag (NEW!)
-if [ "$USE_COLOR_NORM" = "False" ]; then
-    TRAIN_CMD="$TRAIN_CMD --no_normalize_colors"
-    echo "   ⚠️  Added: --no_normalize_colors (keeping colors in [0, 255])"
-    echo "   ⚠️  WARNING: This may cause training instability!"
-else
-    # Default is True (colors normalized to [0, 1])
-    echo "   ✓ Using color normalization to [0, 1] (default)"
-fi
-
-# ═══════════════════════════════════════════════════════════════════════════
 
 # ─── W&B ────────────────────────────────────────────────────────────────────
 if [ "$USE_WANDB" = "True" ]; then
     TRAIN_CMD="$TRAIN_CMD --use_wandb"
-    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-Normalization"
+    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-Semantic"
     TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
 fi
 
-echo ""
-echo "   Full command:"
+echo "   Command:"
 echo "   $TRAIN_CMD"
 echo ""
 
@@ -444,55 +389,25 @@ echo ""
 if [ $TRAIN_EXIT -eq 0 ]; then
     echo "✅ Training completed successfully!"
     echo ""
-    echo "Results:"
-    echo "   Normalization config:"
-    echo "      Canonical norm:     $([ "$USE_CANONICAL_NORM" = "True" ] && echo "✓ Enabled" || echo "✗ Disabled")"
-    echo "      Balanced loss:      $([ "$USE_BALANCED_LOSS" = "True" ] && echo "✓ Enabled" || echo "✗ Disabled")"
-    echo ""
     echo "Next steps:"
-    echo "   1. Check logs:           cat logs/can3tok_${SLURM_JOB_ID}.out"
-    echo "   2. Find checkpoints:     ls checkpoints/RGB_job_${SLURM_JOB_ID}_*/"
-    echo "   3. Load best model:      checkpoints/RGB_job_${SLURM_JOB_ID}_*/best_model.pth"
+    echo "   1. Check logs:       cat logs/can3tok_${SLURM_JOB_ID}.out"
+    echo "   2. Checkpoints:      ls checkpoints/RGB_job_${SLURM_JOB_ID}_*/"
+    echo "   3. Best model:       checkpoints/RGB_job_${SLURM_JOB_ID}_*/best_model.pth"
     echo ""
-    echo "   Expected improvements (if balanced loss enabled):"
-    echo "      - Color std:        0.05 → 0.20+"
-    echo "      - Position range:   [-5, 5] → [-8, 8]"
-    echo "      - Balanced losses:  All ~10-15 (instead of 90 vs 12)"
-    echo ""
+    echo "   3DGS Reconstructions (supersplat.at):"
+    echo "      Location:   checkpoints/RGB_job_${SLURM_JOB_ID}_*/reconstructed_gaussians/"
+    echo "      Drag & drop to: https://supersplat.at"
     if [ "$USE_WANDB" = "True" ]; then
-        echo "   W&B Dashboard: https://wandb.ai/3D-SSC/Can3Tok-Normalization"
+        echo ""
+        echo "   W&B Dashboard: https://wandb.ai/3D-SSC/Can3Tok-Semantic"
     fi
 else
     echo "❌ Training failed with exit code $TRAIN_EXIT"
     echo ""
     echo "Troubleshooting:"
-    echo "   1. Check error log:      cat logs/can3tok_${SLURM_JOB_ID}.err"
-    echo "   2. Check GPU memory:     nvidia-smi"
-    echo "   3. Verify dataset:       ls /home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/"
+    echo "   1. Check error log:  cat logs/can3tok_${SLURM_JOB_ID}.err"
+    echo "   2. Check GPU memory: nvidia-smi"
+    echo "   3. Verify dataset:   ls /home/yli11/scratch/datasets/gaussian_world/"
 fi
 
 echo "════════════════════════════════════════════════════════════════════════════════"
-
-# ============================================================================
-# QUICK REFERENCE: EXPERIMENT CONFIGURATIONS
-# ============================================================================
-#
-# To run different experiments, uncomment the desired configuration at the top:
-#
-# EXPERIMENT 1 (Baseline - Color collapse):
-#   USE_CANONICAL_NORM=True
-#   USE_BALANCED_LOSS=False
-#
-# EXPERIMENT 2 (Recommended - Best quality):
-#   USE_CANONICAL_NORM=True
-#   USE_BALANCED_LOSS=True
-#
-# EXPERIMENT 3 (Raw data - Unstable):
-#   USE_CANONICAL_NORM=False
-#   USE_BALANCED_LOSS=False
-#
-# EXPERIMENT 4 (Raw + balanced):
-#   USE_CANONICAL_NORM=False
-#   USE_BALANCED_LOSS=True
-#
-# ============================================================================

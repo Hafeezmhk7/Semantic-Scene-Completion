@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init.out
+#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init_1.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
@@ -68,9 +68,9 @@ SAMPLING_STRATEGY="balanced"
 # ============================================================================
 
 BATCH_SIZE=64
-NUM_EPOCHS=1000
+NUM_EPOCHS=700
 LEARNING_RATE=1e-4
-KL_WEIGHT=1e-5
+KL_WEIGHT=1e-6
 EVAL_EVERY=20
 FAILURE_THRESHOLD=100
 

@@ -1057,7 +1057,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         wandb_run.log(log_dict, step=global_step)
     
     # Save checkpoints
-    if epoch >= 10 and epoch % 10 == 0:
+    if epoch >= 10 and epoch % 50 == 0:
         checkpoint_path = os.path.join(save_path, f"epoch_{epoch}.pth")
         torch.save({
             'epoch': epoch,
