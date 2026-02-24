@@ -56,47 +56,6 @@ the correct formulation for our dataset.
 - Location: `CrossAttentionEncoder` in `sal_perceiver_II_initialization.py`
 
 ---
-
-## Training Results Summary
-
-### Baseline Run (no semantics, 700 epochs, 300 scenes)
-
-Final validation L2: **0.14** (best at epoch 699)
-
-| Parameter | Epoch 0 | Epoch 400 | Epoch 700 |
-|-----------|---------|-----------|-----------|
-| Position loss | 148.47 | 6.04 | 2.55 |
-| Color loss | 30.7 | ~4.0 | 3.29 |
-| Scale loss | — | — | 0.25 |
-| Rotation loss | 44.0 | — | 0.73 |
-| KL loss | 6,544 | 98,882 | ~64,000 |
-
-Scale distribution at epoch 700: ~77.5% <5cm, ~13% 5-10cm, ~9.5% >10cm.
-Target distribution for indoor scenes: 65% <5cm, 25% 5-10cm, 10% >10cm.
-The model is biased toward small scales due to asymmetric L2 gradient penalty.
-Scale distribution improves slowly but does not reach the target within 700 epochs.
-
-KL weight reduction from 1e-5 to 1e-6 was the critical change that produced
-a 36% L2 improvement over the 500-epoch run (0.22 -> 0.14). The KL loss
-remains high (~64k at epoch 700) but does not hinder reconstruction because
-the low weight prevents it from dominating gradients.
----
-
-### Semantic Runs (300 scenes, 700 epochs)
-
-Three semantic modes compared against baseline at epoch 200:
-
-| Mode | L2 | Position loss | Scale <5cm | Scale 5-10cm | Scale >10cm |
-|------|----|---------------|-----------|--------------|-------------|
-| Baseline | 2.77 | 79.52 | 83.3% | 12.7% | 3.8% |
-| Geometric | 2.71 | 77.36 | 75.0% | 17.0% | 8.0% |
-| Hidden | 2.52 | 72.61 | 84.6% | 11.0% | 4.3% |
-| Attention | 2.91 | 83.87 | 86.6% | 10.0% | 3.4% |
-
-Geometric mode at epoch 380: L2=0.31, position loss=7.24 (vs baseline 0.32, 8.46).
-
-
-
 ## File Structure and Usage
 
 ### Training Files
