@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init_1_geometric.out
+#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init_1_geometric_1.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
@@ -42,7 +42,7 @@ echo ""
 # OPTION 2: GEOMETRIC MODE (Recommended balance)
 # ────────────────────────────────────────────────────────────────────────────
 SEMANTIC_MODE="geometric"
-SEGMENT_WEIGHT=0.3
+SEGMENT_WEIGHT=0.6
 INSTANCE_WEIGHT=0.0
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ FAILURE_THRESHOLD=100
 #   5.0  = Very strong color emphasis (aggressive)
 #  10.0  = Maximum emphasis (use if 5.0 still collapses)
 # ============================================================================
-COLOR_LOSS_WEIGHT=1.0
+COLOR_LOSS_WEIGHT=2.0
 
 # ============================================================================
 # 📏 SCALE NORMALIZATION MODE  ← KEY EXPERIMENT FLAG

@@ -1,0 +1,89 @@
+#!/bin/bash
+#SBATCH --job-name=label_sim_tsne
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=02:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --output=logs/label_sim_tsne_%j.out
+#SBATCH --error=logs/label_sim_tsne_%j.err
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Label-Similarity Guided t-SNE
+#
+# What this does:
+#   1. Scans 100 scenes from the training split
+#   2. Reads segment.npy for each → computes label distribution vector
+#   3. Finds groups of scenes that genuinely share the same label composition
+#      (cosine similarity >= threshold)
+#   4. Encodes those scenes with BOTH models
+#   5. t-SNE coloured by label-similarity group (not manual room labels)
+#   6. Measures whether semantic model puts same-group scenes closer together
+#
+# Key parameters to tune:
+#   --n_scan            How many scenes to scan (more = better groups, slower)
+#   --dominance_thresh  A scene joins group X if label_X > this fraction
+#                       of its total Gaussians. Groups scenes by their
+#                       most dominant surface type rather than overall
+#                       cosine similarity (which gets confused by ubiquitous
+#                       labels like label_16 that appear in every scene).
+#                       0.25 = label must be >25% of Gaussians (recommended)
+#                       0.40 = stricter, scenes with very clear single surface
+#                       0.15 = looser, more scenes qualify but less distinctive
+#   --min_group_size    Minimum scenes per group (4 is good for t-SNE)
+#   --n_groups          How many groups to find (5 gives a clean plot)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DATASET_ROOT="/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs"
+SPLIT="train_grid1.0cm_chunk8x8_stride6x6"
+
+CKPT_BASELINE="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20007981_none/final.pth"
+CKPT_SEMANTIC="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_19979090_hidden_beta0.3/final.pth"
+
+OUTPUT_DIR="label_tsne_job_${SLURM_JOB_ID}"
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs "$OUTPUT_DIR"
+
+echo "========================================================"
+echo "  Label-Similarity Guided t-SNE"
+echo "  Baseline: $CKPT_BASELINE"
+echo "  Semantic: $CKPT_SEMANTIC"
+echo "  Output:   $OUTPUT_DIR"
+echo "========================================================"
+
+python label_similarity_tsne.py \
+    --dataset_root        "$DATASET_ROOT" \
+    --split               "$SPLIT"        \
+    --checkpoint_baseline "$CKPT_BASELINE" \
+    --checkpoint_semantic "$CKPT_SEMANTIC" \
+    --n_scan              300             \
+    --n_groups            6               \
+    --min_group_size      5               \
+    --dominance_thresh    0.25            \
+    --tsne_seed           42              \
+    --tsne_n_iter         2000            \
+    --resol               200             \
+    --output_dir          "$OUTPUT_DIR"
+
+EXIT_CODE=$?
+
+echo ""
+echo "========================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "DONE — copy results:"
+    echo "  scp user@snellius:\$(pwd)/$OUTPUT_DIR/tsne_label_groups.png ."
+    echo "  scp user@snellius:\$(pwd)/$OUTPUT_DIR/results.json ."
+    echo ""
+    echo "If no groups were found, lower dominance_thresh:"
+    echo "  --dominance_thresh 0.15"
+    echo "If groups are too small, lower min_group_size:"
+    echo "  --min_group_size 3"
+else
+    echo "FAILED (exit $EXIT_CODE) — check logs/label_sim_tsne_${SLURM_JOB_ID}.err"
+fi
+echo "========================================================"

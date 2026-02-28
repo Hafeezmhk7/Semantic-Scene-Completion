@@ -1,0 +1,95 @@
+#!/bin/bash
+#SBATCH --job-name=tsne_analysis
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=01:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --output=logs/tsne_%j.out
+#SBATCH --error=logs/tsne_%j.err
+
+# ============================================================================
+# Can3Tok t-SNE Latent Space Analysis  —  Aggregate ALL chunks per scene
+#
+#   Each scene in train_grid1.0cm_chunk8x8_stride6x6 is split into many
+#   8×8m chunks, e.g.:
+#     0210_840153_r0_c0/   0210_840153_r0_c1/   0210_840153_r1_c0/ ...
+#
+#   With --aggregate_chunks:
+#     1. Every chunk directory matching the scene_id is found
+#     2. Each chunk is encoded independently → z_i ∈ R^16384
+#     3. All z_i are averaged → z_scene = mean(z_0, z_1, ..., z_K)
+#
+#   Each chunk stays fully in-distribution (8×8m, trained on).
+#   The mean latent represents the full room, not one spatial slice.
+# ============================================================================
+
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+
+SCENE_CONFIG="scene_config.json"
+DATASET_ROOT="/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs"
+SPLIT="train_grid1.0cm_chunk8x8_stride6x6"
+
+CHECKPOINT_BASELINE="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20007981_none/final.pth"
+CHECKPOINT_SEMANTIC="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_19979090_hidden_beta0.3/final.pth"
+
+OUTPUT_DIR="tsne_results_job_${SLURM_JOB_ID}"
+
+TSNE_N_ITER=2000
+TSNE_SEED=42
+MIN_SCENES_PER_CAT=0
+MAX_SCENES_PER_CAT=15
+N_ANCHOR_SCENES=5
+N_SUBSAMPLINGS=6
+N_OTHER_SCENES=8
+
+# ── ENVIRONMENT ───────────────────────────────────────────────────────────────
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs "$OUTPUT_DIR"
+
+echo "========================================================================"
+echo "  Can3Tok t-SNE  —  ALL chunks aggregated"
+echo "========================================================================"
+echo "  Job ID:    $SLURM_JOB_ID"
+echo "  Node:      $(hostname)"
+echo "  Start:     $(date)"
+echo "  Split:     $SPLIT"
+echo "  Mode:      ALL chunks per scene → mean z"
+echo "  Anchors:   $N_ANCHOR_SCENES scenes × $N_SUBSAMPLINGS subsamplings (Exp B)"
+echo "========================================================================"
+
+python latent_tsne_analysis.py \
+    --scene_config            "$SCENE_CONFIG" \
+    --dataset_root            "$DATASET_ROOT" \
+    --split                   "$SPLIT" \
+    --checkpoint_baseline     "$CHECKPOINT_BASELINE" \
+    --checkpoint_semantic     "$CHECKPOINT_SEMANTIC" \
+    --output_dir              "$OUTPUT_DIR" \
+    --min_scenes_per_category "$MIN_SCENES_PER_CAT" \
+    --max_scenes_per_category "$MAX_SCENES_PER_CAT" \
+    --n_anchor_scenes         "$N_ANCHOR_SCENES" \
+    --n_subsamplings          "$N_SUBSAMPLINGS" \
+    --n_other_scenes          "$N_OTHER_SCENES" \
+    --tsne_n_iter             "$TSNE_N_ITER" \
+    --tsne_seed               "$TSNE_SEED" \
+    --resol                   200 \
+    --aggregate_chunks
+
+EXIT_CODE=$?
+
+echo ""
+echo "========================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "DONE"
+    echo "  scp user@snellius:\$(pwd)/$OUTPUT_DIR/tsne_semantic_comparison.png ."
+    echo "  scp user@snellius:\$(pwd)/$OUTPUT_DIR/metrics.json ."
+else
+    echo "FAILED (exit $EXIT_CODE) — check logs/tsne_${SLURM_JOB_ID}.err"
+fi
+echo "End: $(date)"
+echo "========================================================================"

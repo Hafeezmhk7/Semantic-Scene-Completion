@@ -2,22 +2,44 @@
 #SBATCH --job-name=can3tok_semantic
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
-#SBATCH --time=12:00:00
+#SBATCH --time=23:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init_1.out
+#SBATCH --output=logs/train_cannorm_500e_3.8k_11_nsi.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
 # CAN3TOK TRAINING - FULL SEMANTIC CONTROL + COLOR WEIGHTING + SCALE MODE
 # ============================================================================
-# Controls available via flags — no YAML edits needed.
 #
-# NEW FLAGS:
-#   SCALE_NORM_MODE  — 'log' (Can3Tok) or 'linear' (original)
-#   COLOR_LOSS_WEIGHT — upweight color loss to fight gray collapse
-# ============================================================================
+# HOW TO CONTROL CHECKPOINT RESUMING:
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Case 1 — Fresh training (default):
+#   Set RESUME_CHECKPOINT="" (empty string)
+#   → Starts from epoch 0 with random weights
+#
+# Case 2 — Resume from a specific checkpoint (most common):
+#   Set RESUME_CHECKPOINT="/path/to/epoch_950.pth"
+#   → Loads weights + optimizer state
+#   → Automatically resumes from epoch 951
+#   → best_val_loss is restored so good checkpoints are not overwritten
+#   → New checkpoints saved to a NEW folder with current SLURM job ID
+#
+# Case 3 — Fine-tune / reset epoch counter:
+#   Set RESUME_CHECKPOINT="/path/to/best_model.pth"
+#   Set RESUME_EPOCH=0
+#   → Loads weights + optimizer state
+#   → Epoch counter starts at 0 (treats it like a fresh run from pretrained weights)
+#   → Useful for ablation experiments starting from the same pretrained base
+#
+# Available checkpoint files in each run folder:
+#   best_model.pth  → best validation L2 recorded during that run
+#   epoch_N.pth     → saved every 50 epochs starting from epoch 10
+#   final.pth       → saved at end of training
+#
+# ─────────────────────────────────────────────────────────────────────────────
 
 echo "================================================================================"
 echo "               CAN3TOK TRAINING - SEMANTIC LEARNING CONTROL"
@@ -28,33 +50,34 @@ echo "Start time: $(date)"
 echo ""
 
 # ============================================================================
-# 🎯 SEMANTIC LEARNING CONFIGURATION
+# CHECKPOINT RESUMING CONFIGURATION   ← CONTROL THIS
 # ============================================================================
 
-# ────────────────────────────────────────────────────────────────────────────
-# OPTION 1: NO SEMANTIC LEARNING (Baseline)
-# ────────────────────────────────────────────────────────────────────────────
+# Set to empty string "" for fresh training.
+# Set to a full path to resume from a saved checkpoint.
+RESUME_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20043776_none/final.pth"
+
+# Optional: override epoch counter. Leave empty to auto-detect from checkpoint.
+# Set to a number (e.g. "0") to reset the epoch counter (for fine-tuning).
+RESUME_EPOCH="1000"
+
+# ============================================================================
+# SEMANTIC LEARNING CONFIGURATION
+# ============================================================================
+
 SEMANTIC_MODE="geometric"
 SEGMENT_WEIGHT=0.0
 INSTANCE_WEIGHT=0.0
 
-# ────────────────────────────────────────────────────────────────────────────
-# OPTION 2: GEOMETRIC MODE (Recommended balance)
-# ────────────────────────────────────────────────────────────────────────────
+# Other options (uncomment to use):
 # SEMANTIC_MODE="geometric"
 # SEGMENT_WEIGHT=0.3
 # INSTANCE_WEIGHT=0.0
 
-# ────────────────────────────────────────────────────────────────────────────
-# OPTION 3: HIDDEN STATE MODE (Best quality, slowest)
-# ────────────────────────────────────────────────────────────────────────────
 # SEMANTIC_MODE="hidden"
 # SEGMENT_WEIGHT=0.3
 # INSTANCE_WEIGHT=0.0
 
-# ────────────────────────────────────────────────────────────────────────────
-# OPTION 4: ATTENTION MODE (Spatial context)
-# ────────────────────────────────────────────────────────────────────────────
 # SEMANTIC_MODE="attention"
 # SEGMENT_WEIGHT=0.3
 # INSTANCE_WEIGHT=0.0
@@ -68,48 +91,19 @@ SAMPLING_STRATEGY="balanced"
 # ============================================================================
 
 BATCH_SIZE=64
-NUM_EPOCHS=700
-LEARNING_RATE=1e-4
+NUM_EPOCHS=1200
+LEARNING_RATE=1e-5
 KL_WEIGHT=1e-6
 EVAL_EVERY=20
 FAILURE_THRESHOLD=100
 
 # ============================================================================
-# 🎨 COLOR LOSS WEIGHTING
-# ============================================================================
-# Upweight color loss to fight gray collapse without balanced loss.
-#
-# Recommended values:
-#   1.0  = Equal weight with other params (default)
-#   3.0  = Strong color emphasis (good starting point for gray collapse)
-#   5.0  = Very strong color emphasis (aggressive)
-#  10.0  = Maximum emphasis (use if 5.0 still collapses)
+# COLOR LOSS WEIGHTING
 # ============================================================================
 COLOR_LOSS_WEIGHT=1.0
 
 # ============================================================================
-# 📏 SCALE NORMALIZATION MODE  ← KEY EXPERIMENT FLAG
-# ============================================================================
-# Controls how Gaussian scales are stored in the dataset and what the
-# model learns to predict.
-#
-# 'log'    → Can3Tok ICCV 2025 style
-#            scale_stored = log(scale_metres) + log(scene_factor)
-#            → Ground truth is NEGATIVE (e.g. -7 to -1)
-#            → Decoder must use exp() activation
-#            → Pro: Physically principled, matches paper exactly
-#            → Con: Large scale loss early in training (targets are negative,
-#                   exp() output starts positive → large error until converged)
-#
-# 'linear' → Original style
-#            scale_stored = scale_metres * scene_factor
-#            → Ground truth is SMALL POSITIVE (e.g. 0.01 – 0.2m)
-#            → Decoder uses softplus() activation
-#            → Pro: Easier to learn from scratch (targets near expected range)
-#            → Con: Different from Can3Tok paper
-#
-# RECOMMENDATION: Start with 'linear' to confirm the rest of the pipeline
-# works (colors, positions), then switch to 'log' for final experiments.
+# SCALE NORMALIZATION MODE
 # ============================================================================
 SCALE_NORM_MODE="linear"   # "log" | "linear"
 
@@ -119,142 +113,115 @@ SCALE_NORM_MODE="linear"   # "log" | "linear"
 
 TRAIN_SCENES=300
 VAL_SCENES=30
-SAMPLING_METHOD="opacity"  # "random" | "grid"
+SAMPLING_METHOD="opacity"
 
 # ============================================================================
-# PCA VISUALIZATION CONFIGURATION (CloudCompare)
+# PCA VISUALIZATION CONFIGURATION
 # ============================================================================
 
 PCA_VIS_FREQ=10
-PCA_NUM_SCENES=5
+PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
 
 # ============================================================================
-# 3DGS RECONSTRUCTION CONFIGURATION (supersplat.at)
+# 3DGS RECONSTRUCTION CONFIGURATION
 # ============================================================================
 
-RECON_PLY_FREQ=5
-RECON_PLY_NUM_SCENES=2
+RECON_PLY_FREQ=10
+RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
 # ============================================================================
-# 🎯 NORMALIZATION CONTROL
+# NORMALIZATION CONTROL
 # ============================================================================
 
-USE_CANONICAL_NORM=True    # True = normalize to canonical sphere | False = raw
+USE_CANONICAL_NORM=True
 
 # ============================================================================
 # WEIGHTS & BIASES
 # ============================================================================
 
-export WANDB_API_KEY="your_key_here"
+export WANDB_API_KEY="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"
 USE_WANDB=False
 
 # ============================================================================
 # PRINT CONFIGURATION SUMMARY
 # ============================================================================
 
-echo "════════════════════════════════════════════════════════════════════════════════"
-echo "                        CONFIGURATION SUMMARY"
-echo "════════════════════════════════════════════════════════════════════════════════"
+echo "========================================================================"
+echo "                     CONFIGURATION SUMMARY"
+echo "========================================================================"
 echo ""
 
-echo "📋 JOB INFORMATION:"
-echo "   Job ID:            $SLURM_JOB_ID"
-echo "   Partition:         $SLURM_JOB_PARTITION"
-echo "   Node:              $SLURM_NODELIST"
-echo "   GPUs:              $SLURM_GPUS"
-echo "   CPUs:              $SLURM_CPUS_PER_TASK"
-echo "   Memory:            64GB"
-echo "   Time Limit:        12:00:00"
+echo "JOB INFORMATION:"
+echo "   Job ID:    $SLURM_JOB_ID"
+echo "   Node:      $SLURM_NODELIST"
+echo "   GPUs:      $SLURM_GPUS"
+echo "   CPUs:      $SLURM_CPUS_PER_TASK"
 echo ""
 
-echo "🧠 SEMANTIC LEARNING:"
+echo "CHECKPOINT RESUMING:"
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    echo "   Status:      RESUMING FROM CHECKPOINT"
+    echo "   Checkpoint:  $RESUME_CHECKPOINT"
+    if [ -f "$RESUME_CHECKPOINT" ]; then
+        echo "   File exists: YES"
+    else
+        echo "   File exists: NO  <-- WARNING: file not found!"
+    fi
+    if [ -n "$RESUME_EPOCH" ]; then
+        echo "   Epoch override: $RESUME_EPOCH (--resume_epoch)"
+    else
+        echo "   Epoch override: auto (resumes at saved_epoch + 1)"
+    fi
+else
+    echo "   Status:      FRESH TRAINING (no checkpoint)"
+fi
+echo ""
+
+echo "SEMANTIC LEARNING:"
 if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || \
    (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
-    echo "   Status:            ✅ ENABLED"
-    echo "   Mode:              ${SEMANTIC_MODE^^}"
-    echo "   Segment weight:    $SEGMENT_WEIGHT"
-    echo "   Instance weight:   $INSTANCE_WEIGHT"
+    echo "   Status:         ENABLED"
+    echo "   Mode:           ${SEMANTIC_MODE^^}"
+    echo "   Segment weight: $SEGMENT_WEIGHT"
+    echo "   Instance weight:$INSTANCE_WEIGHT"
 else
-    echo "   Status:            ❌ DISABLED (Baseline)"
+    echo "   Status:         DISABLED (Baseline)"
 fi
 echo ""
 
-echo "📏 SCALE NORMALIZATION:"
-echo "   Mode:              $SCALE_NORM_MODE"
-if [ "$SCALE_NORM_MODE" = "log" ]; then
-    echo "   Style:             Can3Tok ICCV 2025"
-    echo "   Formula:           scale_stored = log(scale) + log(factor)"
-    echo "   GT range:          Negative values (e.g. -7 to -1)"
-    echo "   Decoder act:       exp()"
-    echo "   ⚠️  Expect large scale loss early in training"
-else
-    echo "   Style:             Original (linear)"
-    echo "   Formula:           scale_stored = scale × factor"
-    echo "   GT range:          Small positive metres (e.g. 0.01 – 0.2)"
-    echo "   Decoder act:       softplus()"
-    echo "   ✓  Scale loss should be small from early epochs"
-fi
+echo "SCALE NORMALIZATION:"
+echo "   Mode: $SCALE_NORM_MODE"
 echo ""
 
-echo "🎨 COLOR CONFIGURATION:"
-echo "   Color Loss Weight: ${COLOR_LOSS_WEIGHT}×"
-if (( $(echo "$COLOR_LOSS_WEIGHT > 1.0" | bc -l) )); then
-    echo "   Effect:            🎯 Color errors weighted ${COLOR_LOSS_WEIGHT}× vs other params"
-else
-    echo "   Effect:            ⚖️  Equal weight with other parameters"
-fi
-echo "   Sigmoid:           ❌ REMOVED (raw output + clamp at PLY write)"
+echo "COLOR CONFIGURATION:"
+echo "   Color Loss Weight: ${COLOR_LOSS_WEIGHT}x"
 echo ""
 
-echo "⚙️  TRAINING HYPERPARAMETERS:"
-echo "   Batch Size:        $BATCH_SIZE"
-echo "   Epochs:            $NUM_EPOCHS"
-echo "   Learning Rate:     $LEARNING_RATE"
-echo "   KL Weight:         $KL_WEIGHT"
-echo "   Eval Every:        $EVAL_EVERY epochs"
-echo "   Failure Thresh:    $FAILURE_THRESHOLD"
+echo "TRAINING HYPERPARAMETERS:"
+echo "   Batch Size:  $BATCH_SIZE"
+echo "   Epochs:      $NUM_EPOCHS"
+echo "   LR:          $LEARNING_RATE"
+echo "   KL Weight:   $KL_WEIGHT"
+echo "   Eval Every:  $EVAL_EVERY"
 echo ""
 
-echo "📊 DATASET:"
-echo "   Training Scenes:   $TRAIN_SCENES"
-echo "   Val Scenes:        $VAL_SCENES"
-echo "   Sampling:          ${SAMPLING_METHOD^^}"
-echo "   Canonical Norm:    $([ "$USE_CANONICAL_NORM" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
-echo "   Scale Mode:        $SCALE_NORM_MODE"
+echo "DATASET:"
+echo "   Train Scenes: $TRAIN_SCENES"
+echo "   Val Scenes:   $VAL_SCENES"
+echo "   Sampling:     $SAMPLING_METHOD"
+echo "   Canonical:    $USE_CANONICAL_NORM"
 echo ""
 
-echo "🎨 PCA VISUALIZATION (CloudCompare):"
-echo "   Frequency:         Every $PCA_VIS_FREQ epochs"
-echo "   Scenes:            $PCA_NUM_SCENES per epoch"
-echo "   Output:            checkpoints/.../pca_visualizations/epoch_XXX/"
-echo ""
-
-echo "🌐 3DGS RECONSTRUCTION (supersplat.at):"
-echo "   Frequency:         Every $RECON_PLY_FREQ epochs"
-echo "   Scenes:            $RECON_PLY_NUM_SCENES per epoch"
-echo "   Max SH Degree:     $RECON_PLY_MAX_SH"
-echo "   Color:             Raw output clamped [0,1] → f_dc via C0"
-echo "   Scale:             Mode=$SCALE_NORM_MODE → $([ "$SCALE_NORM_MODE" = "log" ] && echo "exp() activation" || echo "softplus() activation")"
-echo "   Output:            checkpoints/.../reconstructed_gaussians/epoch_XXX/"
-echo "   View At:           https://supersplat.at"
-echo ""
-
-echo "📈 LOGGING:"
-echo "   W&B:               $([ "$USE_WANDB" = "True" ] && echo "✅ Enabled" || echo "❌ Disabled")"
-echo "   Checkpoints:       Every 10 epochs"
-echo "   Best Model:        Tracked by val L2 error"
-echo ""
-
-echo "════════════════════════════════════════════════════════════════════════════════"
+echo "========================================================================"
 echo ""
 
 # ============================================================================
 # ENVIRONMENT SETUP
 # ============================================================================
 
-echo "🔧 Setting up environment..."
+echo "Setting up environment..."
 module purge && module load 2023 && module load CUDA/12.1.1
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
@@ -263,16 +230,16 @@ site-packages/torch/lib:$LD_LIBRARY_PATH"
 cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
 mkdir -p logs checkpoints
 
-echo "   ✓ Modules loaded"
-echo "   ✓ Conda environment: can3tok"
-echo "   ✓ Working directory: $(pwd)"
+echo "   Modules loaded"
+echo "   Conda environment: can3tok"
+echo "   Working directory: $(pwd)"
 echo ""
 
 if [ "$USE_WANDB" = "True" ]; then
     wandb login $WANDB_API_KEY --relogin 2>/dev/null
-    echo "   ✓ Weights & Biases authenticated"
+    echo "   Weights & Biases authenticated"
 else
-    echo "   ⊘ Weights & Biases disabled"
+    echo "   Weights & Biases disabled"
 fi
 echo ""
 
@@ -280,11 +247,11 @@ echo ""
 # BUILD TRAINING COMMAND
 # ============================================================================
 
-echo "🚀 Building training command..."
+echo "Building training command..."
 
 TRAIN_CMD="python gs_can3tok_2.py"
 
-# ─── Training parameters ────────────────────────────────────────────────────
+# Training parameters
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
@@ -292,12 +259,12 @@ TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
 
-# ─── Dataset parameters ─────────────────────────────────────────────────────
+# Dataset parameters
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
 TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
 
-# ─── Semantic parameters ────────────────────────────────────────────────────
+# Semantic parameters
 TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
 TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
@@ -305,33 +272,43 @@ TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
-# ─── Color loss weighting ───────────────────────────────────────────────────
+# Color loss weighting
 TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
 
-# ─── Scale normalization mode (NEW!) ────────────────────────────────────────
+# Scale normalization mode
 TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
 
-# ─── PCA visualization ──────────────────────────────────────────────────────
+# PCA visualization
 TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
 TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
 
-# ─── 3DGS reconstruction ────────────────────────────────────────────────────
+# 3DGS reconstruction
 TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
 
-# ─── Normalization flags ────────────────────────────────────────────────────
+# Normalization flags
 if [ "$USE_CANONICAL_NORM" = "False" ]; then
     TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
 fi
 
-# ─── W&B ────────────────────────────────────────────────────────────────────
+# W&B
 if [ "$USE_WANDB" = "True" ]; then
     TRAIN_CMD="$TRAIN_CMD --use_wandb"
     TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-Semantic"
     TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
 fi
+
+# ─── CHECKPOINT RESUMING ────────────────────────────────────────────────────
+# Appended last so it is easy to spot in the printed command.
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
+    if [ -n "$RESUME_EPOCH" ]; then
+        TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
+    fi
+fi
+# ────────────────────────────────────────────────────────────────────────────
 
 echo "   Command:"
 echo "   $TRAIN_CMD"
@@ -341,9 +318,9 @@ echo ""
 # START TRAINING
 # ============================================================================
 
-echo "════════════════════════════════════════════════════════════════════════════════"
-echo "                          STARTING TRAINING"
-echo "════════════════════════════════════════════════════════════════════════════════"
+echo "========================================================================"
+echo "                       STARTING TRAINING"
+echo "========================================================================"
 echo ""
 
 SECONDS=0
@@ -354,36 +331,31 @@ TRAIN_EXIT=$?
 DURATION=$((SECONDS / 60))
 
 echo ""
-echo "════════════════════════════════════════════════════════════════════════════════"
-echo "                          TRAINING COMPLETE"
-echo "════════════════════════════════════════════════════════════════════════════════"
-echo "Exit code:     $TRAIN_EXIT"
-echo "Duration:      $DURATION minutes"
-echo "End time:      $(date)"
+echo "========================================================================"
+echo "                       TRAINING COMPLETE"
+echo "========================================================================"
+echo "Exit code: $TRAIN_EXIT"
+echo "Duration:  $DURATION minutes"
+echo "End time:  $(date)"
 echo ""
 
 if [ $TRAIN_EXIT -eq 0 ]; then
-    echo "✅ Training completed successfully!"
+    echo "Training completed successfully!"
     echo ""
     echo "Next steps:"
-    echo "   1. Check logs:       cat logs/can3tok_${SLURM_JOB_ID}.out"
-    echo "   2. Checkpoints:      ls checkpoints/RGB_job_${SLURM_JOB_ID}_*/"
-    echo "   3. Best model:       checkpoints/RGB_job_${SLURM_JOB_ID}_*/best_model.pth"
-    echo ""
-    echo "   3DGS Reconstructions (supersplat.at):"
-    echo "      Location:   checkpoints/RGB_job_${SLURM_JOB_ID}_*/reconstructed_gaussians/"
-    echo "      Drag & drop to: https://supersplat.at"
+    echo "   1. Check logs:   cat logs/can3tok_${SLURM_JOB_ID}.out"
+    echo "   2. Checkpoints:  ls checkpoints/RGB_job_${SLURM_JOB_ID}_*/"
+    echo "   3. Best model:   checkpoints/RGB_job_${SLURM_JOB_ID}_*/best_model.pth"
     if [ "$USE_WANDB" = "True" ]; then
-        echo ""
-        echo "   W&B Dashboard: https://wandb.ai/3D-SSC/Can3Tok-Semantic"
+        echo "   4. W&B:          https://wandb.ai/3D-SSC/Can3Tok-Semantic"
     fi
 else
-    echo "❌ Training failed with exit code $TRAIN_EXIT"
+    echo "Training FAILED with exit code $TRAIN_EXIT"
     echo ""
     echo "Troubleshooting:"
-    echo "   1. Check error log:  cat logs/can3tok_${SLURM_JOB_ID}.err"
-    echo "   2. Check GPU memory: nvidia-smi"
-    echo "   3. Verify dataset:   ls /home/yli11/scratch/datasets/gaussian_world/"
+    echo "   1. Error log:  cat logs/can3tok_${SLURM_JOB_ID}.err"
+    echo "   2. Check GPU:  nvidia-smi"
+    echo "   3. Check path: ls $RESUME_CHECKPOINT"
 fi
 
-echo "════════════════════════════════════════════════════════════════════════════════"
+echo "========================================================================"

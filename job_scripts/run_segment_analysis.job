@@ -1,0 +1,66 @@
+#!/bin/bash
+#SBATCH --job-name=segment_analysis
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=00:30:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --output=logs/segment_%j.out
+#SBATCH --error=logs/segment_%j.err
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Segment label distribution analysis
+#
+# Run this AFTER your t-SNE job has finished.
+# Point --embedding_baseline and --embedding_semantic at the
+# embedding_expA_*.npy files saved by latent_tsne_analysis.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCENE_CONFIG="scene_config.json"
+DATASET_ROOT="/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs"
+SPLIT="train_grid1.0cm_chunk8x8_stride6x6"
+
+# ▶ Update these to point at your most recent t-SNE results folder
+TSNE_RESULTS_DIR="tsne_results_job_XXXXXXXX"
+EMBEDDING_BASELINE="${/home/yli11/scratch/Hafeez_thesis/Can3Tok/tsne_results_job_20147264}/embedding_expA_baseline.npy"
+EMBEDDING_SEMANTIC="${/home/yli11/scratch/Hafeez_thesis/Can3Tok/tsne_results_job_20147264}/embedding_expA_semantic.npy"
+
+OUTPUT_DIR="segment_analysis_job_${SLURM_JOB_ID}"
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs "$OUTPUT_DIR"
+
+echo "========================================================"
+echo "  Segment Label Analysis"
+echo "  t-SNE results: $TSNE_RESULTS_DIR"
+echo "  Output:        $OUTPUT_DIR"
+echo "========================================================"
+
+python segment_analysis.py \
+    --scene_config        "$SCENE_CONFIG" \
+    --dataset_root        "$DATASET_ROOT" \
+    --split               "$SPLIT" \
+    --embedding_baseline  "$EMBEDDING_BASELINE" \
+    --embedding_semantic  "$EMBEDDING_SEMANTIC" \
+    --top_n_labels        20 \
+    --top_n_print         10 \
+    --output_dir          "$OUTPUT_DIR"
+
+EXIT_CODE=$?
+
+echo ""
+echo "========================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "DONE"
+    echo "  scp user@snellius:\$(pwd)/$OUTPUT_DIR/segment_distributions.png ."
+    echo "  scp user@snellius:\$(pwd)/$OUTPUT_DIR/label_similarity_matrix.png ."
+    echo "  scp user@snellius:\$(pwd)/$OUTPUT_DIR/tsne_vs_label_similarity.png ."
+    echo "  scp user@snellius:\$(pwd)/$OUTPUT_DIR/segment_stats.json ."
+else
+    echo "FAILED (exit $EXIT_CODE)"
+fi
+echo "========================================================"

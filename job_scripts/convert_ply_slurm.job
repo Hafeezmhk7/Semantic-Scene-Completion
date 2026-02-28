@@ -1,0 +1,91 @@
+#!/bin/bash
+#SBATCH --job-name=npy_to_ply
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=02:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --output=logs/npy_to_ply_%j.out
+#SBATCH --error=logs/npy_to_ply_%j.err
+
+# ============================================================================
+# NPY → PLY CONVERSION — ALL GAUSSIANS, NO SUBSAMPLING
+# CPU job only (no GPU needed).
+#
+# Note on memory: scenes with ~1M Gaussians need ~4–8 GB RAM each.
+# 32 GB is safe; adjust --mem if your scenes are larger.
+# ============================================================================
+
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+
+DATASET_DIR="/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/train"
+OUTPUT_DIR="ply_for_labeling"
+NUM_SCENES=500    # Start small (e.g. 10) to check output before full run
+
+# ── ENVIRONMENT ───────────────────────────────────────────────────────────────
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs "$OUTPUT_DIR"
+
+# ── PRINT CONFIG ──────────────────────────────────────────────────────────────
+
+echo "========================================================================"
+echo "  NPY → PLY  (ALL Gaussians — no subsampling)"
+echo "========================================================================"
+echo "  Job ID:       $SLURM_JOB_ID"
+echo "  Dataset:      $DATASET_DIR"
+echo "  Output:       $OUTPUT_DIR"
+echo "  Num scenes:   $NUM_SCENES"
+echo "  Started:      $(date)"
+echo "========================================================================"
+echo ""
+
+# ── DRY RUN ───────────────────────────────────────────────────────────────────
+
+echo "--- DRY RUN ---"
+python npy_to_ply_supersplat.py \
+    --dataset-dir  "$DATASET_DIR" \
+    --output-dir   "$OUTPUT_DIR" \
+    --num-scenes   "$NUM_SCENES" \
+    --dry-run
+
+echo ""
+echo "--- CONVERTING ---"
+
+# ── CONVERT ───────────────────────────────────────────────────────────────────
+
+python npy_to_ply_supersplat.py \
+    --dataset-dir  "$DATASET_DIR" \
+    --output-dir   "$OUTPUT_DIR" \
+    --num-scenes   "$NUM_SCENES" \
+    --skip-existing
+
+EXIT_CODE=$?
+
+echo ""
+echo "========================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "DONE"
+    du -sh "$OUTPUT_DIR" 2>/dev/null
+    echo ""
+    echo "Download:"
+    echo "  tar -czf ply_for_labeling.tar.gz $OUTPUT_DIR/"
+    echo "  scp user@snellius.surf.nl:\$(pwd)/ply_for_labeling.tar.gz ."
+    echo "  tar -xzf ply_for_labeling.tar.gz"
+    echo ""
+    echo "Label in SuperSplat:"
+    echo "  https://supersplat.at  →  drag each .ply  →  fill scene_index.csv"
+    echo ""
+    echo "Generate scene_config.json:"
+    echo "  python scene_index_to_config.py \\"
+    echo "      --index $OUTPUT_DIR/scene_index.csv \\"
+    echo "      --output scene_config.json"
+else
+    echo "FAILED (exit $EXIT_CODE) — check logs/npy_to_ply_${SLURM_JOB_ID}.err"
+fi
+echo "End: $(date)"
+echo "========================================================================"

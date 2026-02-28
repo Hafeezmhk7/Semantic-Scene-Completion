@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init_1_hidden.out
+#SBATCH --output=logs/baseliner_val=train_cannorm_500e_3.8k_11_scale_init_1_hidden_color_weight_2.out
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
@@ -85,7 +85,7 @@ FAILURE_THRESHOLD=100
 #   5.0  = Very strong color emphasis (aggressive)
 #  10.0  = Maximum emphasis (use if 5.0 still collapses)
 # ============================================================================
-COLOR_LOSS_WEIGHT=1.0
+COLOR_LOSS_WEIGHT=2.0
 
 # ============================================================================
 # 📏 SCALE NORMALIZATION MODE  ← KEY EXPERIMENT FLAG
@@ -94,7 +94,7 @@ COLOR_LOSS_WEIGHT=1.0
 # model learns to predict.
 #
 # 'log'    → Can3Tok ICCV 2025 style
-#            scale_stored = log(scale_metres) + log(scene_factor)
+#            scale_stored = log(scale_metres) + log(scen e_factor)
 #            → Ground truth is NEGATIVE (e.g. -7 to -1)
 #            → Decoder must use exp() activation
 #            → Pro: Physically principled, matches paper exactly
@@ -147,8 +147,8 @@ USE_CANONICAL_NORM=True    # True = normalize to canonical sphere | False = raw
 # WEIGHTS & BIASES
 # ============================================================================
 
-export WANDB_API_KEY="your_key_here"
-USE_WANDB=False
+export WANDB_API_KEY="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"
+USE_WANDB=True
 
 # ============================================================================
 # PRINT CONFIGURATION SUMMARY

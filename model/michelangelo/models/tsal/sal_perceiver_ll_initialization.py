@@ -395,7 +395,7 @@ class GS_decoder(nn.Module):
         # Scale params are at positions [7, 8, 9] within each 14-param
         # Gaussian, so in the flat output_linear bias they are at
         # indices [7, 8, 9, 21, 22, 23, 35, 36, 37, ...] for N Gaussians.
-        self._initialize_scale_bias()
+        # self._initialize_scale_bias()
 
     def _initialize_scale_bias(self):
         """
