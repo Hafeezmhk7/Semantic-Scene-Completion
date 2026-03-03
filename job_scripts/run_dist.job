@@ -1,0 +1,226 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_dist
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=23:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=64G
+#SBATCH --output=logs/train_dist_%j.out
+#SBATCH --error=logs/train_dist_%j.err
+
+# ============================================================================
+# CAN3TOK TRAINING — DISTRIBUTION PREDICTION SEMANTIC MODE
+# ============================================================================
+#
+# New experiment: 'dist' mode
+#   - Attaches SemanticDistributionHead on top of GS_decoder hidden state [B,1024]
+#   - Head predicts label distribution p̂_s ∈ R^72 (what fraction of Gaussians
+#     carry each ScanNet72 label)
+#   - Loss: KL(p_s || softmax(logits)) — no positive pairs, no temperature tuning,
+#     each scene supervised against its own segment.npy distribution
+#   - Gradient flows: distribution head → hidden state → GS_decoder → mu
+#     (rank-constrained through 1024-dim bottleneck like InfoNCE hidden mode)
+#
+# HOW THIS DIFFERS FROM InfoNCE (hidden mode):
+#   InfoNCE asks: "are these two scenes in the same room category?"
+#   Distribution asks: "what fraction of this scene's Gaussians carry each label?"
+#   The probing experiment showed InfoNCE actually degraded dominant label accuracy
+#   (19% → 10%) because room-type groupings conflict with surface composition.
+#   Distribution supervision directly targets the information that probing tried to
+#   extract — so if Phase 2 succeeds, probing this checkpoint should show
+#   substantially higher dominant label accuracy and macro F1.
+#
+# EXPECTED TRAINING BEHAVIOUR:
+#   Epoch 1:   dist_kl ≈ 3.5-4.0  (high, random predictions)
+#   Epoch 10:  dist_kl ≈ 1.5-2.0  (head learning)
+#   Epoch 50+: dist_kl ≈ 0.8-1.2  (if mu encodes distribution info)
+#   dist_cos_sim should rise from ~0.3 toward 0.7+
+#   dist_dom_acc should rise from ~0.05 toward 0.4+
+#
+# GAMMA TUNING (segment_loss_weight):
+#   Start with 0.1 — ten times smaller than recon loss.
+#   Monitor: val L2 should not degrade more than 5% from baseline (0.137).
+#   If val L2 stays flat → increase gamma to 0.3.
+#   If val L2 degrades significantly → reduce gamma to 0.05.
+#
+# ============================================================================
+
+echo "================================================================================"
+echo "          CAN3TOK TRAINING — DISTRIBUTION PREDICTION (dist mode)"
+echo "================================================================================"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node:   $SLURM_NODELIST"
+echo "Start:  $(date)"
+echo ""
+
+# ============================================================================
+# CHECKPOINT — resume from baseline VAE (recommended)
+# ============================================================================
+# Starting from the trained baseline (val L2=0.137) rather than scratch:
+# - Reconstruction is already good; distribution head only needs to learn
+#   the semantic mapping, not relearn geometry from scratch
+# - Saves ~700 epochs of compute
+# - Cleaner ablation: any mu change is attributable to distribution loss alone
+
+#RESUME_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20007981_none/final.pth"
+RESUME_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20180575_dist_beta0.1/final.pth"
+RESUME_EPOCH="1999"   # Reset epoch counter — treat as new experiment from pretrained base
+
+# ============================================================================
+# SEMANTIC MODE — distribution prediction
+# ============================================================================
+SEMANTIC_MODE="dist"
+SEGMENT_WEIGHT=0.1     # γ: start small, increase if val L2 stays stable
+                       # Recommended sweep: 0.05 → 0.1 → 0.3
+INSTANCE_WEIGHT=0.0    # Not used for dist mode
+
+# These are only used for InfoNCE modes (hidden/geometric/attention)
+# Kept here for compatibility — dist mode ignores them
+SEMANTIC_TEMP=0.1
+SEMANTIC_SUBSAMPLE=10000
+SAMPLING_STRATEGY="balanced"
+
+# ============================================================================
+# TRAINING HYPERPARAMETERS
+# ============================================================================
+BATCH_SIZE=64
+NUM_EPOCHS=3000
+LEARNING_RATE=1e-5      # Low LR — fine-tuning from pretrained checkpoint
+KL_WEIGHT=1e-6
+EVAL_EVERY=20
+FAILURE_THRESHOLD=100
+
+# ============================================================================
+# DATASET / NORMALIZATION (must match baseline checkpoint)
+# ============================================================================
+TRAIN_SCENES=300
+VAL_SCENES=30
+SAMPLING_METHOD="opacity"
+COLOR_LOSS_WEIGHT=1.0
+SCALE_NORM_MODE="linear"
+USE_CANONICAL_NORM=True
+
+# PCA vis disabled for dist mode (per_gaussian_features is [B,72] not [B,N,32])
+PCA_VIS_FREQ=999
+PCA_NUM_SCENES=0
+PCA_BRIGHTNESS=1.25
+
+RECON_PLY_FREQ=50
+RECON_PLY_NUM_SCENES=3
+RECON_PLY_MAX_SH=3
+
+# ============================================================================
+# W&B
+# ============================================================================
+export WANDB_API_KEY="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"
+USE_WANDB=False
+
+# ============================================================================
+# PRINT SUMMARY
+# ============================================================================
+echo "========================================================================"
+echo "                     CONFIGURATION SUMMARY"
+echo "========================================================================"
+echo "EXPERIMENT: Distribution Prediction (Phase 2)"
+echo "  Semantic mode:     $SEMANTIC_MODE  (KL divergence loss)"
+echo "  Gamma (γ):         $SEGMENT_WEIGHT  (weight on dist loss)"
+echo "  Resume from:       $RESUME_CHECKPOINT"
+echo "  Epoch reset to:    $RESUME_EPOCH"
+echo ""
+echo "TRAINING:"
+echo "  Batch size:  $BATCH_SIZE"
+echo "  Epochs:      $NUM_EPOCHS"
+echo "  LR:          $LEARNING_RATE"
+echo "  KL weight:   $KL_WEIGHT"
+echo ""
+echo "WHAT TO WATCH IN LOGS:"
+echo "  dist_kl       → should decrease from ~3.5 toward <1.0"
+echo "  dist_cos_sim  → should increase from ~0.3 toward 0.7+"
+echo "  dist_dom_acc  → should increase from ~0.05 toward 0.4+"
+echo "  val L2        → should NOT increase more than 5% above 0.137"
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+echo "Setting up environment..."
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs checkpoints
+echo "  Working directory: $(pwd)"
+echo ""
+
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+TRAIN_CMD="/gpfs/home2/yli11/.conda/envs/can3tok/bin/python gs_can3tok_2.py"
+
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
+TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
+TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
+TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
+TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
+TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
+TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
+TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
+TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
+
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
+fi
+
+if [ "$USE_WANDB" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --use_wandb --wandb_project Can3Tok-Dist --wandb_entity 3D-SSC"
+fi
+
+echo "Command: $TRAIN_CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+echo "========================================================================"
+echo "STARTING TRAINING"
+echo "========================================================================"
+
+SECONDS=0
+eval $TRAIN_CMD
+TRAIN_EXIT=$?
+DURATION=$((SECONDS / 60))
+
+echo ""
+echo "========================================================================"
+echo "DONE"
+echo "========================================================================"
+echo "Exit code: $TRAIN_EXIT"
+echo "Duration:  $DURATION minutes"
+echo "End time:  $(date)"
+
+if [ $TRAIN_EXIT -eq 0 ]; then
+    echo ""
+    echo "NEXT STEP — run probing experiment on this checkpoint:"
+    echo "  1. Update CKPT_SEMANTIC in run_probe_label_distribution.sh"
+    echo "     to: checkpoints/RGB_job_${SLURM_JOB_ID}_dist_beta${SEGMENT_WEIGHT}/final.pth"
+    echo "  2. sbatch run_probe_label_distribution.sh semantic"
+    echo "  3. Compare probe results against baseline (best_val_KL 1.27, dom_acc 19%)"
+fi

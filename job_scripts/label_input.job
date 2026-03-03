@@ -1,0 +1,355 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_labelinput
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=23:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=64G
+#SBATCH --output=logs/train_labelinput_option1_%j.out
+#SBATCH --error=logs/can3tok_%j.err
+
+# ============================================================================
+# CAN3TOK TRAINING - OPTION 1: SEMANTIC LABELS AS ENCODER INPUT
+# ============================================================================
+#
+# WHAT THIS RUN DOES:
+# ─────────────────────────────────────────────────────────────────────────────
+# Normalized ScanNet72 segment label appended as col 18 of the feature tensor.
+# Encoder input_proj receives 12 features per Gaussian instead of 11:
+#   rgb(3) + opacity(1) + scale(3) + rotation(4) + label(1) = 12
+#
+# Direct gradient path — no auxiliary head, no bottleneck:
+#   L2_recon → decoder → mu → Perceiver cross-attn → input_proj → label(col 18)
+#
+# REQUIRED:
+#   shapevae-256.yaml  →  point_feats: 12   (was 11)
+#   --label_input      →  dataset returns (40000, 19) tensors
+#   --semantic_mode    →  none
+#   RESUME_CHECKPOINT  →  empty (architecture changed — must train from scratch)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo "================================================================================"
+echo "          CAN3TOK TRAINING - OPTION 1: LABEL AS ENCODER INPUT"
+echo "================================================================================"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURM_NODELIST"
+echo "Start time: $(date)"
+echo ""
+
+# ============================================================================
+# CHECKPOINT RESUMING CONFIGURATION
+# ============================================================================
+
+# ⚠️  Must be empty for the first Option 1 run.
+#    Old baseline checkpoints have input_proj Linear(11,d) — incompatible.
+#    The training script will raise a clear error if there is a mismatch.
+RESUME_CHECKPOINT=""
+RESUME_EPOCH=""
+
+# ============================================================================
+# OPTION 1 — LABEL INPUT CONFIGURATION
+# ============================================================================
+
+LABEL_INPUT=True
+
+# ============================================================================
+# SEMANTIC LEARNING CONFIGURATION
+# ============================================================================
+
+# 'none' — labels enter via encoder input, no auxiliary loss head needed.
+SEMANTIC_MODE="none"
+SEGMENT_WEIGHT=0.0
+INSTANCE_WEIGHT=0.0
+
+SEMANTIC_TEMP=0.1
+SEMANTIC_SUBSAMPLE=10000
+SAMPLING_STRATEGY="balanced"
+
+# ============================================================================
+# TRAINING HYPERPARAMETERS
+# ============================================================================
+
+BATCH_SIZE=64
+NUM_EPOCHS=2000
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-5
+EVAL_EVERY=20
+FAILURE_THRESHOLD=100
+
+# ============================================================================
+# COLOR LOSS WEIGHTING
+# ============================================================================
+
+COLOR_LOSS_WEIGHT=1.0
+
+# ============================================================================
+# SCALE NORMALIZATION MODE
+# ============================================================================
+
+SCALE_NORM_MODE="linear"
+
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+
+TRAIN_SCENES=300
+VAL_SCENES=30
+SAMPLING_METHOD="opacity"
+
+# ============================================================================
+# PCA VISUALIZATION CONFIGURATION
+# ============================================================================
+
+PCA_VIS_FREQ=20
+PCA_NUM_SCENES=3
+PCA_BRIGHTNESS=1.25
+
+# ============================================================================
+# 3DGS RECONSTRUCTION CONFIGURATION
+# ============================================================================
+
+RECON_PLY_FREQ=20
+RECON_PLY_NUM_SCENES=3
+RECON_PLY_MAX_SH=3
+
+# ============================================================================
+# NORMALIZATION CONTROL
+# ============================================================================
+
+USE_CANONICAL_NORM=True
+
+# ============================================================================
+# WEIGHTS & BIASES
+# ============================================================================
+
+export WANDB_API_KEY="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"
+USE_WANDB=False
+
+# ============================================================================
+# PRINT CONFIGURATION SUMMARY
+# ============================================================================
+
+echo "========================================================================"
+echo "                     CONFIGURATION SUMMARY"
+echo "========================================================================"
+echo ""
+
+echo "JOB INFORMATION:"
+echo "   Job ID:    $SLURM_JOB_ID"
+echo "   Node:      $SLURM_NODELIST"
+echo "   GPUs:      $SLURM_GPUS"
+echo "   CPUs:      $SLURM_CPUS_PER_TASK"
+echo ""
+
+echo "CHECKPOINT RESUMING:"
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    echo "   Status:      RESUMING FROM CHECKPOINT"
+    echo "   Checkpoint:  $RESUME_CHECKPOINT"
+    if [ -f "$RESUME_CHECKPOINT" ]; then
+        echo "   File exists: YES"
+    else
+        echo "   File exists: NO  <-- WARNING: file not found!"
+    fi
+    if [ -n "$RESUME_EPOCH" ]; then
+        echo "   Epoch override: $RESUME_EPOCH"
+    else
+        echo "   Epoch override: auto (resumes at saved_epoch + 1)"
+    fi
+else
+    echo "   Status:      FRESH TRAINING (required for Option 1 first run)"
+fi
+echo ""
+
+echo "OPTION 1 — LABEL AS ENCODER INPUT:"
+echo "   Status:         ENABLED"
+echo "   Feature tensor: (40000, 19)  — col 18 = label / 71.0"
+echo "   Encoder input:  Linear(12, d_model)  [point_feats=12 in yaml]"
+echo "   Recon target:   cols 4-17 (14-dim, label col 18 excluded)"
+echo "   Gradient path:  L2_recon → decoder → mu → Perceiver → input_proj → label"
+echo ""
+
+echo "SEMANTIC LEARNING:"
+echo "   Status:  DISABLED (labels enter via encoder, not via loss head)"
+echo ""
+
+echo "TRAINING HYPERPARAMETERS:"
+echo "   Batch Size:  $BATCH_SIZE"
+echo "   Epochs:      $NUM_EPOCHS"
+echo "   LR:          $LEARNING_RATE"
+echo "   KL Weight:   $KL_WEIGHT"
+echo "   Eval Every:  $EVAL_EVERY"
+echo "   Scale Mode:  $SCALE_NORM_MODE"
+echo ""
+
+echo "DATASET:"
+echo "   Train Scenes: $TRAIN_SCENES"
+echo "   Val Scenes:   $VAL_SCENES"
+echo "   Sampling:     $SAMPLING_METHOD"
+echo "   Canonical:    $USE_CANONICAL_NORM"
+echo ""
+
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# ENVIRONMENT SETUP
+# ============================================================================
+
+echo "Setting up environment..."
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
+site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs checkpoints
+
+echo "   Modules loaded"
+echo "   Conda environment: can3tok"
+echo "   Working directory: $(pwd)"
+echo ""
+
+if [ "$USE_WANDB" = "True" ]; then
+    wandb login $WANDB_API_KEY --relogin 2>/dev/null
+    echo "   Weights & Biases authenticated"
+else
+    echo "   Weights & Biases disabled"
+fi
+echo ""
+
+# ============================================================================
+# PRE-FLIGHT CHECK: point_feats must be 12 when label_input=True
+# ============================================================================
+
+YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+if [ -f "$YAML_PATH" ]; then
+    POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
+    if [ "$POINT_FEATS" != "12" ]; then
+        echo "❌  ERROR: label_input=True requires point_feats: 12 in $YAML_PATH"
+        echo "           Found: point_feats: $POINT_FEATS"
+        echo "           Update the yaml and resubmit."
+        exit 1
+    fi
+    echo "✓  point_feats=12 confirmed in $YAML_PATH"
+else
+    echo "⚠️  Could not find $YAML_PATH — skipping point_feats check"
+fi
+echo ""
+
+# ============================================================================
+# BUILD TRAINING COMMAND
+# ============================================================================
+
+echo "Building training command..."
+
+TRAIN_CMD="python gs_can3tok_2.py"
+
+# Training parameters
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
+TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
+TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
+
+# Dataset parameters
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
+TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
+TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+
+# Option 1: label input (no dropout — labels used as-is every step)
+TRAIN_CMD="$TRAIN_CMD --label_input"
+
+# Semantic parameters
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
+TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
+TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
+
+# Color and scale
+TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+
+# PCA visualization
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
+TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
+
+# 3DGS reconstruction
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+
+# Normalization
+if [ "$USE_CANONICAL_NORM" = "False" ]; then
+    TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+fi
+
+# W&B
+if [ "$USE_WANDB" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --use_wandb"
+    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-Semantic"
+    TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
+fi
+
+# Checkpoint resuming
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
+    if [ -n "$RESUME_EPOCH" ]; then
+        TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
+    fi
+fi
+
+echo "   Command:"
+echo "   $TRAIN_CMD"
+echo ""
+
+# ============================================================================
+# START TRAINING
+# ============================================================================
+
+echo "========================================================================"
+echo "                       STARTING TRAINING"
+echo "========================================================================"
+echo ""
+
+SECONDS=0
+
+eval $TRAIN_CMD
+TRAIN_EXIT=$?
+
+DURATION=$((SECONDS / 60))
+
+echo ""
+echo "========================================================================"
+echo "                       TRAINING COMPLETE"
+echo "========================================================================"
+echo "Exit code: $TRAIN_EXIT"
+echo "Duration:  $DURATION minutes"
+echo "End time:  $(date)"
+echo ""
+
+if [ $TRAIN_EXIT -eq 0 ]; then
+    echo "Training completed successfully!"
+    echo ""
+    echo "Next steps:"
+    echo "   1. Check logs:   cat logs/train_labelinput_option1_${SLURM_JOB_ID}.out"
+    echo "   2. Checkpoints:  ls checkpoints/RGB_job_${SLURM_JOB_ID}_none_labelinput/"
+    echo "   3. Best model:   checkpoints/RGB_job_${SLURM_JOB_ID}_none_labelinput/best_model.pth"
+    echo ""
+    echo "   To resume this run, set:"
+    echo "   RESUME_CHECKPOINT=\"checkpoints/RGB_job_${SLURM_JOB_ID}_none_labelinput/best_model.pth\""
+else
+    echo "Training FAILED with exit code $TRAIN_EXIT"
+    echo ""
+    echo "Troubleshooting:"
+    echo "   1. Error log:    cat logs/can3tok_${SLURM_JOB_ID}.err"
+    echo "   2. point_feats:  grep point_feats $YAML_PATH  (must be 12)"
+    echo "   3. Feature check: look for 'Label col (18)' in epoch 0 diagnostic"
+fi
+
+echo "========================================================================"

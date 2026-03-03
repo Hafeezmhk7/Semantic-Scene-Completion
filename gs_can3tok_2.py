@@ -1,16 +1,55 @@
 """
-Can3Tok Training - SIMPLE COLOR WEIGHTING
-==========================================
-RGB COLOR + INDIVIDUAL PARAMETER TRACKING + PCA VISUALIZATION
+Can3Tok Training — Step 1: Color Residual + Hidden Semantic Baseline
+======================================================================
 
-SIMPLIFIED:
-- Standard L2 loss (no complex balanced loss)
-- Optional color weighting (multiply color loss by weight)
-- Dataset normalization controlled by flags
+WHAT THIS FILE IMPLEMENTS
+--------------------------
+This is the complete training script for the 2000-scene hidden semantic
+baseline with Step 1 color residual encoding.
 
-CHECKPOINT RESUMING:
-- Use --resume_checkpoint /path/to/checkpoint.pth to resume
-- Use --resume_epoch N to override the epoch counter (optional)
+Step 1 adds three coordinated changes vs the plain hidden baseline:
+
+  DATASET (gs_dataset_scenesplat.py, color_residual=True):
+    After top-40k sampling:
+      mean_color  = color.mean(axis=0)    # [3] scene DC term
+      color       = color - mean_color    # [N,3] AC residuals ~[-0.3, +0.3]
+    mean_color returned in batch dict.
+
+  MODEL (sal_perceiver.py, color_residual=True):
+    MeanColorHead: shape_embed [B,384] -> Linear(384,64) -> ReLU
+                                       -> Linear(64,3) -> Sigmoid -> [B,3]
+    Stored as self.last_mean_color_pred (instance attribute) — NOT a 7th return
+    value. Keeps the 6-value return signature that asl_pl_module.py expects.
+    Gradient path: MSE_color -> MeanColorHead -> shape_embed -> encoder token 0.
+
+  TRAINING LOOP (this file):
+    mean_color_gt   = batch['mean_color'].to(device)                   # [B,3]
+    mean_color_pred = gs_autoencoder.shape_model.last_mean_color_pred  # [B,3]
+    color_pred_loss = F.mse_loss(mean_color_pred, mean_color_gt)
+    total_loss += mean_color_weight * color_pred_loss
+
+    At PLY save time: add mean_color back to residuals before saving.
+      absolute_color = predicted_residual + mean_color_gt
+
+SEMANTIC MODE
+-------------
+  semantic_mode='hidden'  → InfoNCE on GS_decoder hidden state [B,1024]
+  segment_weight=0.3      → beta, must be >0 to activate
+  Both conditions required (gs_can3tok_2.py checks: semantic_mode != 'none'
+  AND segment_loss_weight > 0).
+
+  shape_embed -> MeanColorHead path and GS_decoder hidden -> InfoNCE path
+  are completely independent. No interference.
+
+MODEL FORWARD RETURN VALUES  (6 values, unchanged)
+---------------------------------------------------
+  shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
+  mean_color_pred accessed via: gs_autoencoder.shape_model.last_mean_color_pred
+
+CHECKPOINT
+----------
+  Stores color_residual=True/False so probe and resume scripts can verify
+  compatibility automatically.
 """
 
 import torch
@@ -19,982 +58,716 @@ import torch.nn as nn
 import os
 import numpy as np
 from tqdm import tqdm
-import random
 from datetime import datetime
 import argparse
 from pathlib import Path
 
-# Michelangelo imports (VAE model)
 from model.michelangelo.utils import instantiate_from_config
 from model.michelangelo.utils.misc import get_config_from_file
-
-# Data loading
 import torch.utils.data as Data
 
-# Semantic loss functions
 from semantic_losses import compute_semantic_loss
-
-# PCA Feature Visualization
+from distribution_loss import compute_distribution_loss
 from pca_feature_visualization import visualize_comparison
-
-# 3DGS PLY Reconstruction
 from gs_ply_reconstructor import save_reconstructed_gaussians
 
-import matplotlib.pyplot as plt
-from scipy.stats import special_ortho_group
-
-# Unbuffered output
 import sys
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 os.environ['PYTHONUNBUFFERED'] = '1'
 
 # ============================================================================
-# PARAMETER INDICES FOR 14-DIM GAUSSIANS
+# PARAMETER INDICES  (identical for label_input=True/False)
 # ============================================================================
-"""
-Input format [B, N, features]:
-  Columns 0-3:   voxel_centers + uniq_idx
-  Columns 4-7:   xyz positions  
-  Columns 7-10:  rgb colors
-  Columns 10:    opacity
-  Columns 11-14: scale (sx, sy, sz)
-  Columns 14-18: rotation quaternion (qw, qx, qy, qz)
+# Feature tensor cols 4-17 → 14-dim reconstruction target:
+#   [0:3] xyz  [3:6] rgb-or-residual  [6] opacity  [7:10] scale  [10:14] quat
 
-Target format [B, N, 14]:
-  [0:3]   xyz positions
-  [3:6]   rgb colors
-  [6]     opacity
-  [7:10]  scale
-  [10:14] rotation quaternion
-"""
-
-# Define parameter slices
 PARAM_SLICES = {
-    'position': slice(0, 3),      # xyz
-    'color': slice(3, 6),         # rgb
-    'opacity': slice(6, 7),       # alpha
-    'scale': slice(7, 10),        # sx, sy, sz
-    'rotation': slice(10, 14),    # quat
+    'position': slice(0, 3),
+    'color':    slice(3, 6),
+    'opacity':  slice(6, 7),
+    'scale':    slice(7, 10),
+    'rotation': slice(10, 14),
 }
 
-# Indices from input to extract for target
-GEOMETRIC_INDICES = list(range(4, 7)) + list(range(7, 10)) + [10] + list(range(11, 14)) + list(range(14, 18))
-
-print(f"PARAMETER CONFIGURATION:")
-print(f"   Total params: 14")
-print(f"   Position (xyz): indices {PARAM_SLICES['position']}")
-print(f"   Color (rgb):    indices {PARAM_SLICES['color']}")
-print(f"   Opacity (a):    indices {PARAM_SLICES['opacity']}")
-print(f"   Scale (s):      indices {PARAM_SLICES['scale']}")
-print(f"   Rotation (q):   indices {PARAM_SLICES['rotation']}")
-print()
+GEOMETRIC_INDICES = (
+    list(range(4, 7))   # xyz
+  + list(range(7, 10))  # rgb / residuals
+  + [10]                # opacity
+  + list(range(11, 14)) # scale
+  + list(range(14, 18)) # quaternion
+)  # 14 values, cols 4-17
 
 # ============================================================================
-# INDIVIDUAL LOSS COMPUTATION (FOR TRACKING ONLY)
-# ============================================================================
-
-def compute_individual_losses(prediction, target):
-    losses = {}
-    pos_diff      = prediction[:, :, PARAM_SLICES['position']] - target[:, :, PARAM_SLICES['position']]
-    losses['position'] = torch.norm(pos_diff, p=2).item()
-    color_diff    = prediction[:, :, PARAM_SLICES['color']] - target[:, :, PARAM_SLICES['color']]
-    losses['color'] = torch.norm(color_diff, p=2).item()
-    opacity_diff  = prediction[:, :, PARAM_SLICES['opacity']] - target[:, :, PARAM_SLICES['opacity']]
-    losses['opacity'] = torch.norm(opacity_diff, p=2).item()
-    scale_diff    = prediction[:, :, PARAM_SLICES['scale']] - target[:, :, PARAM_SLICES['scale']]
-    losses['scale'] = torch.norm(scale_diff, p=2).item()
-    rotation_diff = prediction[:, :, PARAM_SLICES['rotation']] - target[:, :, PARAM_SLICES['rotation']]
-    losses['rotation'] = torch.norm(rotation_diff, p=2).item()
-    return losses
-
-
-# ============================================================================
-# SIMPLE RECONSTRUCTION LOSS WITH COLOR WEIGHTING
+# LOSS HELPERS
 # ============================================================================
 
 def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0):
     if color_weight == 1.0:
-        diff = prediction - target
-        loss = torch.norm(diff, p=2)
-        return loss / batch_size
-    else:
-        diff_pos   = prediction[:, :, 0:3] - target[:, :, 0:3]
-        diff_color = prediction[:, :, 3:6] - target[:, :, 3:6]
-        diff_other = prediction[:, :, 6:]  - target[:, :, 6:]
-        loss_pos   = torch.norm(diff_pos, p=2)
-        loss_color = torch.norm(diff_color, p=2) * color_weight
-        loss_other = torch.norm(diff_other, p=2)
-        total_loss = loss_pos + loss_color + loss_other
-        return total_loss / batch_size
+        return torch.norm(prediction - target, p=2) / batch_size
+    loss_pos   = torch.norm(prediction[:, :, 0:3] - target[:, :, 0:3], p=2)
+    loss_color = torch.norm(prediction[:, :, 3:6] - target[:, :, 3:6], p=2) * color_weight
+    loss_other = torch.norm(prediction[:, :, 6:]  - target[:, :, 6:],  p=2)
+    return (loss_pos + loss_color + loss_other) / batch_size
 
+
+def compute_individual_losses(prediction, target):
+    return {
+        name: torch.norm(prediction[:, :, sl] - target[:, :, sl], p=2).item()
+        for name, sl in PARAM_SLICES.items()
+    }
 
 # ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
 
-parser = argparse.ArgumentParser(description='Can3Tok Training - Simple Color Weighting')
-parser.add_argument('--use_wandb', action='store_true', default=False)
-parser.add_argument('--wandb_project', type=str, default='Can3Tok-SceenSplat-7K')
-parser.add_argument('--wandb_entity', type=str, default='3D-SSC')
-parser.add_argument('--batch_size', type=int, default=64)
-parser.add_argument('--num_epochs', type=int, default=1000)
-parser.add_argument('--lr', type=float, default=1e-4)
-parser.add_argument('--kl_weight', type=float, default=1e-5)
-parser.add_argument('--eval_every', type=int, default=10)
-parser.add_argument('--failure_threshold', type=float, default=8000.0)
-parser.add_argument('--train_scenes', type=int, default=None)
-parser.add_argument('--val_scenes', type=int, default=None)
-parser.add_argument('--sampling_method', type=str, default='opacity', choices=['random', 'opacity', 'hybrid'])
-parser.add_argument('--segment_loss_weight', type=float, default=0.0)
+parser = argparse.ArgumentParser(description='Can3Tok Training')
+
+# Core training
+parser.add_argument('--batch_size',           type=int,   default=64)
+parser.add_argument('--num_epochs',           type=int,   default=1000)
+parser.add_argument('--lr',                   type=float, default=1e-4)
+parser.add_argument('--kl_weight',            type=float, default=1e-5)
+parser.add_argument('--eval_every',           type=int,   default=20)
+parser.add_argument('--failure_threshold',    type=float, default=100.0)
+
+# Dataset
+parser.add_argument('--train_scenes',         type=int,   default=None)
+parser.add_argument('--val_scenes',           type=int,   default=None)
+parser.add_argument('--sampling_method',      type=str,   default='opacity',
+                    choices=['random', 'opacity', 'hybrid'])
+
+# Semantic
+parser.add_argument('--semantic_mode',        type=str,   default='none',
+                    choices=['none', 'hidden', 'geometric', 'attention', 'dist'])
+parser.add_argument('--segment_loss_weight',  type=float, default=0.0)
 parser.add_argument('--instance_loss_weight', type=float, default=0.0)
 parser.add_argument('--semantic_temperature', type=float, default=0.07)
-parser.add_argument('--semantic_subsample', type=int, default=2000)
-parser.add_argument('--semantic_mode', type=str, default='none',
-                    choices=['none', 'hidden', 'geometric', 'attention'])
-parser.add_argument('--sampling_strategy', type=str, default='balanced',
+parser.add_argument('--semantic_subsample',   type=int,   default=2000)
+parser.add_argument('--sampling_strategy',    type=str,   default='balanced',
                     choices=['random', 'balanced'])
-parser.add_argument('--pca_vis_freq', type=int, default=10)
-parser.add_argument('--pca_brightness', type=float, default=1.25)
-parser.add_argument('--pca_num_scenes', type=int, default=10)
-parser.add_argument('--recon_ply_freq', type=int, default=10)
-parser.add_argument('--recon_ply_num_scenes', type=int, default=5)
-parser.add_argument('--recon_ply_max_sh', type=int, default=3)
-parser.add_argument('--color_loss_weight', type=float, default=1.0)
-parser.add_argument('--scale_norm_mode', type=str, default='linear', choices=['log', 'linear'])
 
-norm_group = parser.add_mutually_exclusive_group()
-norm_group.add_argument('--use_canonical_norm', dest='use_canonical_norm', action='store_true', default=True)
-norm_group.add_argument('--no_canonical_norm', dest='use_canonical_norm', action='store_false')
+# Step 1: Color residual
+parser.add_argument('--color_residual',       action='store_true', default=False,
+    help='Enable Step 1 color residual. Dataset stores color-mean_color; '
+         'model predicts mean_color from shape_embed via MeanColorHead.')
+parser.add_argument('--mean_color_weight',    type=float, default=1.0,
+    help='Weight on MSE(mean_color_pred, mean_color_gt). '
+         'total_loss += mean_color_weight * color_pred_loss')
 
-color_norm_group = parser.add_mutually_exclusive_group()
-color_norm_group.add_argument('--normalize_colors', dest='normalize_colors', action='store_true', default=True)
-color_norm_group.add_argument('--no_normalize_colors', dest='normalize_colors', action='store_false')
+# Option 1: label as encoder input
+parser.add_argument('--label_input',          action='store_true', default=False)
+parser.add_argument('--no_label_input',       dest='label_input', action='store_false')
 
-# ============================================================================
-# CHECKPOINT RESUMING ARGUMENTS
-# ============================================================================
-# --resume_checkpoint  Path to .pth file. Loads weights + optimizer state.
-#                      Training resumes at saved_epoch + 1 automatically.
-#
-# --resume_epoch       Optional integer to manually override epoch counter.
-#                      Useful for fine-tuning experiments where you want
-#                      to reset the epoch count to 0.
-# ============================================================================
-parser.add_argument('--resume_checkpoint', type=str, default=None,
-                    help='Path to checkpoint .pth to resume from. '
-                         'Example: --resume_checkpoint /path/to/epoch_950.pth')
-parser.add_argument('--resume_epoch', type=int, default=None,
-                    help='Override start epoch (default: saved_epoch + 1). '
-                         'Use --resume_epoch 0 to reset counter for fine-tuning.')
+# Normalization
+parser.add_argument('--scale_norm_mode',      type=str, default='linear',
+                    choices=['log', 'linear'])
+parser.add_argument('--color_loss_weight',    type=float, default=1.0)
+norm_grp = parser.add_mutually_exclusive_group()
+norm_grp.add_argument('--use_canonical_norm', dest='use_canonical_norm',
+                      action='store_true', default=True)
+norm_grp.add_argument('--no_canonical_norm',  dest='use_canonical_norm',
+                      action='store_false')
+color_norm_grp = parser.add_mutually_exclusive_group()
+color_norm_grp.add_argument('--normalize_colors',    dest='normalize_colors',
+                            action='store_true', default=True)
+color_norm_grp.add_argument('--no_normalize_colors', dest='normalize_colors',
+                            action='store_false')
+
+# Visualization
+parser.add_argument('--pca_vis_freq',         type=int,   default=50)
+parser.add_argument('--pca_brightness',       type=float, default=1.25)
+parser.add_argument('--pca_num_scenes',       type=int,   default=3)
+parser.add_argument('--recon_ply_freq',       type=int,   default=50)
+parser.add_argument('--recon_ply_num_scenes', type=int,   default=3)
+parser.add_argument('--recon_ply_max_sh',     type=int,   default=3)
+
+# W&B
+parser.add_argument('--use_wandb',            action='store_true', default=False)
+parser.add_argument('--wandb_project',        type=str, default='Can3Tok-SceenSplat-7K')
+parser.add_argument('--wandb_entity',         type=str, default='3D-SSC')
+
+# Resuming
+parser.add_argument('--resume_checkpoint',    type=str, default=None)
+parser.add_argument('--resume_epoch',         type=int, default=None)
 
 args = parser.parse_args()
 
-# Semantic detection
-semantic_requested = (args.semantic_mode != 'none')
+# ── Semantic activation ───────────────────────────────────────────────────────
+semantic_requested    = (args.semantic_mode != 'none')
 semantic_loss_enabled = (args.segment_loss_weight > 0 or args.instance_loss_weight > 0)
-enable_semantic = semantic_requested and semantic_loss_enabled
-
-if not semantic_loss_enabled:
-    effective_semantic_mode = 'none'
-    enable_semantic = False
-else:
-    effective_semantic_mode = args.semantic_mode
+enable_semantic       = semantic_requested and semantic_loss_enabled
+effective_semantic_mode = args.semantic_mode if enable_semantic else 'none'
 
 # ============================================================================
-# WEIGHTS & BIASES SETUP
+# W&B
 # ============================================================================
 
 wandb_enabled = False
 if args.use_wandb:
     try:
         import wandb
-        job_id = os.environ.get('SLURM_JOB_ID', 'local')
-        run_name = f"can3tok_RGB_job_{job_id}_{effective_semantic_mode}"
-        if enable_semantic:
-            run_name += f"_beta{args.segment_loss_weight}"
-        if args.color_loss_weight > 1.0:
-            run_name += f"_color{args.color_loss_weight}"
-        if not args.use_canonical_norm:
-            run_name += "_raw"
-        if args.resume_checkpoint is not None:
-            run_name += "_resumed"
+        job_id   = os.environ.get('SLURM_JOB_ID', 'local')
+        run_name = f"can3tok_job_{job_id}_{effective_semantic_mode}"
+        if args.color_residual:   run_name += "_colorresidual"
+        if args.label_input:      run_name += "_labelinput"
+        if enable_semantic:       run_name += f"_beta{args.segment_loss_weight}"
+        if args.resume_checkpoint: run_name += "_resumed"
         wandb_run = wandb.init(
-            entity=args.wandb_entity,
-            project=args.wandb_project,
-            name=run_name,
-            config={
-                "learning_rate": args.lr,
-                "architecture": "Can3Tok-RGB-Simple",
-                "dataset": "SceneSplat-7K",
-                "batch_size": args.batch_size,
-                "epochs": args.num_epochs,
-                "kl_weight": args.kl_weight,
-                "semantic_mode": effective_semantic_mode,
-                "enable_semantic": enable_semantic,
-                "num_params": 14,
-                "color_loss_weight": args.color_loss_weight,
-                "use_canonical_norm": args.use_canonical_norm,
-                "resumed_from": args.resume_checkpoint,
-            },
-            tags=["rgb-color", "simple-loss", "color-weighting"],
+            entity=args.wandb_entity, project=args.wandb_project, name=run_name,
+            config=vars(args)
         )
-        print("W&B enabled")
         wandb_enabled = True
+        print("W&B enabled")
     except Exception as e:
         print(f"W&B failed: {e}")
-        wandb_enabled = False
-else:
-    print("W&B disabled")
 
 # ============================================================================
-# GPU SETUP
+# DEVICE
 # ============================================================================
 
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # ============================================================================
-# CONFIGURATION
+# DATA PATHS
 # ============================================================================
 
-loss_usage = "L2"
-random_permute = 0
-random_rotation = 0
-
-resol = 200
 data_path = "/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs"
-
-num_epochs = args.num_epochs
-bch_size = args.batch_size
-kl_weight = args.kl_weight
-eval_every = args.eval_every
-failure_threshold = args.failure_threshold
-train_scenes = args.train_scenes
-val_scenes = args.val_scenes
-sampling_method = args.sampling_method
 
 # ============================================================================
 # CHECKPOINT FOLDER
 # ============================================================================
 
 job_id = os.environ.get('SLURM_JOB_ID', None)
-if job_id:
-    checkpoint_folder = f"RGB_job_{job_id}_{effective_semantic_mode}"
-    if enable_semantic:
-        checkpoint_folder += f"_beta{args.segment_loss_weight}"
-    if args.color_loss_weight > 1.0:
-        checkpoint_folder += f"_color{args.color_loss_weight}"
-    if not args.use_canonical_norm:
-        checkpoint_folder += "_raw"
-else:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_folder = f"RGB_local_{timestamp}_{effective_semantic_mode}"
-    if enable_semantic:
-        checkpoint_folder += f"_beta{args.segment_loss_weight}"
-    if args.color_loss_weight > 1.0:
-        checkpoint_folder += f"_color{args.color_loss_weight}"
-    if not args.use_canonical_norm:
-        checkpoint_folder += "_raw"
+tag = f"RGB_job_{job_id}_{effective_semantic_mode}" if job_id else \
+      f"RGB_local_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{effective_semantic_mode}"
 
-save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{checkpoint_folder}/"
+if args.color_residual:   tag += "_colorresidual"
+if args.label_input:      tag += "_labelinput"
+if enable_semantic:       tag += f"_beta{args.segment_loss_weight}"
+if not args.use_canonical_norm: tag += "_raw"
+
+save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{tag}/"
 os.makedirs(save_path, exist_ok=True)
 
+# ============================================================================
+# STARTUP SUMMARY
+# ============================================================================
+
 print(f"\n{'='*70}")
-print(f"CAN3TOK TRAINING - SIMPLE COLOR WEIGHTING")
+print(f"CAN3TOK TRAINING")
 print(f"{'='*70}")
-print(f"  Job ID:            {job_id or 'local'}")
-print(f"  Semantic Mode:     {effective_semantic_mode}")
-print(f"  Color Weight:      {args.color_loss_weight}x")
-print(f"  Scale Norm Mode:   {args.scale_norm_mode}")
-print(f"  Canonical Norm:    {'ENABLED' if args.use_canonical_norm else 'DISABLED'}")
-print(f"  Color Norm:        {'[0,1]' if args.normalize_colors else '[0,255]'}")
-print(f"  Device:            {device}")
-print(f"  Save path:         {save_path}")
+print(f"  Semantic mode:    {effective_semantic_mode}")
+print(f"  Enable semantic:  {enable_semantic}")
+print(f"  Color residual:   {args.color_residual}  "
+      f"(Step 1 — shape_embed -> MeanColorHead)")
+print(f"  Mean color weight:{args.mean_color_weight}  (weight on color pred loss)")
+print(f"  Label input:      {args.label_input}")
+print(f"  Scale norm mode:  {args.scale_norm_mode}")
+print(f"  Canonical norm:   {args.use_canonical_norm}")
+print(f"  Device:           {device}")
+print(f"  Save path:        {save_path}")
 if args.resume_checkpoint:
-    print(f"  Resume from:       {args.resume_checkpoint}")
+    print(f"  Resume from:      {args.resume_checkpoint}")
 print(f"{'='*70}\n")
 
 # ============================================================================
-# MODEL SETUP
+# MODEL
 # ============================================================================
 
-print("Loading model configuration...")
-config_path_perceiver = "./model/configs/aligned_shape_latents/shapevae-256.yaml"
-model_config_perceiver = get_config_from_file(config_path_perceiver)
+print("Loading model config...")
+config_path = "./model/configs/aligned_shape_latents/shapevae-256.yaml"
+model_config_perceiver = get_config_from_file(config_path)
 model_config = model_config_perceiver.model
 model_config.params.shape_module_cfg.params.semantic_mode = effective_semantic_mode
+model_config.params.shape_module_cfg.params.color_residual = args.color_residual  # Step 1
 
-print(f"\n{'='*70}")
-print("INSTANTIATING MODEL")
-print(f"{'='*70}")
-perceiver_encoder_decoder = instantiate_from_config(model_config)
-print(f"Model instantiated successfully")
-print(f"{'='*70}\n")
+cfg_point_feats = model_config.params.shape_module_cfg.params.point_feats
+expected_feats  = 12 if args.label_input else 11
+if cfg_point_feats != expected_feats:
+    raise ValueError(
+        f"point_feats mismatch: yaml={cfg_point_feats}, "
+        f"label_input={args.label_input} requires {expected_feats}. "
+        f"Update shapevae-256.yaml."
+    )
+print(f"  point_feats={cfg_point_feats} OK")
 
-gs_autoencoder = perceiver_encoder_decoder
+gs_autoencoder = instantiate_from_config(model_config)
 gs_autoencoder.to(device)
-
 optimizer = torch.optim.Adam(gs_autoencoder.parameters(), lr=args.lr, betas=[0.9, 0.999])
 
 # ============================================================================
 # CHECKPOINT LOADING
 # ============================================================================
-#
-# CONTROL GUIDE:
-#
-#   Fresh training (no flag needed):
-#     python gs_can3tok_2.py [other args]
-#     → Starts epoch 0 with random weights
-#
-#   Resume normally (most common case):
-#     python gs_can3tok_2.py --resume_checkpoint /path/to/epoch_950.pth [other args]
-#     → Loads weights + optimizer, starts at epoch 951
-#     → best_val_loss is restored so good checkpoints are not overwritten
-#
-#   Resume with epoch reset (fine-tuning / ablation):
-#     python gs_can3tok_2.py --resume_checkpoint /path/to/best_model.pth --resume_epoch 0 [other args]
-#     → Loads weights + optimizer, but epoch counter starts at 0
-#     → Useful when you want to run a second experiment starting from a pretrained base
-#
-# ============================================================================
 
-start_epoch = 0
+start_epoch   = 0
+best_val_loss = float('inf')
+best_epoch    = 0
 
-if args.resume_checkpoint is not None:
-    print(f"\n{'='*70}")
-    print(f"RESUMING FROM CHECKPOINT")
-    print(f"{'='*70}")
-
+if args.resume_checkpoint:
+    print(f"\nResuming from: {args.resume_checkpoint}")
     if not os.path.exists(args.resume_checkpoint):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {args.resume_checkpoint}\n"
-            f"Please check the path and try again."
+        raise FileNotFoundError(f"Checkpoint not found: {args.resume_checkpoint}")
+    ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
+
+    # Verify color_residual compatibility — changes input to decoder color head
+    saved_cr = ckpt.get('color_residual', False)
+    if saved_cr != args.color_residual:
+        raise ValueError(
+            f"color_residual mismatch: checkpoint={saved_cr}, current={args.color_residual}. "
+            f"These are incompatible — the MeanColorHead exists only when color_residual=True."
+        )
+    # Verify label_input — changes input_proj dimension
+    saved_li = ckpt.get('label_input', False)
+    if saved_li != args.label_input:
+        raise ValueError(
+            f"label_input mismatch: checkpoint={saved_li}, current={args.label_input}. "
+            f"input_proj dimension differs — cannot resume across this boundary."
         )
 
-    print(f"  Loading: {args.resume_checkpoint}")
-    checkpoint = torch.load(args.resume_checkpoint, map_location=device)
-
-    # Load model weights
-    gs_autoencoder.load_state_dict(checkpoint['model_state_dict'])
-    print(f"  Model weights loaded")
-
-    # Load optimizer state (preserves momentum buffers, LR, etc.)
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    print(f"  Optimizer state loaded")
-
-    # Determine start epoch
-    saved_epoch = checkpoint.get('epoch', 0)
-    if args.resume_epoch is not None:
-        start_epoch = args.resume_epoch
-        print(f"  Epoch counter: overridden to {start_epoch} (--resume_epoch flag)")
+    saved_mode = ckpt.get('semantic_mode', 'none')
+    if saved_mode != effective_semantic_mode:
+        print(f"  Semantic mode changed: {saved_mode} -> {effective_semantic_mode} (strict=False)")
+        gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=False)
     else:
-        start_epoch = saved_epoch + 1
-        print(f"  Epoch counter: saved={saved_epoch}, resuming at {start_epoch}")
+        gs_autoencoder.load_state_dict(ckpt['model_state_dict'])
 
-    # Restore best_val_loss so we don't overwrite a better checkpoint
-    best_val_loss = checkpoint.get('val_l2_error',
-                    checkpoint.get('best_val_l2', float('inf')))
-    best_epoch = saved_epoch
-
-    print(f"")
-    print(f"  Checkpoint info:")
-    print(f"    Saved at epoch:  {saved_epoch}")
-    print(f"    Val L2 at save:  {best_val_loss:.4f}")
-    print(f"    Semantic mode:   {checkpoint.get('semantic_mode', 'unknown')}")
-    print(f"    Color weight:    {checkpoint.get('color_loss_weight', 'unknown')}")
-    print(f"    Scale norm mode: {checkpoint.get('scale_norm_mode', 'unknown')}")
-    print(f"    Canonical norm:  {checkpoint.get('use_canonical_norm', 'unknown')}")
-    print(f"")
-    print(f"  Will train from epoch {start_epoch} to {num_epochs - 1}")
-    print(f"{'='*70}\n")
-
-else:
-    print(f"Fresh training — starting from epoch 0 with random weights\n")
-    best_val_loss = float('inf')
-    best_epoch = 0
+    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    saved_epoch = ckpt.get('epoch', 0)
+    start_epoch = args.resume_epoch if args.resume_epoch is not None else saved_epoch + 1
+    best_val_loss = ckpt.get('val_l2_error', ckpt.get('best_val_l2', float('inf')))
+    best_epoch    = saved_epoch
+    print(f"  Resumed at epoch {start_epoch} (saved val L2: {best_val_loss:.4f})")
 
 # ============================================================================
-# DATASET LOADING
+# DATASETS
 # ============================================================================
 
-print("Loading datasets...")
 from gs_dataset_scenesplat import gs_dataset
 
-print("\n" + "="*70)
-print("TRAINING DATASET")
-print("="*70)
+print(f"\n--- Training Dataset ---")
 gs_dataset_train = gs_dataset(
     root=os.path.join(data_path, "train_grid1.0cm_chunk8x8_stride6x6"),
-    resol=resol,
-    random_permute=True,
-    train=True,
-    sampling_method=sampling_method,
-    max_scenes=train_scenes,
+    resol=200, random_permute=True, train=True,
+    sampling_method=args.sampling_method,
+    max_scenes=args.train_scenes,
     normalize=args.use_canonical_norm,
     normalize_colors=args.normalize_colors,
     target_radius=10.0,
     scale_norm_mode=args.scale_norm_mode,
+    label_input=args.label_input,
+    color_residual=args.color_residual,
 )
-
 trainDataLoader = Data.DataLoader(
-    dataset=gs_dataset_train,
-    batch_size=bch_size,
-    shuffle=True,
-    num_workers=9,
-    pin_memory=True,
-    persistent_workers=True
+    dataset=gs_dataset_train, batch_size=args.batch_size,
+    shuffle=True, num_workers=9, pin_memory=True, persistent_workers=True,
 )
 
-print("="*70)
-print("VALIDATION DATASET")
-print("="*70)
-
+print(f"\n--- Validation Dataset ---")
 gs_dataset_val = gs_dataset(
     root=os.path.join(data_path, "train_grid1.0cm_chunk8x8_stride6x6"),
-    resol=resol,
-    random_permute=False,
-    train=True,
-    sampling_method=sampling_method,
-    max_scenes=val_scenes,
+    resol=200, random_permute=False, train=True,
+    sampling_method=args.sampling_method,
+    max_scenes=args.val_scenes,
     normalize=args.use_canonical_norm,
     normalize_colors=args.normalize_colors,
     target_radius=10.0,
     scale_norm_mode=args.scale_norm_mode,
+    label_input=args.label_input,
+    color_residual=args.color_residual,
 )
-
 valDataLoader = Data.DataLoader(
-    dataset=gs_dataset_val,
-    batch_size=bch_size,
-    shuffle=False,
-    num_workers=9,
-    pin_memory=True,
-    persistent_workers=True
+    dataset=gs_dataset_val, batch_size=args.batch_size,
+    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True,
 )
 
-print("="*70)
-print("DATASET SUMMARY")
-print("="*70)
-print(f"Training: {len(gs_dataset_train)} scenes, {len(trainDataLoader)} batches")
-print(f"Validation: {len(gs_dataset_val)} scenes, {len(valDataLoader)} batches")
-print(f"Sampling: {sampling_method}")
-print("="*70)
-print()
+print(f"\n{'='*70}")
+print(f"  Train: {len(gs_dataset_train)} scenes, {len(trainDataLoader)} batches/epoch")
+print(f"  Val:   {len(gs_dataset_val)} scenes,  {len(valDataLoader)} batches")
+print(f"  Total steps: {len(trainDataLoader) * args.num_epochs:,}")
+print(f"{'='*70}\n")
 
 # ============================================================================
-# EVALUATION FUNCTION
+# CHECKPOINT METADATA  (written into every saved .pth)
 # ============================================================================
 
-def evaluate_model(model, dataloader, device, failure_threshold,
-                   save_path=None, epoch=None, enable_pca_vis=True, num_vis_scenes=10):
+_ckpt_meta = {
+    'semantic_mode':      effective_semantic_mode,
+    'enable_semantic':    enable_semantic,
+    'label_input':        args.label_input,
+    'color_residual':     args.color_residual,
+    'mean_color_weight':  args.mean_color_weight,
+    'color_loss_weight':  args.color_loss_weight,
+    'use_canonical_norm': args.use_canonical_norm,
+    'scale_norm_mode':    args.scale_norm_mode,
+}
+
+# ============================================================================
+# EVALUATION
+# ============================================================================
+
+def evaluate_model(model, dataloader, device, epoch=None):
     model.eval()
+    total_l2 = total_kl = 0.0
+    total_color_pred_loss = 0.0
+    per_param = {k: 0.0 for k in PARAM_SLICES}
+    n_scenes  = 0
 
-    total_l2_error = 0.0
-    total_kl = 0.0
-    per_scene_l2_errors = []
-    num_failures = 0
-    num_scenes = 0
-
-    total_position_loss = 0.0
-    total_color_loss = 0.0
-    total_opacity_loss = 0.0
-    total_scale_loss = 0.0
-    total_rotation_loss = 0.0
-
-    scene_data_list = []
-    scenes_collected = 0
-    max_scenes_for_visualization = num_vis_scenes
-
+    scene_data_list  = []
     recon_preds_list = []
-    recon_scenes_collected = 0
-    max_scenes_for_recon = args.recon_ply_num_scenes
+    recon_means_list = []   # mean_color for each collected scene (Step 1)
+
+    do_pca   = (epoch is not None and epoch % args.pca_vis_freq  == 0 and enable_semantic)
+    do_recon = (epoch is not None and epoch % args.recon_ply_freq == 0)
 
     with torch.no_grad():
-        for i_batch, batch_data in enumerate(tqdm(dataloader, desc="Evaluating", leave=False)):
-            if isinstance(batch_data, dict):
-                UV_gs_batch = batch_data['features'].type(torch.float32).to(device)
-                segment_labels = batch_data.get('segment_labels', None)
-            else:
-                UV_gs_batch = batch_data[0].type(torch.float32).to(device)
-                segment_labels = None
+        for batch_data in tqdm(dataloader, desc="Evaluating", leave=False):
+            UV_gs_batch    = batch_data['features'].float().to(device)
+            mean_color_gt  = batch_data['mean_color'].float().to(device)  # [B,3]
+            segment_labels = batch_data.get('segment_labels', None)
+            B = UV_gs_batch.shape[0]
 
-            batch_size = UV_gs_batch.shape[0]
-
-            if i_batch == 0:
-                voxel_centers = UV_gs_batch[:, :, 0:3].detach().cpu().numpy()
-                gauss_positions = UV_gs_batch[:, :, 4:7].detach().cpu().numpy()
-                print(f"\nCOORDINATE SYSTEM CHECK:")
-                print(f"  Voxel centers range:      [{voxel_centers.min():.2f}, {voxel_centers.max():.2f}]")
-                print(f"  Gaussian positions range: [{gauss_positions.min():.2f}, {gauss_positions.max():.2f}]")
-
-            need_semantic = (enable_pca_vis and
-                             scenes_collected < max_scenes_for_visualization and
-                             segment_labels is not None and
-                             epoch is not None and
-                             epoch % args.pca_vis_freq == 0)
-
-            was_training = model.training
-            if need_semantic:
+            # Need model.train() to get per_gaussian_features for PCA collection
+            need_sem = (do_pca and len(scene_data_list) < args.pca_num_scenes
+                        and segment_labels is not None)
+            was_train = model.training
+            if need_sem:
                 model.train()
 
-            shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features = model(
+            (shape_embed, mu, log_var, z,
+             UV_gs_recover, per_gaussian_features) = model(
                 UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3]
             )
+            mean_color_pred = model.shape_model.last_mean_color_pred
 
-            if need_semantic and not was_training:
+            if need_sem and not was_train:
                 model.eval()
 
-            target = UV_gs_batch[:, :, GEOMETRIC_INDICES]
-            UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 14)
+            target     = UV_gs_batch[:, :, GEOMETRIC_INDICES]
+            pred_3d    = UV_gs_recover.reshape(B, -1, 14)
+            recon_loss = compute_reconstruction_loss(
+                pred_3d, target, B, args.color_loss_weight)
 
-            batch_l2_error = compute_reconstruction_loss(
-                UV_gs_recover_reshaped, target,
-                batch_size=batch_size, color_weight=args.color_loss_weight
-            )
-            individual_losses = compute_individual_losses(UV_gs_recover_reshaped, target)
+            kl_loss = -0.5 * torch.sum(
+                1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
 
-            per_scene_norms = torch.norm(UV_gs_recover_reshaped - target, p=2, dim=(1, 2))
-            per_scene_errors_scaled = per_scene_norms / np.sqrt(batch_size)
+            # Step 1: color prediction error
+            if mean_color_pred is not None and args.color_residual:
+                cp_loss = F.mse_loss(mean_color_pred, mean_color_gt).item()
+                total_color_pred_loss += cp_loss * B
 
-            kl_loss = -0.5 * torch.sum(1.0 + log_var - mu.pow(2) - log_var.exp(), dim=1)
-
-            total_l2_error += batch_l2_error.item()
+            total_l2 += recon_loss.item()
             total_kl += kl_loss.sum().item()
-            per_scene_l2_errors.extend(per_scene_errors_scaled.cpu().numpy().tolist())
-            num_failures += (per_scene_errors_scaled.cpu().numpy() > failure_threshold).sum()
-            num_scenes += batch_size
+            n_scenes  += B
 
-            total_position_loss += individual_losses['position']
-            total_color_loss    += individual_losses['color']
-            total_opacity_loss  += individual_losses['opacity']
-            total_scale_loss    += individual_losses['scale']
-            total_rotation_loss += individual_losses['rotation']
+            ind = compute_individual_losses(pred_3d, target)
+            for k in per_param:
+                per_param[k] += ind[k]
 
-            if (enable_pca_vis and
-                scenes_collected < max_scenes_for_visualization and
-                per_gaussian_features is not None and
-                segment_labels is not None and
-                epoch is not None and
-                epoch % args.pca_vis_freq == 0):
-                try:
-                    pos = UV_gs_batch[:, :, 4:7].cpu().numpy()
-                    col = UV_gs_batch[:, :, 7:10].cpu().numpy()
-                    sem_feat = per_gaussian_features.cpu().numpy()
-                    for scene_idx in range(batch_size):
-                        if scenes_collected >= max_scenes_for_visualization:
-                            break
-                        scene_data_list.append({
-                            'semantic_features': sem_feat[scene_idx],
-                            'positions': pos[scene_idx],
-                            'colors': col[scene_idx],
-                            'coords': pos[scene_idx],
-                            'scene_id': scenes_collected
-                        })
-                        scenes_collected += 1
-                except Exception as e:
-                    print(f"Could not extract features for PCA: {e}")
+            # Collect for PCA
+            if need_sem and per_gaussian_features is not None:
+                pos = UV_gs_batch[:, :, 4:7].cpu().numpy()
+                col = UV_gs_batch[:, :, 7:10].cpu().numpy()
+                sem = per_gaussian_features.cpu().numpy()
+                for si in range(B):
+                    if len(scene_data_list) >= args.pca_num_scenes:
+                        break
+                    scene_data_list.append({
+                        'semantic_features': sem[si],
+                        'positions': pos[si], 'colors': col[si],
+                        'coords': pos[si], 'scene_id': len(scene_data_list),
+                    })
 
-            if (recon_scenes_collected < max_scenes_for_recon and
-                epoch is not None and
-                epoch % args.recon_ply_freq == 0):
-                try:
-                    pred_np = UV_gs_recover_reshaped.cpu().numpy()
-                    for scene_idx in range(batch_size):
-                        if recon_scenes_collected >= max_scenes_for_recon:
-                            break
-                        recon_preds_list.append(pred_np[scene_idx])
-                        recon_scenes_collected += 1
-                except Exception as e:
-                    print(f"Could not collect predictions for PLY: {e}")
+            # Collect for PLY reconstruction
+            if do_recon and len(recon_preds_list) < args.recon_ply_num_scenes:
+                preds_np = pred_3d.cpu().numpy()
+                means_np = mean_color_gt.cpu().numpy()
+                for si in range(B):
+                    if len(recon_preds_list) >= args.recon_ply_num_scenes:
+                        break
+                    recon_preds_list.append(preds_np[si])
+                    recon_means_list.append(means_np[si])
 
-    avg_l2_error = total_l2_error
-    avg_kl = total_kl / num_scenes
-    failure_rate = (num_failures / num_scenes) * 100.0
-    per_scene_l2_errors = np.array(per_scene_l2_errors)
-
-    # PCA Visualizations
-    pca_paths = {}
-    if (enable_pca_vis and len(scene_data_list) > 0 and
-        save_path is not None and epoch is not None and
-        epoch % args.pca_vis_freq == 0):
-
+    # PCA visualizations
+    if do_pca and scene_data_list and save_path:
         vis_dir = Path(save_path) / "pca_visualizations" / f"epoch_{epoch:03d}"
         vis_dir.mkdir(parents=True, exist_ok=True)
-        for scene_idx, scene_data in enumerate(scene_data_list):
+        for si, sd in enumerate(scene_data_list):
             try:
-                scene_pca_paths = visualize_comparison(
-                    coords=scene_data['coords'],
-                    semantic_features=scene_data['semantic_features'],
-                    positions=scene_data['positions'],
-                    colors=scene_data['colors'],
-                    output_dir=vis_dir,
-                    scene_name=f"scene_{scene_idx:03d}",
-                    brightness=args.pca_brightness
+                visualize_comparison(
+                    coords=sd['coords'], semantic_features=sd['semantic_features'],
+                    positions=sd['positions'], colors=sd['colors'],
+                    output_dir=vis_dir, scene_name=f"scene_{si:03d}",
+                    brightness=args.pca_brightness,
                 )
-                pca_paths[f'scene_{scene_idx:03d}'] = scene_pca_paths
             except Exception as e:
-                print(f"PCA error scene {scene_idx}: {e}")
+                print(f"  PCA error scene {si}: {e}")
 
-    # 3DGS PLY Reconstruction
-    recon_paths = {}
-    if (len(recon_preds_list) > 0 and save_path is not None and
-        epoch is not None and epoch % args.recon_ply_freq == 0):
+    # PLY reconstruction
+    # Step 1: add mean_color back to residuals before saving
+    if do_recon and recon_preds_list and save_path:
         try:
-            all_preds = np.stack(recon_preds_list, axis=0)
+            all_preds = np.stack(recon_preds_list, axis=0)   # [S, N, 14]
+            if args.color_residual:
+                for si in range(len(all_preds)):
+                    all_preds[si, :, 3:6] += recon_means_list[si]   # add DC term
+                    all_preds[si, :, 3:6]  = np.clip(all_preds[si, :, 3:6], 0, 1)
             recon_dir = Path(save_path) / "reconstructed_gaussians" / f"epoch_{epoch:03d}"
-            recon_paths = save_reconstructed_gaussians(
+            save_reconstructed_gaussians(
                 predictions=all_preds, output_dir=recon_dir, epoch=epoch,
-                num_scenes=len(recon_preds_list), max_sh_degree=args.recon_ply_max_sh,
-                color_mode="1", prefix="scene"
+                num_scenes=len(all_preds), max_sh_degree=args.recon_ply_max_sh,
+                color_mode="1", prefix="scene",
             )
         except Exception as e:
-            print(f"PLY save error: {e}")
+            print(f"  PLY save error: {e}")
 
     model.train()
-
     return {
-        'avg_l2_error': avg_l2_error,
-        'l2_std': per_scene_l2_errors.std(),
-        'failure_rate': failure_rate,
-        'avg_kl': avg_kl,
-        'per_scene_errors': per_scene_l2_errors,
-        'position_loss': total_position_loss / num_scenes,
-        'color_loss':    total_color_loss    / num_scenes,
-        'opacity_loss':  total_opacity_loss  / num_scenes,
-        'scale_loss':    total_scale_loss    / num_scenes,
-        'rotation_loss': total_rotation_loss / num_scenes,
-        'pca_paths': pca_paths,
-        'recon_paths': recon_paths,
+        'avg_l2_error':        total_l2,
+        'avg_kl':              total_kl / max(n_scenes, 1),
+        'color_pred_loss':     total_color_pred_loss / max(n_scenes, 1),
+        **{f'{k}_loss': v / max(n_scenes, 1) for k, v in per_param.items()},
     }
-
-# ============================================================================
-# TRAINING SETUP
-# ============================================================================
-
-volume_dims = 40
-resolution = 16.0 / volume_dims
-origin_offset = torch.tensor(
-    np.array([
-        (volume_dims - 1) / 2,
-        (volume_dims - 1) / 2,
-        (volume_dims - 1) / 2
-    ]) * resolution,
-    dtype=torch.float32
-).to(device)
 
 # ============================================================================
 # TRAINING LOOP
 # ============================================================================
 
-print("="*70)
-print("STARTING TRAINING")
-if start_epoch > 0:
-    print(f"RESUMING FROM EPOCH {start_epoch} --> TARGET EPOCH {num_epochs - 1}")
-else:
-    print("FRESH START FROM EPOCH 0")
-print("="*70)
-print()
+print(f"{'='*70}")
+print(f"STARTING TRAINING  (epoch {start_epoch} -> {args.num_epochs - 1})")
+print(f"{'='*70}\n")
 
 global_step = 0
-# Note: best_val_loss and best_epoch were already set in the checkpoint
-# loading section above (either restored from checkpoint or initialized to
-# float('inf') and 0 for fresh training)
 
-# KEY CHANGE: range(start_epoch, num_epochs) so resumed runs don't repeat epochs
-for epoch in tqdm(range(start_epoch, num_epochs), desc="Training"):
-    epoch_loss = 0.0
-    epoch_recon_loss = 0.0
-    epoch_kl_loss = 0.0
-    epoch_semantic_loss = 0.0
-    epoch_position_loss = 0.0
-    epoch_color_loss = 0.0
-    epoch_opacity_loss = 0.0
-    epoch_scale_loss = 0.0
-    epoch_rotation_loss = 0.0
-
+for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     gs_autoencoder.train()
 
+    epoch_loss = epoch_recon = epoch_kl = epoch_sem = epoch_color_pred = 0.0
+    epoch_pos = epoch_col = epoch_opa = epoch_scl = epoch_rot = 0.0
+
     for i_batch, batch_data in enumerate(trainDataLoader):
-        if isinstance(batch_data, dict):
-            UV_gs_batch = batch_data['features'].type(torch.float32).to(device)
-            segment_labels  = batch_data['segment_labels'].type(torch.int64).to(device)  if enable_semantic else None
-            instance_labels = batch_data['instance_labels'].type(torch.int64).to(device) if enable_semantic else None
-        else:
-            UV_gs_batch = batch_data[0].type(torch.float32).to(device)
-            segment_labels  = None
-            instance_labels = None
+        UV_gs_batch   = batch_data['features'].float().to(device)
+        mean_color_gt = batch_data['mean_color'].float().to(device)   # [B,3]
+        B = UV_gs_batch.shape[0]
 
-        if epoch % 10 == 0 and i_batch == 0 and random_permute == 1:
-            perm_indices = torch.randperm(UV_gs_batch.size()[1])
-            UV_gs_batch = UV_gs_batch[:, perm_indices]
-            if segment_labels  is not None: segment_labels  = segment_labels[:, perm_indices]
-            if instance_labels is not None: instance_labels = instance_labels[:, perm_indices]
-
-        if epoch % 5 == 0 and epoch > 1 and random_rotation == 1:
-            rand_rot_comp = special_ortho_group.rvs(3)
-            rand_rot = torch.tensor(np.dot(rand_rot_comp, rand_rot_comp.T),
-                                    dtype=torch.float32).to(UV_gs_batch.device)
-            UV_gs_batch[:, :, 4:7] = UV_gs_batch[:, :, 4:7] @ rand_rot
-            for bcbc in range(UV_gs_batch.shape[0]):
-                shifted_points   = UV_gs_batch[bcbc, :, 4:7] + origin_offset
-                voxel_indices    = torch.floor(shifted_points / resolution)
-                voxel_indices    = torch.clip(voxel_indices, 0, volume_dims - 1)
-                voxel_centers_b  = (voxel_indices - (volume_dims - 1) / 2) * resolution
-                UV_gs_batch[bcbc, :, :3] = voxel_centers_b
+        segment_labels = instance_labels = None
+        if enable_semantic:
+            segment_labels  = batch_data['segment_labels'].long().to(device)
+            instance_labels = batch_data['instance_labels'].long().to(device)
 
         optimizer.zero_grad()
 
-        shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features = gs_autoencoder(
+        # ── Forward ──────────────────────────────────────────────────────────
+        # asl_pl_module.py wraps shape_model and expects exactly 6 return values.
+        # mean_color_pred is stored as shape_model.last_mean_color_pred to avoid
+        # touching asl_pl_module.py.
+        (shape_embed, mu, log_var, z,
+         UV_gs_recover, per_gaussian_features) = gs_autoencoder(
             UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3]
         )
+        mean_color_pred = gs_autoencoder.shape_model.last_mean_color_pred
 
-        KL_loss = -0.5 * torch.sum(
-            1.0 + log_var - mu.pow(2) - log_var.exp(), dim=1
-        ).mean()
-
-        target = UV_gs_batch[:, :, GEOMETRIC_INDICES]
-        UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 14)
-
+        # ── Reconstruction loss ───────────────────────────────────────────────
+        target   = UV_gs_batch[:, :, GEOMETRIC_INDICES]
+        pred_3d  = UV_gs_recover.reshape(B, -1, 14)
         recon_loss = compute_reconstruction_loss(
-            UV_gs_recover_reshaped, target,
-            batch_size=UV_gs_batch.shape[0],
-            color_weight=args.color_loss_weight
-        )
+            pred_3d, target, B, args.color_loss_weight)
 
-        if i_batch == 0:
-            coord_pred   = UV_gs_recover_reshaped[:, :, 0:3].detach().cpu().numpy()
-            coord_target = target[:, :, 0:3].detach().cpu().numpy()
-            print(f"\nEPOCH {epoch} - DIAGNOSTIC:")
-            print(f"  Target coord range: [{coord_target.min():.2f}, {coord_target.max():.2f}]")
-            print(f"  Output coord range: [{coord_pred.min():.2f}, {coord_pred.max():.2f}]")
+        # ── KL loss ───────────────────────────────────────────────────────────
+        KL_loss = -0.5 * torch.sum(
+            1 + log_var - mu.pow(2) - log_var.exp(), dim=1).mean()
 
-        individual_losses = compute_individual_losses(UV_gs_recover_reshaped, target)
+        # ── Step 1: mean color prediction loss ───────────────────────────────
+        # Gradient: MSE -> MeanColorHead -> shape_embed -> encoder token 0
+        # Completely independent from reconstruction and InfoNCE paths.
+        color_pred_loss = torch.tensor(0.0, device=device)
+        if mean_color_pred is not None and args.color_residual:
+            color_pred_loss = F.mse_loss(mean_color_pred, mean_color_gt)
 
+        # ── Semantic loss ─────────────────────────────────────────────────────
         semantic_loss    = torch.tensor(0.0, device=device)
         semantic_metrics = {}
         if enable_semantic and segment_labels is not None and per_gaussian_features is not None:
-            semantic_loss, semantic_metrics = compute_semantic_loss(
-                embeddings=per_gaussian_features,
-                segment_labels=segment_labels,
-                instance_labels=instance_labels,
-                batch_size=UV_gs_batch.shape[0],
-                segment_weight=args.segment_loss_weight,
-                instance_weight=args.instance_loss_weight,
-                temperature=args.semantic_temperature,
-                subsample=args.semantic_subsample,
-                sampling_strategy=args.sampling_strategy
-            )
+            if args.semantic_mode == 'dist':
+                semantic_loss, semantic_metrics = compute_distribution_loss(
+                    dist_logits=per_gaussian_features,
+                    segment_labels=segment_labels,
+                    weight=args.segment_loss_weight,
+                )
+            else:
+                semantic_loss, semantic_metrics = compute_semantic_loss(
+                    embeddings=per_gaussian_features,
+                    segment_labels=segment_labels,
+                    instance_labels=instance_labels,
+                    batch_size=B,
+                    segment_weight=args.segment_loss_weight,
+                    instance_weight=args.instance_loss_weight,
+                    temperature=args.semantic_temperature,
+                    subsample=args.semantic_subsample,
+                    sampling_strategy=args.sampling_strategy,
+                )
 
-        loss = recon_loss + kl_weight * KL_loss + semantic_loss
-
-        loss_value          = loss.item()
-        recon_loss_value    = recon_loss.item()
-        kl_loss_value       = KL_loss.item()
-        semantic_loss_value = semantic_loss.item()
-
+        # ── Total loss ────────────────────────────────────────────────────────
+        loss = (recon_loss
+                + args.kl_weight    * KL_loss
+                + semantic_loss
+                + args.mean_color_weight * color_pred_loss)
         loss.backward()
         optimizer.step()
 
-        epoch_loss          += loss_value
-        epoch_recon_loss    += recon_loss_value
-        epoch_kl_loss       += kl_loss_value
-        epoch_semantic_loss += semantic_loss_value
-        epoch_position_loss += individual_losses['position']
-        epoch_color_loss    += individual_losses['color']
-        epoch_opacity_loss  += individual_losses['opacity']
-        epoch_scale_loss    += individual_losses['scale']
-        epoch_rotation_loss += individual_losses['rotation']
+        ind = compute_individual_losses(pred_3d, target)
+        epoch_loss       += loss.item()
+        epoch_recon      += recon_loss.item()
+        epoch_kl         += KL_loss.item()
+        epoch_sem        += semantic_loss.item()
+        epoch_color_pred += color_pred_loss.item()
+        epoch_pos += ind['position']
+        epoch_col += ind['color']
+        epoch_opa += ind['opacity']
+        epoch_scl += ind['scale']
+        epoch_rot += ind['rotation']
+
+        # Epoch 0 first-batch diagnostic
+        if epoch == start_epoch and i_batch == 0:
+            print(f"\nEPOCH {epoch} DIAGNOSTIC (batch 0):")
+            print(f"  mu range:         [{mu.min().item():.3f}, {mu.max().item():.3f}]")
+            print(f"  recon_loss:       {recon_loss.item():.4f}")
+            print(f"  KL_loss:          {KL_loss.item():.4f}")
+            if args.color_residual and mean_color_pred is not None:
+                print(f"  color_pred_loss:  {color_pred_loss.item():.6f}"
+                      f"  (MSE of mean color prediction)")
+                mc_pred = mean_color_pred[0].detach().cpu().numpy()
+                mc_gt   = mean_color_gt[0].cpu().numpy()
+                print(f"  mean_color gt:    {mc_gt.round(3)}")
+                print(f"  mean_color pred:  {mc_pred.round(3)}")
+                color_col = UV_gs_batch[:, :, 7:10].detach().cpu().numpy()
+                print(f"  color col range:  [{color_col.min():.3f}, {color_col.max():.3f}]"
+                      f"  (should be negative — these are residuals)")
+            else:
+                color_col = UV_gs_batch[:, :, 7:10].detach().cpu().numpy()
+                print(f"  color col range:  [{color_col.min():.3f}, {color_col.max():.3f}]"
+                      f"  (absolute [0,1])")
+            if semantic_loss.item() > 0:
+                print(f"  semantic_loss:    {semantic_loss.item():.4f}")
 
         if wandb_enabled:
-            log_dict = {
-                "train/step_loss":          loss_value,
-                "train/step_recon_loss":    recon_loss_value,
-                "train/step_kl_loss":       kl_loss_value,
-                "train/step_position_loss": individual_losses['position'],
-                "train/step_color_loss":    individual_losses['color'],
-                "train/step_opacity_loss":  individual_losses['opacity'],
-                "train/step_scale_loss":    individual_losses['scale'],
-                "train/step_rotation_loss": individual_losses['rotation'],
+            log = {
+                "train/step_loss":       loss.item(),
+                "train/step_recon":      recon_loss.item(),
+                "train/step_kl":         KL_loss.item(),
+                "train/step_color_pred": color_pred_loss.item(),
+                "train/step_position":   ind['position'],
+                "train/step_color":      ind['color'],
+                "train/step_opacity":    ind['opacity'],
+                "train/step_scale":      ind['scale'],
+                "train/step_rotation":   ind['rotation'],
             }
             if semantic_metrics:
-                for key, value in semantic_metrics.items():
-                    log_dict[f"train/step_{key}"] = value
-            wandb_run.log(log_dict, step=global_step)
+                log.update({f"train/step_{k}": v for k, v in semantic_metrics.items()})
+            wandb_run.log(log, step=global_step)
 
         global_step += 1
 
-        if i_batch == 0:
-            msg = (f"Epoch {epoch}/{num_epochs} | Loss: {loss_value:.2f} | "
-                   f"Recon: {recon_loss_value:.2f} | KL: {kl_loss_value:.2f}")
-            if semantic_loss_value > 0:
-                msg += f" | Semantic: {semantic_loss_value:.4f}"
-            msg += (f"\n  Pos: {individual_losses['position']:.2f} | "
-                    f"Color: {individual_losses['color']:.2f} | "
-                    f"Opacity: {individual_losses['opacity']:.2f} | "
-                    f"Scale: {individual_losses['scale']:.2f} | "
-                    f"Rot: {individual_losses['rotation']:.2f}")
-            if args.color_loss_weight > 1.0:
-                msg += f" [COLOR_WEIGHT={args.color_loss_weight}]"
-            print(msg)
+    # ── End-of-epoch logging (EVERY epoch) ───────────────────────────────────
+    nb = len(trainDataLoader)
+    print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | "
+          f"Recon={epoch_recon/nb:.4f} | KL={epoch_kl/nb:.4f} | "
+          f"Sem={epoch_sem/nb:.4f} | ColorPred={epoch_color_pred/nb:.6f}")
+    print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
+          f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | "
+          f"Rot={epoch_rot/nb:.3f}")
+    print(f"  mu range: [{mu.min().item():.3f}, {mu.max().item():.3f}]")
 
-    avg_train_loss    = epoch_loss          / len(trainDataLoader)
-    avg_train_recon   = epoch_recon_loss    / len(trainDataLoader)
-    avg_train_kl      = epoch_kl_loss       / len(trainDataLoader)
-    avg_train_semantic= epoch_semantic_loss / len(trainDataLoader)
-    avg_position      = epoch_position_loss / len(trainDataLoader)
-    avg_color         = epoch_color_loss    / len(trainDataLoader)
-    avg_opacity       = epoch_opacity_loss  / len(trainDataLoader)
-    avg_scale         = epoch_scale_loss    / len(trainDataLoader)
-    avg_rotation      = epoch_rotation_loss / len(trainDataLoader)
-
+    # ── Validation ────────────────────────────────────────────────────────────
     val_metrics = None
-    if epoch % eval_every == 0 or epoch == num_epochs - 1:
-        print(f"\n{'='*70}")
-        print(f"VALIDATION (Epoch {epoch})")
-        print(f"{'='*70}")
-
-        val_metrics = evaluate_model(
-            gs_autoencoder, valDataLoader, device, failure_threshold,
-            save_path=save_path, epoch=epoch,
-            enable_pca_vis=enable_semantic,
-            num_vis_scenes=args.pca_num_scenes
-        )
-
-        print(f"  L2 Error:  {val_metrics['avg_l2_error']:.2f}")
-        print(f"  Position:  {val_metrics['position_loss']:.2f}")
-        print(f"  Color:     {val_metrics['color_loss']:.2f}")
-        print(f"  Opacity:   {val_metrics['opacity_loss']:.2f}")
-        print(f"  Scale:     {val_metrics['scale_loss']:.2f}")
-        print(f"  Rotation:  {val_metrics['rotation_loss']:.2f}")
+    if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
+        print(f"\n--- Validation (epoch {epoch}) ---")
+        val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=epoch)
+        print(f"  L2:           {val_metrics['avg_l2_error']:.4f}")
+        print(f"  Position:     {val_metrics['position_loss']:.4f}")
+        print(f"  Color:        {val_metrics['color_loss']:.4f}"
+              f"  {'(residuals)' if args.color_residual else '(absolute)'}")
+        print(f"  Opacity:      {val_metrics['opacity_loss']:.4f}")
+        print(f"  Scale:        {val_metrics['scale_loss']:.4f}")
+        print(f"  Rotation:     {val_metrics['rotation_loss']:.4f}")
+        if args.color_residual:
+            print(f"  ColorPredMSE: {val_metrics['color_pred_loss']:.6f}"
+                  f"  (shape_embed -> mean RGB prediction)")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
             best_epoch    = epoch
-            best_model_path = os.path.join(save_path, "best_model.pth")
             torch.save({
-                'epoch':               epoch,
-                'model_state_dict':    gs_autoencoder.state_dict(),
-                'optimizer_state_dict':optimizer.state_dict(),
-                'val_l2_error':        val_metrics['avg_l2_error'],
-                'semantic_mode':       effective_semantic_mode,
-                'enable_semantic':     enable_semantic,
-                'color_loss_weight':   args.color_loss_weight,
-                'use_canonical_norm':  args.use_canonical_norm,
-                'scale_norm_mode':     args.scale_norm_mode,
-            }, best_model_path)
-            print(f"  New best model! (L2: {best_val_loss:.2f})")
-        print(f"{'='*70}\n")
+                'epoch':                epoch,
+                'model_state_dict':     gs_autoencoder.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_l2_error':         val_metrics['avg_l2_error'],
+                **_ckpt_meta,
+            }, os.path.join(save_path, "best_model.pth"))
+            print(f"  [NEW BEST] L2={best_val_loss:.4f} saved")
 
-    if wandb_enabled:
-        log_dict = {
-            "train/epoch_loss":     avg_train_loss,
-            "train/epoch_recon":    avg_train_recon,
-            "train/epoch_kl":       avg_train_kl,
-            "train/epoch_semantic": avg_train_semantic,
-            "train/epoch":          epoch,
-            "train/epoch_position": avg_position,
-            "train/epoch_color":    avg_color,
-            "train/epoch_opacity":  avg_opacity,
-            "train/epoch_scale":    avg_scale,
-            "train/epoch_rotation": avg_rotation,
-            "best/val_l2_error":    best_val_loss,
-            "best/epoch":           best_epoch,
-        }
-        if val_metrics is not None:
-            log_dict.update({
-                "val/l2_error":       val_metrics['avg_l2_error'],
-                "val/failure_rate":   val_metrics['failure_rate'],
-                "val/position_loss":  val_metrics['position_loss'],
-                "val/color_loss":     val_metrics['color_loss'],
-                "val/opacity_loss":   val_metrics['opacity_loss'],
-                "val/scale_loss":     val_metrics['scale_loss'],
-                "val/rotation_loss":  val_metrics['rotation_loss'],
-            })
-        wandb_run.log(log_dict, step=global_step)
+    if wandb_enabled and val_metrics:
+        wandb_run.log({
+            "val/l2_error":       val_metrics['avg_l2_error'],
+            "val/position_loss":  val_metrics['position_loss'],
+            "val/color_loss":     val_metrics['color_loss'],
+            "val/color_pred_mse": val_metrics['color_pred_loss'],
+            "val/opacity_loss":   val_metrics['opacity_loss'],
+            "val/scale_loss":     val_metrics['scale_loss'],
+            "val/rotation_loss":  val_metrics['rotation_loss'],
+            "best/val_l2":        best_val_loss,
+            "best/epoch":         best_epoch,
+            "train/epoch":        epoch,
+        }, step=global_step)
 
+    # ── Periodic checkpoint ───────────────────────────────────────────────────
     if epoch >= 10 and epoch % 50 == 0:
-        checkpoint_path = os.path.join(save_path, f"epoch_{epoch}.pth")
         torch.save({
-            'epoch':               epoch,
-            'model_state_dict':    gs_autoencoder.state_dict(),
-            'optimizer_state_dict':optimizer.state_dict(),
-            'train_loss':          avg_train_loss,
-            'semantic_mode':       effective_semantic_mode,
-            'enable_semantic':     enable_semantic,
-            'color_loss_weight':   args.color_loss_weight,
-            'use_canonical_norm':  args.use_canonical_norm,
-            'scale_norm_mode':     args.scale_norm_mode,
-        }, checkpoint_path)
-        print(f"Checkpoint saved: epoch_{epoch}.pth")
+            'epoch':                epoch,
+            'model_state_dict':     gs_autoencoder.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss':           epoch_loss / nb,
+            **_ckpt_meta,
+        }, os.path.join(save_path, f"epoch_{epoch}.pth"))
+        print(f"  Checkpoint saved: epoch_{epoch}.pth")
 
 # ============================================================================
 # FINAL SAVE
 # ============================================================================
 
-print("\n" + "="*70)
-print("TRAINING COMPLETE")
-print("="*70)
+print(f"\n{'='*70}\nTRAINING COMPLETE\n{'='*70}")
 
-final_val_metrics = evaluate_model(
-    gs_autoencoder, valDataLoader, device, failure_threshold,
-    save_path=save_path, epoch=num_epochs-1,
-    enable_pca_vis=enable_semantic, num_vis_scenes=args.pca_num_scenes
-)
+final_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=args.num_epochs - 1)
 
 print(f"\nFinal Results:")
-print(f"  Final L2:  {final_val_metrics['avg_l2_error']:.2f}")
-print(f"  Best L2:   {best_val_loss:.2f} (epoch {best_epoch})")
-print(f"\nIndividual Losses:")
-print(f"  Position:  {final_val_metrics['position_loss']:.2f}")
-print(f"  Color:     {final_val_metrics['color_loss']:.2f}")
-print(f"  Opacity:   {final_val_metrics['opacity_loss']:.2f}")
-print(f"  Scale:     {final_val_metrics['scale_loss']:.2f}")
-print(f"  Rotation:  {final_val_metrics['rotation_loss']:.2f}")
+print(f"  Final L2:  {final_metrics['avg_l2_error']:.4f}")
+print(f"  Best L2:   {best_val_loss:.4f} (epoch {best_epoch})")
+print(f"  Position:  {final_metrics['position_loss']:.4f}")
+print(f"  Color:     {final_metrics['color_loss']:.4f}"
+      f"  {'(residuals)' if args.color_residual else '(absolute)'}")
+if args.color_residual:
+    print(f"  ColorPredMSE: {final_metrics['color_pred_loss']:.6f}")
 
-final_path = os.path.join(save_path, "final.pth")
 torch.save({
-    'epoch':               num_epochs - 1,
-    'model_state_dict':    gs_autoencoder.state_dict(),
-    'optimizer_state_dict':optimizer.state_dict(),
-    'final_val_l2':        final_val_metrics['avg_l2_error'],
-    'best_val_l2':         best_val_loss,
-    'best_epoch':          best_epoch,
-    'semantic_mode':       effective_semantic_mode,
-    'enable_semantic':     enable_semantic,
-    'color_loss_weight':   args.color_loss_weight,
-    'use_canonical_norm':  args.use_canonical_norm,
-    'scale_norm_mode':     args.scale_norm_mode,
-    'individual_losses': {
-        'position': final_val_metrics['position_loss'],
-        'color':    final_val_metrics['color_loss'],
-        'opacity':  final_val_metrics['opacity_loss'],
-        'scale':    final_val_metrics['scale_loss'],
-        'rotation': final_val_metrics['rotation_loss'],
-    },
-}, final_path)
+    'epoch':                args.num_epochs - 1,
+    'model_state_dict':     gs_autoencoder.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'final_val_l2':         final_metrics['avg_l2_error'],
+    'best_val_l2':          best_val_loss,
+    'best_epoch':           best_epoch,
+    **_ckpt_meta,
+    'individual_losses': {k: final_metrics[f'{k}_loss'] for k in PARAM_SLICES},
+}, os.path.join(save_path, "final.pth"))
 
-print(f"\nSaved: {final_path}")
+print(f"\nSaved: {save_path}final.pth")
 
 if wandb_enabled:
     wandb_run.summary.update({
-        "final_val_l2_error":   final_val_metrics['avg_l2_error'],
-        "best_val_l2_error":    best_val_loss,
-        "best_epoch":           best_epoch,
-        "semantic_mode":        effective_semantic_mode,
-        "enable_semantic":      enable_semantic,
-        "color_loss_weight":    args.color_loss_weight,
-        "use_canonical_norm":   args.use_canonical_norm,
-        "final_position_loss":  final_val_metrics['position_loss'],
-        "final_color_loss":     final_val_metrics['color_loss'],
-        "final_opacity_loss":   final_val_metrics['opacity_loss'],
-        "final_scale_loss":     final_val_metrics['scale_loss'],
-        "final_rotation_loss":  final_val_metrics['rotation_loss'],
+        "final_val_l2": final_metrics['avg_l2_error'],
+        "best_val_l2":  best_val_loss,
+        "best_epoch":   best_epoch,
     })
     wandb_run.finish()
 
-print("\nTraining complete!")
-print(f"  Canonical norm:  {args.use_canonical_norm}")
-print(f"  Color weight:    {args.color_loss_weight}")
-print(f"  Scale norm mode: {args.scale_norm_mode}")
-if args.resume_checkpoint:
-    print(f"  Resumed from:    {args.resume_checkpoint}")
+print("Done.")

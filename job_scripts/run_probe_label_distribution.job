@@ -1,0 +1,147 @@
+#!/bin/bash
+#SBATCH --job-name=probe_label_dist
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --gpus=1
+#SBATCH --mem=64G
+#SBATCH --time=03:00:00
+#SBATCH --output=logs/probe_%j.out
+#SBATCH --error=logs/probe_%j.err
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROBE LABEL DISTRIBUTION - SLURM JOB
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# USAGE:
+#   sbatch run_probe_label_distribution.sh baseline
+#   sbatch run_probe_label_distribution.sh label
+#   sbatch run_probe_label_distribution.sh semantic
+#
+# label_input is AUTO-DETECTED from checkpoint metadata.
+# No flag needed in probe script — it reads checkpoint['label_input'].
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+mkdir -p logs
+
+PYTHON="/gpfs/home2/yli11/.conda/envs/can3tok/bin/python"
+
+# ── Checkpoint paths ──────────────────────────────────────────────────────────
+CKPT_BASELINE="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20007981_none/final.pth"
+CKPT_SEMANTIC="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_19979090_hidden_beta0.3/final.pth"
+CKPT_LABEL="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20199952_none_labelinput/epoch_1450.pth"
+
+# ── Mode selection ────────────────────────────────────────────────────────────
+MODE="${1:-baseline}"
+
+if   [ "$MODE" == "label"    ]; then CHECKPOINT="$CKPT_LABEL"
+elif [ "$MODE" == "semantic" ]; then CHECKPOINT="$CKPT_SEMANTIC"
+else                                  CHECKPOINT="$CKPT_BASELINE"
+fi
+
+RUN_NAME="probe_${MODE}_job_${SLURM_JOB_ID}"
+
+# ── Dataset / probe config ────────────────────────────────────────────────────
+DATA_DIR="/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
+OUTPUT_DIR="/home/yli11/scratch/Hafeez_thesis/Can3Tok/probe_results"
+CODE_DIR="/home/yli11/scratch/Hafeez_thesis/Can3Tok"
+
+N_TOTAL=2000
+N_VAL=50
+PROJ_HIDDEN=128
+PROJ_OUT=64
+EPOCHS=500
+LR=3e-4
+BATCH_SIZE=64
+WEIGHT_DECAY=1e-4
+PRESENCE_THRESH=0.05
+MIN_LABEL_FREQ=3
+SAMPLING_METHOD=opacity
+SCALE_NORM_MODE=linear
+TARGET_RADIUS=10.0
+
+echo "======================================================================"
+echo "PROBE LABEL DISTRIBUTION EXPERIMENT"
+echo "======================================================================"
+echo "  SLURM Job ID:   $SLURM_JOB_ID"
+echo "  Mode:           $MODE"
+echo "  Checkpoint:     $CHECKPOINT"
+echo "  Run name:       $RUN_NAME"
+echo "  Output dir:     $OUTPUT_DIR/$RUN_NAME"
+echo ""
+echo "  NOTE: label_input is auto-detected from checkpoint metadata."
+echo "        The probe script reads checkpoint['label_input'] and sets"
+echo "        point_feats accordingly before instantiating the model."
+echo "======================================================================"
+
+# ── Verify Python ─────────────────────────────────────────────────────────────
+echo ""
+echo "Checking Python environment..."
+if [ ! -f "$PYTHON" ]; then
+    echo "ERROR: Python not found at $PYTHON"
+    exit 1
+fi
+echo "  Python:  $PYTHON"
+echo "  Version: $($PYTHON --version 2>&1)"
+echo "  NumPy:   $($PYTHON -c 'import numpy; print(numpy.__version__)' 2>&1)"
+echo "  Torch:   $($PYTHON -c 'import torch; print(torch.__version__)' 2>&1)"
+
+# ── Verify paths ──────────────────────────────────────────────────────────────
+echo ""
+echo "Checking paths..."
+if [ ! -f "$CHECKPOINT" ]; then
+    echo "ERROR: Checkpoint not found: $CHECKPOINT"
+    exit 1
+fi
+echo "  Checkpoint: OK  ($CHECKPOINT)"
+
+if [ ! -d "$DATA_DIR" ]; then
+    echo "ERROR: Data directory not found: $DATA_DIR"
+    exit 1
+fi
+echo "  Data dir:   OK"
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+echo ""
+echo "Starting probe..."
+echo "----------------------------------------------------------------------"
+
+cd "$CODE_DIR"
+
+$PYTHON probe_label_distribution.py \
+    --checkpoint        "$CHECKPOINT" \
+    --data_dir          "$DATA_DIR" \
+    --n_total           $N_TOTAL \
+    --n_val             $N_VAL \
+    --proj_hidden       $PROJ_HIDDEN \
+    --proj_out          $PROJ_OUT \
+    --epochs            $EPOCHS \
+    --lr                $LR \
+    --batch_size        $BATCH_SIZE \
+    --weight_decay      $WEIGHT_DECAY \
+    --presence_thresh   $PRESENCE_THRESH \
+    --min_label_freq    $MIN_LABEL_FREQ \
+    --sampling_method   $SAMPLING_METHOD \
+    --scale_norm_mode   $SCALE_NORM_MODE \
+    --target_radius     $TARGET_RADIUS \
+    --normalize_colors \
+    --output_dir        "$OUTPUT_DIR" \
+    --run_name          "$RUN_NAME"
+
+EXIT_CODE=$?
+echo "----------------------------------------------------------------------"
+echo "Exit code: $EXIT_CODE"
+
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "DONE [$MODE]  Results: $OUTPUT_DIR/$RUN_NAME"
+    echo ""
+    echo "Compare baseline vs label runs:"
+    echo "  cat $OUTPUT_DIR/probe_baseline_*/results.json | python -c \\"
+    echo "    \"import json,sys; d=json.load(sys.stdin); \\"
+    echo "    print('Dominant acc:', d['summary']['dominant_label_accuracy']); \\"
+    echo "    print('Macro F1:    ', d['summary']['macro_f1'])\""
+else
+    echo "FAILED [$MODE]  See logs/probe_${SLURM_JOB_ID}.err"
+fi

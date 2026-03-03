@@ -1,0 +1,359 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_hidden_colorresid
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=23:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=64G
+#SBATCH --output=logs/train_colorresid_%j.out
+#SBATCH --error=logs/train_colorresid_%j.err
+
+# ============================================================================
+# CAN3TOK — HIDDEN SEMANTIC + STEP 1 COLOR RESIDUAL (2000 SCENES)
+# ============================================================================
+#
+# What this run tests (Step 1):
+#   Dataset stores color residuals (color - mean_color) instead of absolute RGB.
+#   Model predicts scene mean_color from shape_embed via a tiny MLP head.
+#   Loss: total = recon + kl_weight*KL + segment_weight*InfoNCE
+#               + mean_color_weight * MSE(pred_mean_color, gt_mean_color)
+#
+# Why:
+#   Baseline val color stuck at ~3.14 for 1000 epochs (60x worse than pure baseline).
+#   Root cause: encoder must store absolute scene color in mu, competing with geometry.
+#   Color residual gives shape_embed [B,384] its first gradient signal ever.
+#   shape_embed carries DC color (mean), mu carries AC color (residuals).
+#   Independent gradient paths — no interference between Step 1 and InfoNCE.
+#
+# Expected outcome:
+#   Val color loss drops significantly vs baseline (residuals ~[-0.3,+0.3] not [0,1]).
+#   shape_embed ColorPredMSE decreases toward 0 during training.
+#   Semantic F1 maintained (InfoNCE path unchanged).
+#   mu range stays healthy (±10-14, not collapsed).
+# ============================================================================
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# CHECKPOINT RESUMING
+# ============================================================================
+
+RESUME_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20204665_hidden_colorresidual_beta0.3/best_model.pth"   # path to .pth to resume; empty = fresh start
+RESUME_EPOCH="1000"        # override epoch counter; empty = auto (saved epoch + 1)
+
+# ============================================================================
+# CORE TRAINING FLAGS
+# ============================================================================
+
+BATCH_SIZE=64
+# Scenes per gradient step.
+
+NUM_EPOCHS=1500
+# 2000 scenes / 64 = 31 batches/epoch → 31,000 total gradient steps.
+
+LEARNING_RATE=1e-5
+# Adam LR. Same across all runs.
+
+KL_WEIGHT=1e-5
+# Weight on KL divergence. Low value keeps mu from collapsing.
+
+EVAL_EVERY=20
+# Run validation every N epochs.
+
+FAILURE_THRESHOLD=100
+# Per-scene L2 above this is logged as a failure. Diagnostic only.
+
+# ============================================================================
+# STEP 1: COLOR RESIDUAL FLAGS
+# ============================================================================
+
+COLOR_RESIDUAL=True
+# Enable Step 1. Dataset computes mean_color after top-40k sampling,
+# stores (color - mean_color) as the color feature, returns mean_color
+# in batch dict. Model adds MeanColorHead on shape_embed.
+
+MEAN_COLOR_WEIGHT=1.0
+# Weight on MSE(pred_mean_color, gt_mean_color).
+# total_loss += mean_color_weight * color_pred_loss
+# 1.0 = equal footing with reconstruction. Tune if ColorPredMSE is stuck.
+
+COLOR_LOSS_WEIGHT=1.0
+# Weight on the color component of the main reconstruction loss.
+# 1.0 = equal weighting. Color residuals have smaller dynamic range
+# so this should be fine at 1.0; increase if residual recon is poor.
+
+# ============================================================================
+# SEMANTIC (HIDDEN INFONCE) FLAGS
+# ============================================================================
+
+SEMANTIC_MODE="hidden"
+# 'hidden' = InfoNCE on GS_decoder last hidden layer [B,1024].
+# SemanticProjectionHead: hidden -> MLP -> [B, 40000, 32] L2-norm.
+# Positive pair = same ScanNet72 segment label.
+
+SEGMENT_WEIGHT=0.3
+# Beta weight on InfoNCE loss. Must be >0 for semantic to activate.
+# BOTH --semantic_mode and --segment_loss_weight >0 are required
+# (gs_can3tok_2.py checks: semantic_requested AND semantic_loss_enabled).
+
+INSTANCE_WEIGHT=0.0
+# Instance-level contrastive loss weight. Disabled.
+
+SEMANTIC_TEMP=0.07
+# InfoNCE temperature. 0.07 = standard SimCLR. Lower = harder negatives.
+
+SEMANTIC_SUBSAMPLE=10000
+# Gaussians sampled per scene for InfoNCE. 2000 balances coverage vs memory.
+
+SAMPLING_STRATEGY="balanced"
+# 'balanced' = equal counts per ScanNet72 label class (reduces wall/floor bias).
+# 'random' = uniform random sample from 40k Gaussians.
+
+# ============================================================================
+# LABEL INPUT  (DISABLED for this run)
+# ============================================================================
+
+# label_input=False: standard 18-col tensor, encoder Linear(11, d_model).
+# Do not pass --label_input below.
+# Requires point_feats: 11 in shapevae-256.yaml.
+
+# ============================================================================
+# DATASET FLAGS
+# ============================================================================
+
+TRAIN_SCENES=300
+# Training scenes. 2000/64 = 31 batches/epoch.
+
+VAL_SCENES=50
+# Validation scenes. Fixed at 50 for comparability across all runs.
+
+SAMPLING_METHOD="opacity"
+# 'opacity' = keep top-40k by opacity (most visible Gaussians).
+
+# ============================================================================
+# NORMALIZATION FLAGS
+# ============================================================================
+
+USE_CANONICAL_NORM=True
+# Normalise each scene to a canonical sphere (radius=10m).
+# Must match any checkpoint you resume from.
+
+SCALE_NORM_MODE="linear"
+# 'linear' = scale * factor → small positive metres, decoder uses exp().
+# Consistent with all prior hidden-mode runs.
+
+# ============================================================================
+# VISUALIZATION FLAGS
+# ============================================================================
+
+PCA_VIS_FREQ=50
+# Save PCA plots of per-Gaussian semantic features every N epochs.
+
+PCA_NUM_SCENES=3
+# Scenes to visualise per PCA run.
+
+PCA_BRIGHTNESS=1.25
+# Brightness multiplier for PCA color output images.
+
+RECON_PLY_FREQ=50
+# Save reconstructed .ply Gaussian files every N epochs.
+# Step 1 NOTE: training loop adds mean_color back to residuals before saving,
+# so .ply files contain absolute RGB (correct color).
+
+RECON_PLY_NUM_SCENES=3
+# Scenes to reconstruct per PLY save.
+
+RECON_PLY_MAX_SH=3
+# Max spherical harmonics degree in saved PLY files.
+
+# ============================================================================
+# W&B
+# ============================================================================
+
+export WANDB_API_KEY="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"
+USE_WANDB=False
+# Set True to log to W&B. Key metrics to watch:
+#   val/color_pred_mse  — should decrease as shape_embed learns mean RGB
+#   val/color_loss      — residual recon (should be lower than absolute baseline ~3.14)
+#   val/l2_error        — overall reconstruction quality
+
+# ============================================================================
+# CONFIGURATION SUMMARY
+# ============================================================================
+
+echo "========================================================================"
+echo "  STEP 1 COLOR RESIDUAL + HIDDEN INFONCE CONFIGURATION"
+echo "========================================================================"
+echo "  color_residual:    $COLOR_RESIDUAL  (mean subtracted from color features)"
+echo "  mean_color_weight: $MEAN_COLOR_WEIGHT  (MSE weight for shape_embed prediction)"
+echo "  semantic_mode:     $SEMANTIC_MODE  (InfoNCE on GS_decoder hidden [B,1024])"
+echo "  segment_weight:    $SEGMENT_WEIGHT  (beta; both this AND mode must be set)"
+echo "  label_input:       DISABLED  (point_feats=11, 18-col tensor)"
+echo "  train_scenes:      $TRAIN_SCENES"
+echo "  val_scenes:        $VAL_SCENES"
+echo "  epochs:            $NUM_EPOCHS  (31 batches/epoch = 31,000 steps)"
+echo "  batch_size:        $BATCH_SIZE"
+echo "  lr:                $LEARNING_RATE"
+echo "  kl_weight:         $KL_WEIGHT"
+echo "  scale_norm_mode:   $SCALE_NORM_MODE"
+echo "  color_loss_weight: $COLOR_LOSS_WEIGHT"
+echo ""
+echo "  Gradient paths:"
+echo "    recon:       L2_recon -> GS_decoder -> mu"
+echo "    InfoNCE:     InfoNCE  -> SemanticHead -> GS_decoder hidden -> mu"
+echo "    Step 1:      MSE_color -> MeanColorHead -> shape_embed -> encoder token 0"
+echo "    (all three paths are independent)"
+echo ""
+echo "  Prior baseline (no Step 1): val color ~3.14 (residuals ~[-0.3,+0.3] expected much lower)"
+echo "  Target: val ColorPredMSE < 0.01, F1 > 0.70, Val L2 < 0.15"
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# ENVIRONMENT SETUP
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
+site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs checkpoints
+
+if [ "$USE_WANDB" = "True" ]; then
+    wandb login $WANDB_API_KEY --relogin 2>/dev/null
+fi
+
+# ============================================================================
+# PRE-FLIGHT: point_feats must be 11 (label_input=False)
+# ============================================================================
+
+YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+if [ -f "$YAML_PATH" ]; then
+    POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
+    if [ "$POINT_FEATS" != "11" ]; then
+        echo "ERROR: point_feats=$POINT_FEATS in yaml, expected 11 (label_input=False)"
+        echo "       Reset point_feats to 11 in $YAML_PATH before submitting."
+        exit 1
+    fi
+    echo "  point_feats=11 confirmed in $YAML_PATH"
+else
+    echo "  WARNING: $YAML_PATH not found — skipping point_feats check"
+fi
+echo ""
+
+# ============================================================================
+# BUILD TRAINING COMMAND
+# ============================================================================
+
+TRAIN_CMD="python gs_can3tok_2.py"
+
+# Core training
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
+TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
+TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
+
+# Dataset
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
+TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
+TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+
+# Step 1: Color residual
+# --color_residual       : enables color - mean_color in dataset AND MeanColorHead in model
+# --mean_color_weight    : weight on MSE(pred_mean, gt_mean) in total loss
+if [ "$COLOR_RESIDUAL" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --color_residual"
+fi
+TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
+
+# Semantic: hidden InfoNCE
+# BOTH --semantic_mode hidden AND --segment_loss_weight >0 are required
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
+TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
+TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
+
+# No --label_input flag → defaults to False → 18-col tensor, point_feats=11
+
+# Normalization
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+if [ "$USE_CANONICAL_NORM" = "False" ]; then
+    TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+fi
+
+# Visualization
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
+TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+
+# W&B
+if [ "$USE_WANDB" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --use_wandb"
+    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-Semantic"
+    TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
+fi
+
+# Checkpoint resuming
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
+    [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
+fi
+
+echo "Command: $TRAIN_CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $TRAIN_CMD
+TRAIN_EXIT=$?
+echo ""
+echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_hidden_colorresidual_beta${SEGMENT_WEIGHT}"
+
+if [ $TRAIN_EXIT -eq 0 ]; then
+    echo ""
+    echo "Checkpoints: $CKPT_DIR"
+    echo ""
+    echo "NEXT STEPS:"
+    echo "  1. Check val color metrics:"
+    echo "       grep -E 'Color|ColorPred' logs/train_colorresid_${SLURM_JOB_ID}.out | tail -30"
+    echo "       val/color_loss     < 0.5  : Step 1 resolved the color plateau"
+    echo "       val/color_pred_mse < 0.01 : shape_embed is learning mean RGB"
+    echo ""
+    echo "  2. Run probe to get F1:"
+    echo "       Set CKPT_SEMANTIC=$CKPT_DIR/best_model.pth in run_probe_label_distribution.sh"
+    echo "       sbatch run_probe_label_distribution.sh"
+    echo "       Target: F1 > 0.70 (same as hidden baseline, Step 1 should not hurt)"
+    echo ""
+    echo "  3. Compare to prior runs:"
+    echo "       Baseline (no step 1):          val color ~3.14, F1=0.490"
+    echo "       Hidden InfoNCE (no step 1):    val color ~3.14, F1=0.642"
+    echo "       This run (step 1 + InfoNCE):   val color target <0.5,  F1 target >0.70"
+    echo ""
+    echo "  4. Resume if time limit hit:"
+    echo "       RESUME_CHECKPOINT=$CKPT_DIR/best_model.pth"
+    echo "       (resume verifies color_residual=True matches checkpoint)"
+else
+    echo ""
+    echo "FAILED. Common fixes:"
+    echo "  Model forward returns 7 values — ensure all callers unpack correctly."
+    echo "  OOM: reduce SEMANTIC_SUBSAMPLE to 1000"
+    echo "  Semantic not activating: check SEGMENT_WEIGHT > 0 AND SEMANTIC_MODE != none"
+    echo "  point_feats wrong: grep point_feats $YAML_PATH  (must be 11)"
+    echo "  Error log: cat logs/can3tok_${SLURM_JOB_ID}.err"
+fi
