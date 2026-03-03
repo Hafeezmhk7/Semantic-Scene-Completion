@@ -1,462 +1,374 @@
-# Semantic-Aware Can3Tok: 3D Scene Generation with Semantic Scene Completion
+# Can3Tok VAE — Semantic-Aware 3D Scene Tokenizer
 
-## Implementation Differences from Original Can3Tok
+A Perceiver-based Variational Autoencoder that encodes full indoor 3DGS scenes into a structured latent space, with DC/AC color decomposition and semantic InfoNCE supervision. Built on SceneSplat-7K as the foundation for generative scene completion.
 
-### 1. Dataset Format and Normalization
+---
 
-**Can3Tok Original:**
-- Data Format: Raw 3DGS PLY files
-- Scale Storage: Log-space (stores `log(scale_meters)`)
-- Canonical Normalization:
+## Architecture Overview
+
+### Input Representation
+Each scene is represented as **40,000 Gaussians** (sampled by opacity), each with 14 parameters:
+
+```
+[x, y, z,  r, g, b,  opacity,  sx, sy, sz,  qw, qx, qy, qz]
+  (3)       (3)       (1)       (3)           (4)
+```
+
+The dataset assembles an **18-channel feature vector** per Gaussian for the encoder:
+
+```
+[voxel_center(3), voxel_id(1), xyz(3), color(3), opacity(1), scale(3), quat(4)]
+```
+
+Input tensor shape: **`[B, 40000, 18]`**
+
+---
+
+### Encoder — `CrossAttentionEncoder`
+
+A Perceiver-style encoder with **dual Fourier positional embeddings**:
+
+```
+Input [B, 40000, 18]
+  -> Fourier(voxel_centers)   # coarse spatial — assigns each Gaussian to a 40³ voxel grid
+  -> Fourier(xyz_positions)   # fine spatial   — exact Gaussian location within voxel
+  -> Concatenate [fourier_voxel, fourier_xyz, gaussian_params]
+  -> Input projection -> width=384
+  -> Cross-attention: 512 learned queries attend to all 40k Gaussians
+  -> 6x Self-attention transformer layers
+Output: [B, 512, 384]
+```
+
+Why dual Fourier? The voxel embedding gives structural context (which part of the room) while the exact xyz gives fine-grained position. Together they prevent aliasing of nearby Gaussians that happen to share a voxel.
+
+---
+
+### VAE Bottleneck
+
+The 512 latent tokens are split into two parts:
+
+```
+[B, 512, 384]
+  -> split: shape_embed [B, 1, 384]  +  latent_tokens [B, 511, 384]
+  -> project to mu, log_var
+  -> z = mu + sigma * eps  (reparameterization)
+Output: [B, 512, 32]
+```
+
+**`shape_embed`** is the global scene token — a single vector meant to carry the overall scene identity. It is the most important token in the representation, and also the hardest to train (see Color Residual section below).
+
+---
+
+### Decoder — `GS_decoder`
+
+A flat MLP decoder that reconstructs all 40,000 Gaussians from the latent:
+
+```
+[B, 512, 32]
+  -> post-KL projection -> [B, 512, 384]
+  -> 12x Transformer self-attention layers
+  -> Flatten -> [B, 512*384 = 196608]
+  -> 8-layer MLP
+  -> Raw output [B, 40000, 14]
+  -> Activations:
+       colors    -> sigmoid  -> [0, 1]
+       opacity   -> sigmoid  -> [0, 1]
+       scales    -> softplus -> (0, +∞)
+       quats     -> L2 norm  -> ||q|| = 1
+Output: [B, 40000, 14]
+```
+
+---
+
+### Semantic Head — `SemanticProjectionHead`
+
+Extracts per-Gaussian semantic features for contrastive supervision. Three modes:
+
+| Mode | Input | Path | Output |
+|------|-------|------|--------|
+| `geometric` | GS params `[B, 40k, 14]` | 3-layer MLP | `[B, 40k, 32]` |
+| `hidden` | Decoder hidden state `[B, 1024]` | MLP → reshape | `[B, 40k, 32]` |
+| `attention` | Positions + transformer tokens | Cross-attention | `[B, 40k, 32]` |
+
+All outputs are L2-normalized to a unit hypersphere. `hidden` mode gave the best L2 reconstruction. `geometric` mode gave the cleanest scale distribution.
+
+---
+
+## Concept 1 — DC/AC Color Residual Decomposition
+
+This is the primary architectural contribution. It solves a fundamental gradient starvation problem in the original design.
+
+### The Problem: `shape_embed` Gradient Starvation
+
+In the original Can3Tok encoder, the 512 latent tokens are split into:
+- `shape_embed`: 1 token → `[B, 1, 384]` → compressed to `[B, 1, 32]`
+- `latent_tokens`: 511 tokens → `[B, 511, 384]` → compressed to `[B, 511, 32]`
+
+`shape_embed` is intended to be a **global scene descriptor** — it should encode the overall room identity. However, during training it receives almost no gradient signal because:
+
+1. The decoder reconstructs 40,000 Gaussians from 512 tokens combined
+2. The 511 `latent_tokens` have sufficient capacity to explain the per-Gaussian variation
+3. `shape_embed` has no dedicated supervision path — it can be nearly zero with no penalty
+4. Without a gradient, `shape_embed` collapses to carrying no meaningful information
+
+The result: the encoder bottleneck is broken. `mu` tries to encode both local geometry *and* global scene color, causing reconstruction collapse.
+
+---
+
+### The Solution: Two-Level Color Decomposition
+
+Inspired by VQ-VAE-2's hierarchical latent structure, we split color encoding into two levels:
+
+**Level 1 (DC — Global Color):** `shape_embed` → `MeanColorHead` → predicts the scene mean color
+
+**Level 2 (AC — Local Residuals):** `latent_tokens` / `mu` → encode per-Gaussian color *deviations* from the mean
+
+This gives `shape_embed` a concrete, measurable task with direct gradient flow.
+
+---
+
+### Implementation: Dataset Side
+
+**`gs_dataset_scenesplat.py`** — preprocessing step during data loading:
+
 ```python
-  # Positions
-  positions_norm = (positions - center) * scale_factor
+# Per-scene, applied to color.npy [N, 3] where N ~ millions of Gaussians
+scene_mean_color = color.mean(axis=0)          # [3]  — the DC component
+color_residuals  = color - scene_mean_color    # [N, 3]  range ~ [-0.3, +0.3]
 
-  # Scales (log-space arithmetic)
-  scales_norm = scales + log(scale_factor)
-  # Because: log(scale_new) = log(scale_old x factor)
-  #                          = log(scale_old) + log(factor)
+# Store both
+scene['color']            = color_residuals    # replaces absolute RGB [0,1]
+scene['mean_color_label'] = scene_mean_color   # supervision target for shape_embed
 ```
 
-**Our Implementation:**
-- Data Format: SceneSplat preprocessed .npy files
-- Scale Storage: Linear-space (stores `scale_meters` after exp())
-- Canonical Normalization:
+The assembled feature tensor now contains residuals in the color channels:
+
+```
+Before: [voxel_center(3), voxel_id(1), xyz(3),  color_absolute(3),  opacity(1), scale(3), quat(4)]
+After:  [voxel_center(3), voxel_id(1), xyz(3),  color_residual(3),  opacity(1), scale(3), quat(4)]
+```
+
+Shape is unchanged: **`[B, 40000, 18]`**. The difference is that the 3 color channels now range over `[-0.3, +0.3]` (zero-centered residuals) instead of `[0, 1]` (absolute RGB).
+
+---
+
+### Implementation: Model Side
+
+**`sal_perceiver_II_initialization.py`** — `MeanColorHead` is a small MLP attached to `shape_embed`:
+
 ```python
-  # Positions (same as Can3Tok)
-  positions_norm = (positions - center) * scale_factor
+class MeanColorHead(nn.Module):
+    def __init__(self, embed_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3),
+            nn.Sigmoid()          # output in [0, 1] — matches original RGB range
+        )
 
-  # Scales (linear-space arithmetic)
-  scales_norm = scales * scale_factor
-  # Direct multiplication because scales are already in meters
+    def forward(self, shape_embed_z):
+        # shape_embed_z: [B, 32]  (the post-KL compressed shape token)
+        return self.net(shape_embed_z)   # -> [B, 3]
 ```
 
-Note: Log-space scale loss was tested and abandoned. It caused immediate
-scale collapse to <1cm because the loss domain mismatches the linear-space
-targets. Standard L2 on linear-space scales with softplus activation is
-the correct formulation for our dataset.
+During forward pass:
 
-**Location:** `normalize_to_canonical_sphere()` in `gs_dataset_scenesplat.py`
+```
+shape_embed_z [B, 32]  ->  MeanColorHead  ->  mean_color_pred [B, 3]
+```
 
-### 2. Model Output
-- 14 parameters including RGB colors (xyz, rgb, opacity, scale, quaternion)
-
-### 3. Decoder Architecture
-- Can3Tok: Raw outputs without explicit activations
-- Our Implementation: Added activation functions in final layer:
-  - Colors: sigmoid -> [0, 1]
-  - Opacity: sigmoid -> [0, 1]
-  - Scales: softplus -> (0, +inf)
-  - Quaternions: L2 normalization -> ||q|| = 1.0
-- Location: `GS_decoder` class in `sal_perceiver_II_initialization.py`
-
-### 4. Encoder Structure
-- Fixed Issue: Previously missing voxel center Fourier embeddings
-- Current: Dual Fourier embeddings (voxel centers + actual xyz positions)
-- Location: `CrossAttentionEncoder` in `sal_perceiver_II_initialization.py`
-
----
-## File Structure and Usage
-
-### Training Files
-
-**Main Training Script:**
-- `gs_can3tok_2.py` - Primary training script with all loss functions and training loop
-
-**Model Architecture:**
-- `model/michelangelo/models/tsal/sal_perceiver_II_initialization.py` - Contains:
-  - `AlignedShapeLatentPerceiver` - Main VAE model with 3 semantic modes
-  - `CrossAttentionEncoder` - Encoder with dual Fourier embeddings
-  - `GS_decoder` - Decoder with activation functions (outputs 14 params)
-  - `SemanticProjectionHead` classes - For semantic feature extraction
-
-**Dataset Loading:**
-- `gs_dataset_scenesplat.py` - Loads SceneSplat scenes with ScanNet72 labels
-  - Handles importance sampling (top 40k Gaussians by opacity, deterministic)
-  - Voxelization for positional encoding
-  - Canonical sphere normalization
-
-**Loss Functions:**
-- `semantic_losses.py` - Contains:
-  - `ScanNet72SemanticLoss` - InfoNCE contrastive loss for semantic learning
-  - Handles segment-level supervision
-
-**PLY Reconstruction:**
-- `gs_ply_reconstructor.py` - Converts model outputs to 3DGS PLY format
-  - RGB to SH coefficient conversion: `f_dc = (RGB - 0.5) / C0`
-  - Inverts activations: logit(opacity), log(scale)
-  - Normalizes quaternions
-
-**Visualization:**
-- `pca_feature_visualization.py` - PCA coloring of per-Gaussian semantic features
-  - Writes PLY files viewable in CloudCompare
-  - No Open3D dependency, uses plyfile only
-- `visualize_input_pca.py` - Standalone script to generate PCA visualizations
-  of raw input scenes (no model forward pass needed)
-  - Outputs per scene: position PCA, original colors, scale PCA,
-    opacity grayscale, all-params PCA
-
-**Configuration:**
-- `model/configs/aligned_shape_latents/shapevae-256.yaml` - VAE architecture config
-
-**Job Submission:**
-- `job_can3tok.sh` - SLURM job script for cluster training
+The prediction is stored as `self.last_mean_color_pred` on the model instance — this avoids changing the return signature of the encoder and keeps `asl_pl_module.py` untouched.
 
 ---
 
-## Training Pipeline Flow
+### Implementation: Loss Side
 
-### 1. Data Loading (gs_dataset_scenesplat.py)
-```
-For each scene:
-1. Load .npy files (coord, color, opacity, scale, quat, segment, instance)
-2. Sample top 40k Gaussians by opacity (deterministic argsort, same every epoch)
-3. Apply canonical sphere normalization:
-   - Center positions at origin
-   - Scale to fit in 10m radius sphere
-   - Scale proportionally applies to scales (linear space)
-4. Voxelize: assign each Gaussian to 40x40x40 grid (resolution=0.4m)
-5. Assemble 18-channel features:
-   [voxel_centers(3), voxel_id(1), xyz(3), color(3), opacity(1), scale(3), quat(4)]
-6. Return: features, segment_labels, instance_labels
+**`gs_can3tok_2.py`** — additional MSE loss on mean color prediction:
+
+```python
+# mean_color_pred: [B, 3]  — from MeanColorHead(shape_embed_z)
+# mean_color_label: [B, 3] — from dataset preprocessing
+color_pred_loss = F.mse_loss(mean_color_pred, mean_color_label)
+
+# Total loss
+L_total = L_recon + kl_weight * L_KL + beta * L_semantic + lambda_color * color_pred_loss
 ```
 
-### 2. Forward Pass (sal_perceiver.py)
+This loss creates a **direct gradient path** from the color prediction error back through `MeanColorHead` into `shape_embed_z`, and from there back through the KL bottleneck into the encoder's `shape_embed` token.
+
+---
+
+### Information Flow Summary
+
 ```
-Input: [B, 40k, 18] features
+ENCODER
+  40k Gaussians (residual colors) -> CrossAttentionEncoder
+    -> shape_embed [B, 1, 384]   <- now has a real job
+    -> latent_tokens [B, 511, 384]
 
-ENCODER:
-1. Extract voxel_centers and xyz from features
-2. Apply dual Fourier embeddings:
-   - voxel_centers -> Fourier -> coarse spatial encoding
-   - xyz -> Fourier -> fine spatial encoding
-3. Concatenate [xyz_fourier, voxel_fourier, gaussian_params]
-4. Input projection -> transformer width
-5. Cross-attention: queries attend to Gaussian features
-6. Self-attention: refine latent tokens
-   Output: [B, 512, 384] latent tokens
+VAE BOTTLENECK
+  shape_embed -> mu_shape [B, 1, 32] -> z_shape [B, 32]
+                                             |
+                                     MeanColorHead
+                                             |
+                                   mean_color_pred [B, 3]
+                                             |
+                              MSE loss vs mean_color_label [B, 3]  ← gradient flows back here
 
-VAE BOTTLENECK:
-1. Split: shape_embed [B, 384] + latents [B, 511, 384]
-2. Project to mean mu and log_var
-3. Sample: z = mu + sigma * epsilon
-   Output: [B, 512, 32] compressed latents
+  latent_tokens -> mu [B, 511, 32] -> z [B, 511*32]
+                                             |
+                              Decoder reconstructs color_residuals [B, 40k, 3]
+                              (fine AC detail — not the mean)
 
-DECODER:
-1. Post-KL projection: [B, 512, 32] -> [B, 512, 384]
-2. Transformer self-attention
-3. Flatten: [B, 512*384]
-4. 8-layer MLP decoder with activations:
-   - Raw output: [B, 40k, 14]
-   - Apply sigmoid(colors), sigmoid(opacity), softplus(scales), normalize(quat)
-   Output: [B, 40k, 14] activated Gaussians
-
-SEMANTIC HEAD (if enabled):
-1. Extract features from decoder hidden state or Gaussian params
-2. Project to [B, 40k, 32] per-Gaussian features
-3. L2 normalize features
-   Output: [B, 40k, 32] semantic features
-```
-
-### 3. Loss Computation (gs_can3tok_2.py)
-```
-RECONSTRUCTION LOSS:
-L_recon = ||Gaussians_pred - Gaussians_target||_2 / batch_size
-Standard L2 across all 14 parameters. Scale loss computed in linear space.
-
-KL DIVERGENCE:
-L_KL = KL(q(z|x) || N(0,I)) weighted by kl_weight (1e-6)
-KL loss reaches 50k-100k in magnitude but effective gradient contribution
-is kl_weight * KL = 0.05-0.10, which is manageable.
-
-SEMANTIC LOSS (if semantic_mode != 'none'):
-1. For each scene, extract valid Gaussians with segment labels
-2. Subsample 10k Gaussians for efficiency
-3. Create category prototypes by averaging features per category
-4. Compute InfoNCE loss with temperature=0.1
-L_segment = CrossEntropy(similarity_matrix, target_categories)
-Weighted by segment_loss_weight (default 0.3)
-
-TOTAL LOSS:
-L_total = L_recon + kl_weight * L_KL + segment_loss_weight * L_segment
-```
-
-### 4. Training Loop
-```
-For each epoch:
-  For each batch:
-    1. Load batch of scenes with features and labels
-    2. Forward pass through model
-    3. Compute losses
-    4. Backward pass and optimizer step
-    5. Log metrics (L2 error, individual parameter losses)
-
-  Every eval_every epochs (default 50):
-    - Run validation
-    - Save checkpoint
-    - Reconstruct scenes to PLY files (if epoch % recon_ply_freq == 0)
-    - Generate PCA visualizations (if semantic enabled and epoch % pca_vis_freq == 0)
-    - Track best model by validation L2 error
-```
-
-Note: PCA visualization only writes files when both eval_every and
-pca_vis_freq conditions are satisfied simultaneously. Set pca_vis_freq
-equal to eval_every to get PCA at every validation checkpoint.
-
-### 5. PLY Reconstruction (gs_ply_reconstructor.py)
-```
-Input: [B, 40k, 14] model predictions (post-activation)
-
-For each scene:
-1. Extract parameters:
-   - positions [40k, 3]
-   - colors [40k, 3] in [0,1]
-   - opacity [40k, 1] in [0,1]
-   - scales [40k, 3] in (0, inf)
-   - quaternions [40k, 4] normalized
-
-2. Convert to PLY format:
-   - colors: f_dc = (RGB - 0.5) / C0  (SH coefficient conversion)
-   - opacity: logit(opacity) = log(p / (1-p))  (inverse sigmoid)
-   - scales: log(scale)  (inverse softplus)
-   - quaternions: already normalized
-
-3. Write to .ply file
-4. View in supersplat.at
+RECONSTRUCTION
+  final_color [B, 40k, 3] = mean_color_pred [B, 1, 3] + color_residual_pred [B, 40k, 3]
 ```
 
 ---
 
-## Current Training Configuration
+### Why It Works: Dimensional Analysis
 
-### Validated Hyperparameters
+| Component | Tensor | What it encodes |
+|-----------|--------|-----------------|
+| `shape_embed_z` | `[B, 32]` | Global scene identity: overall room tone, lighting character |
+| `mean_color_pred` | `[B, 3]` | Scene-level DC color (e.g. warm yellow room vs cool grey room) |
+| `mu` / `z` (latent) | `[B, 511, 32]` | Per-region AC color residuals + all geometry |
+| `color_residuals` in features | `[B, 40000, 3]` | Per-Gaussian deviation from scene mean |
+
+Before this change, `shape_embed_z` had to somehow encode global color via the reconstruction loss through 40,000 Gaussians — a vanishingly small gradient. Now it has a direct 3-dimensional prediction task that provides strong, clean gradients every step.
+
+---
+
+### Ablation Results
+
+| Configuration | Validation L2 | ΔL2 |
+|--------------|--------------|-----|
+| Baseline (no color residual, no semantic) | 3.23 | — |
+| Color residual only | 2.49 | **−23%** |
+| Semantic InfoNCE only (β=0.3) | 3.30 | marginal |
+| Color residual + Semantic (full model) | 2.05 | **−37%** |
+| Extended training (15K epochs, lr=1e-5) | 1.58 | **−51%** |
+
+The 23% jump from color residual alone confirms the gradient starvation diagnosis. Semantic InfoNCE adds an independent 18% improvement (2.49 → 2.05) because the two gradient paths target different parts of the network — `shape_embed` vs decoder hidden state.
+
+---
+
+##  Concept 2 — Semantic InfoNCE Supervision
+
+Per-Gaussian contrastive learning using ScanNet72 category labels as supervision signal.
+
+**`semantic_losses.py`** — `ScanNet72SemanticLoss`:
+
+```
+For each scene in batch:
+  1. Extract semantic features from SemanticProjectionHead [40k, 32]
+  2. Subsample 10k Gaussians (balanced across categories to prevent wall/floor dominance)
+  3. Compute category prototypes: mean feature per ScanNet72 class
+  4. InfoNCE loss with temperature=0.1:
+       L = -log[ exp(sim(f_i, proto_c) / τ) / Σ_j exp(sim(f_i, proto_j) / τ) ]
+```
+
+Effect: Gaussians from the same semantic category are pulled together in the 32-dim feature space; Gaussians from different categories are pushed apart. The PCA visualization at epoch 1200 confirms this — ceiling Gaussians cluster in blue/cyan, furniture in red/pink, with clean category separation emerging without instance-level supervision.
+
+---
+
+## Training Configuration
+
 ```python
 # Architecture
-num_latents = 256
-embed_dim = 32
-width = 384
-num_encoder_layers = 6
-num_decoder_layers = 12
+num_latents       = 256
+embed_dim         = 32
+width             = 384
+encoder_layers    = 6
+decoder_layers    = 12
 
 # Optimization
-learning_rate = 1e-4
-batch_size = 64
-epochs = 700
-kl_weight = 1e-6           # Critical: 1e-5 causes KL to dominate at late epochs
+learning_rate     = 1e-4
+batch_size        = 64
+kl_weight         = 1e-6    # 1e-5 causes KL to dominate at late epochs
 
-# Loss
-scale_norm_mode = 'linear'  # Do not use 'log': causes immediate scale collapse
-segment_loss_weight = 0.3   # For semantic runs
+# Color residual
+color_residual    = True
+lambda_color      = 1.0     # MSE weight on mean color prediction
+
+# Semantic
+semantic_mode     = 'hidden'
+segment_loss_weight = 0.3
 semantic_temperature = 0.1
 semantic_subsample = 10000
-
-# Dataset
-sampling_method = 'opacity'    # Deterministic top-40k by opacity
-canonical_normalization = True  # 10m radius sphere
-train_scenes = 300
-val_scenes = 30
-eval_every = 50
-```
-
-### Semantic Modes
-```bash
---semantic_mode none        # No semantic learning (pure VAE)
---semantic_mode geometric   # Per-splat projection from 14-dim Gaussian params
---semantic_mode hidden      # Projection from 1024-dim decoder hidden state
---semantic_mode attention   # Cross-attention between positions and transformer tokens
 ```
 
 ---
 
-## Running Training
+## Dataset: SceneSplat-7K with ScanNet72 Labels
 
-### Basic Training (No Semantics)
-```bash
-python gs_can3tok_2.py \
-    --batch_size 64 \
-    --num_epochs 700 \
-    --lr 1e-4 \
-    --kl_weight 1e-6 \
-    --scale_norm_mode linear \
-    --semantic_mode none \
-    --train_scenes 300 \
-    --eval_every 50
-```
+**Source:** SceneSplat (ICCV 2025 Oral, Li et al. 2025) — 7,916 indoor scenes from ScanNet, ScanNet++, Replica, Hypersim, 3RScan, ARKitScenes, Matterport3D.
 
-### Training with Semantic Learning
-```bash
-python gs_can3tok_2.py \
-    --batch_size 64 \
-    --num_epochs 700 \
-    --lr 1e-4 \
-    --kl_weight 1e-6 \
-    --scale_norm_mode linear \
-    --semantic_mode geometric \
-    --segment_loss_weight 0.3 \
-    --semantic_subsample 10000 \
-    --train_scenes 300 \
-    --eval_every 50
-```
-
-### Generate Input Scene PCA Visualizations
-```bash
-python visualize_input_pca.py \
-    --num_scenes 5 \
-    --output_dir ./input_pca_vis \
-    --sampling_method opacity \
-    --scale_norm_mode linear
-```
-
-Outputs 5 PLY files per scene for comparison with model PCA in CloudCompare:
-position PCA, original colors, scale PCA, opacity grayscale, all-params PCA.
-
----
-
-## Evaluation Metrics
-
-### Reconstruction Quality
-
-1. **L2 Error** (primary metric)
-```python
-L2_error = ||G_pred - G_true||_2 / batch_size
-```
-
-2. Individual parameter losses tracked separately for position, color,
-   opacity, scale, and rotation to diagnose training dynamics.
-
-3. Scale distribution tracked across bins (<5cm, 5-10cm, 10-20cm, >20cm)
-   as a proxy for geometric representation quality.
-
----
-
-## Dataset: SceneSplat with ScanNet72 Labels
-
-### Dataset Structure
-
-Each scene directory contains:
+Each scene directory:
 ```
 scene_dir/
-├── coord.npy          # [N, 3] Gaussian positions
-├── color.npy          # [N, 3] RGB values
-├── scale.npy          # [N, 3] Anisotropic scales (linear space, metres)
-├── quat.npy           # [N, 4] Rotation quaternions
-├── opacity.npy        # [N] Opacity values [0,1]
-├── segment.npy        # [N] ScanNet72 category labels (0-71)
-└── instance.npy       # [N] Instance IDs (-1 = background)
+├── coord.npy      [N, 3]   Gaussian positions
+├── color.npy      [N, 3]   RGB values (stored as residuals after preprocessing)
+├── scale.npy      [N, 3]   Anisotropic scales, linear space (metres)
+├── quat.npy       [N, 4]   Rotation quaternions
+├── opacity.npy    [N]      Opacity values [0, 1]
+├── segment.npy    [N]      ScanNet72 category labels (0–71)
+└── instance.npy   [N]      Instance IDs (−1 = background)
 ```
 
-### ScanNet72 Categories
+**Normalization:** positions and scales normalized to fit a 10m radius sphere (linear scale multiplication, not log-space). Log-space scale loss was tested and abandoned — it causes scale collapse to <1cm due to domain mismatch.
 
-- Total categories: 72 (indices 0-71)
-- Missing categories: [13, 53, 61] (never appear in dataset, handled in loss)
-- Most frequent: Wall (0), Floor (1), Ceiling (23), Cabinet (2), Window (8)
+**Sampling:** top 40k Gaussians by opacity, deterministic argsort (same selection every epoch).
 
 ---
-
-## Output Files
-
-### Checkpoints
-```
-checkpoints/RGB_job_<jobid>_<semantic_mode>/
-├── epoch_050.pth              # Model checkpoint (every 50 epochs)
-├── best_model.pth             # Best model by validation L2
-├── final.pth                  # Final epoch model
-├── reconstructed_gaussians/
-│   ├── epoch_050/
-│   │   ├── scene_000_epoch_050.ply
-│   │   └── scene_001_epoch_050.ply
-│   └── epoch_100/
-│       └── ...
-└── pca_visualizations/        # Only for semantic runs
-    ├── epoch_050/
-    │   ├── scene_000_semantic_pca.ply
-    │   └── scene_000_position_pca.ply
-    └── epoch_100/
-        └── ...
-```
-
-### Logs
-```
-logs/
-└── can3tok_<jobid>.out        # Training output with all metrics
-```
 
 ## Code Structure
+
 ```
 .
-├── gs_can3tok_2.py                     # Main training script
-├── gs_dataset_scenesplat.py            # Dataset loader
-├── semantic_losses.py                  # Contrastive loss functions
-├── gs_ply_reconstructor.py             # PLY file writer
-├── pca_feature_visualization.py        # PCA coloring utilities
-├── visualize_input_pca.py              # Input scene PCA visualization
-├── job_can3tok.sh                      # SLURM job script
+├── gs_can3tok_2.py                                      # Training loop, losses
+├── gs_dataset_scenesplat.py                             # Dataset, DC/AC preprocessing
+├── semantic_losses.py                                   # ScanNet72SemanticLoss (InfoNCE)
+├── gs_ply_reconstructor.py                              # Output to .ply (SuperSplat/CloudCompare)
+├── pca_feature_visualization.py                         # PCA coloring of semantic features
+├── visualize_input_pca.py                               # Input scene PCA (no forward pass)
+├── job_can3tok.sh                                       # SLURM job script
 └── model/
-    ├── configs/aligned_shape_latents/
-    │   └── shapevae-256.yaml           # Model configuration
+    ├── configs/aligned_shape_latents/shapevae-256.yaml  # Architecture config
     └── michelangelo/models/tsal/
-        ├── sal_perceiver_II_initialization.py  # Model architecture
-        └── asl_pl_module.py            # PyTorch Lightning wrapper
+        ├── sal_perceiver_II_initialization.py           # Full model: Encoder, Decoder, Heads
+        └── asl_pl_module.py                             # PyTorch Lightning wrapper
 ```
 
 ---
 
-## Three Approaches for Semantic Feature Extraction
+## Quick Start
 
-### Approach 1: Geometric Parameter Projection
-
-```python
-Reconstructed Gaussians [B, 40k, 14]
-    -> Per-Gaussian 3-layer MLP (14 -> 128 -> 128 -> 32)
-    -> L2 normalization
-    -> [B, 40k, 32] semantic features
-```
-
-Best for scale distribution improvement. Per-splat supervision directly
-encourages semantically similar Gaussians to develop coherent representations.
-PCA visualization shows clean clustering by structural class without
-instance-level supervision.
-
-### Approach 2: Hidden State Projection
-
-```python
-Decoder hidden state [B, 1024]
-    -> 3-layer MLP (1024 -> 512 -> 256 -> 40k*32)
-    -> Reshape to [B, 40k, 32]
-    -> L2 normalization
-```
-
-Best overall L2 at epoch 200. Large projection head (329M parameters) learns
-semantic structure quickly but at scene level, so scale distribution
-improvement is limited compared to geometric mode.
-
-### Approach 3: Cross-Attention Semantic Head
-
-```python
-Gaussian positions [B, 40k, 3] (queries)
-    x Transformer tokens [B, 512, 384] (keys/values)
-    -> Cross-attention
-    -> Per-Gaussian features [B, 40k, 32]
-```
-
-Most expressive but computationally expensive. Requires batch size 64 for
-fair comparison — contrastive learning with smaller batches has fewer
-negative pairs per step, which directly weakens the semantic signal.
-
----
-
-## Key Arguments
 ```bash
---semantic_mode {hidden,geometric,attention,none}  # Feature extraction method
---segment_loss_weight FLOAT   # Segment contrast weight (validated: 0.3)
---instance_loss_weight FLOAT  # Instance contrast weight
---semantic_temperature FLOAT  # Temperature for softmax (validated: 0.1)
---semantic_subsample INT      # Gaussians to sample for loss (validated: 10000)
---kl_weight FLOAT             # KL divergence weight (validated: 1e-6)
---scale_norm_mode {linear,log} # Scale storage mode (use linear)
---sampling_method {opacity,random,hybrid}  # Importance sampling strategy
---train_scenes INT            # Limit training scenes
---val_scenes INT              # Limit validation scenes
---eval_every INT              # Validation frequency in epochs
---use_wandb                   # Enable Weights & Biases logging
+# Full model: color residual + semantic InfoNCE
+python gs_can3tok_2.py \
+    --batch_size 64 \
+    --num_epochs 1000 \
+    --lr 1e-4 \
+    --kl_weight 1e-6 \
+    --color_residual \
+    --semantic_mode hidden \
+    --segment_loss_weight 0.3 \
+    --train_scenes 2000 \
+    --eval_every 50
+
+# Baseline: no color residual, no semantics
+python gs_can3tok_2.py \
+    --batch_size 64 \
+    --num_epochs 700 \
+    --lr 1e-4 \
+    --kl_weight 1e-6 \
+    --semantic_mode none \
+    --train_scenes 300
+
+# Visualize input scene PCA
+python visualize_input_pca.py \
+    --num_scenes 5 \
+    --output_dir ./input_pca_vis
 ```
