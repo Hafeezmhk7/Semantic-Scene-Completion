@@ -16,11 +16,12 @@
 #
 # USAGE:
 #   sbatch run_probe_label_distribution.sh baseline
-#   sbatch run_probe_label_distribution.sh label
-#   sbatch run_probe_label_distribution.sh semantic
+#   sbatch run_probe_label_distribution.sh color_residual
+#   sbatch run_probe_label_distribution.sh color_residual_hidden
 #
-# label_input is AUTO-DETECTED from checkpoint metadata.
-# No flag needed in probe script — it reads checkpoint['label_input'].
+# color_residual, label_input, and semantic_mode are ALL AUTO-DETECTED from
+# checkpoint metadata. No manual flags needed — the probe script reads them
+# and sets the model config before instantiation.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -29,17 +30,19 @@ mkdir -p logs
 PYTHON="/gpfs/home2/yli11/.conda/envs/can3tok/bin/python"
 
 # ── Checkpoint paths ──────────────────────────────────────────────────────────
-CKPT_BASELINE="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20007981_none/final.pth"
-CKPT_SEMANTIC="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_19979090_hidden_beta0.3/final.pth"
-CKPT_LABEL="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20199952_none_labelinput/epoch_1450.pth"
+# Update these paths to point to your latest checkpoints
+CKPT_BASELINE="/gpfs/work3/0/prjs1291/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20204707_none/best_model.pth"
+CKPT_COLOR_RESIDUAL="/gpfs/work3/0/prjs1291/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20207686_none_colorresidual/best_model.pth"
+CKPT_COLOR_RESIDUAL_HIDDEN="/gpfs/work3/0/prjs1291/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20231337_hidden_colorresidual_beta0.3/best_model.pth"
 
 # ── Mode selection ────────────────────────────────────────────────────────────
 MODE="${1:-baseline}"
 
-if   [ "$MODE" == "label"    ]; then CHECKPOINT="$CKPT_LABEL"
-elif [ "$MODE" == "semantic" ]; then CHECKPOINT="$CKPT_SEMANTIC"
-else                                  CHECKPOINT="$CKPT_BASELINE"
-fi
+case "$MODE" in
+    "color_residual_hidden") CHECKPOINT="$CKPT_COLOR_RESIDUAL_HIDDEN" ;;
+    "color_residual")        CHECKPOINT="$CKPT_COLOR_RESIDUAL" ;;
+    *)                       CHECKPOINT="$CKPT_BASELINE" ; MODE="baseline" ;;
+esac
 
 RUN_NAME="probe_${MODE}_job_${SLURM_JOB_ID}"
 
@@ -71,9 +74,10 @@ echo "  Checkpoint:     $CHECKPOINT"
 echo "  Run name:       $RUN_NAME"
 echo "  Output dir:     $OUTPUT_DIR/$RUN_NAME"
 echo ""
-echo "  NOTE: label_input is auto-detected from checkpoint metadata."
-echo "        The probe script reads checkpoint['label_input'] and sets"
-echo "        point_feats accordingly before instantiating the model."
+echo "  NOTE: color_residual, label_input, and semantic_mode are ALL"
+echo "        auto-detected from checkpoint['color_residual'] etc."
+echo "        The model is instantiated with the correct architecture"
+echo "        before load_state_dict is called."
 echo "======================================================================"
 
 # ── Verify Python ─────────────────────────────────────────────────────────────
@@ -101,7 +105,7 @@ if [ ! -d "$DATA_DIR" ]; then
     echo "ERROR: Data directory not found: $DATA_DIR"
     exit 1
 fi
-echo "  Data dir:   OK"
+echo "  Data dir:   OK  ($DATA_DIR)"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 echo ""
@@ -137,11 +141,15 @@ echo "Exit code: $EXIT_CODE"
 if [ $EXIT_CODE -eq 0 ]; then
     echo "DONE [$MODE]  Results: $OUTPUT_DIR/$RUN_NAME"
     echo ""
-    echo "Compare baseline vs label runs:"
-    echo "  cat $OUTPUT_DIR/probe_baseline_*/results.json | python -c \\"
-    echo "    \"import json,sys; d=json.load(sys.stdin); \\"
-    echo "    print('Dominant acc:', d['summary']['dominant_label_accuracy']); \\"
-    echo "    print('Macro F1:    ', d['summary']['macro_f1'])\""
+    echo "Quick compare across runs:"
+    echo "  for d in $OUTPUT_DIR/probe_*/; do"
+    echo "    echo \"\$d\"; python -c \\"
+    echo "    \"import json; d=json.load(open('\$d/results.json')); s=d['summary'];"
+    echo "    print('  mode:', d['mode_label']);"
+    echo "    print('  dom_acc:', round(s['dominant_label_accuracy'],3));"
+    echo "    print('  cos_sim:', round(s['mean_cosine_similarity'],3));"
+    echo "    print('  macro_f1:', round(s['macro_f1'],3))\""
+    echo "  done"
 else
     echo "FAILED [$MODE]  See logs/probe_${SLURM_JOB_ID}.err"
 fi

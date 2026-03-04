@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-sal_perceiver.py  —  Can3Tok VAE with Step 1 Color Residual
-=============================================================
+sal_perceiver.py  —  Can3Tok VAE with Step 1 Color Residual + Move 1 Scene Semantic Head
+==========================================================================================
 
 ARCHITECTURE OVERVIEW
 ---------------------
@@ -17,8 +17,18 @@ AlignedShapeLatentPerceiver.encode_latents():
     gradient path: color_loss -> MeanColorHead -> shape_embed -> encoder token 0
                    -> cross-attn weights (shared with mu path, does NOT interfere)
 
-  shape_embed and the GS_decoder hidden state [B,1024] are fully independent.
-  InfoNCE on hidden mode therefore combines cleanly with Step 1.
+  MOVE 1 — SceneSemanticHead: second explicit gradient path into shape_embed:
+    SceneSemanticHead: shape_embed -> MLP(128->128) -> [B, 72] softmax
+    Predicts per-scene ScanNet72 label distribution.
+    Loss: KL(p_s || p_hat) — supervision from segment.npy aggregated per scene.
+    gradient path: KL_loss -> SceneSemanticHead -> shape_embed -> encoder token 0
+    Independent of MeanColorHead and InfoNCE. All three paths co-exist cleanly.
+
+  Both MeanColorHead and SceneSemanticHead operate on the same shape_embed token.
+  shape_embed now has three potential gradient sources:
+    1. MeanColorHead: encodes scene DC color
+    2. SceneSemanticHead: encodes scene semantic character (label distribution)
+    3. (future) Any other global scene property
 
 SEMANTIC MODES
 --------------
@@ -80,6 +90,67 @@ class MeanColorHead(nn.Module):
 
     def forward(self, shape_embed: torch.Tensor) -> torch.Tensor:
         return self.head(shape_embed)
+
+
+# ============================================================================
+# MOVE 1 — SCENE SEMANTIC HEAD
+# ============================================================================
+
+class SceneSemanticHead(nn.Module):
+    """
+    Predicts per-scene ScanNet72 label distribution from shape_embed [B, width].
+
+    This gives shape_embed a SECOND explicit gradient path alongside MeanColorHead,
+    forcing the global token to encode semantic character (dominant surface types
+    and object categories) in addition to mean color.
+
+    Input:  shape_embed  [B, width]  — pre-KL global scene token (width=384)
+    Output: label_dist   [B, 72]     — softmax probability distribution
+                                       over ScanNet72 categories
+
+    Architecture: 3-layer MLP with LayerNorm for training stability.
+
+    Supervision: KL(p_s || p_hat) where p_s is the ground-truth per-scene
+    category distribution computed from segment.npy (already in batch dict).
+
+    Softmax output matches ground-truth label distribution (not one-hot), so
+    KL divergence is the natural loss — same as the probe experiment's head.
+
+    Gradient path:
+      KL_loss -> SceneSemanticHead -> shape_embed -> encoder cross-attn -> encoder
+      This is INDEPENDENT of:
+        - MeanColorHead (both use shape_embed but different loss/output)
+        - InfoNCE on GS_decoder hidden state (completely different network path)
+
+    Parameters: ~108K (vs MeanColorHead's 24K and SemanticProjectionHead's 330M)
+    """
+
+    NUM_LABELS = 72
+
+    def __init__(self, width: int = 384):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(width, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, self.NUM_LABELS),
+        )
+        total = sum(p.numel() for p in self.parameters())
+        print(f"[SceneSemanticHead] shape_embed [B,{width}] -> MLP(128->128) "
+              f"-> [{self.NUM_LABELS}] softmax  |  {total:,} params")
+        print(f"  Gradient path: KL_loss -> SceneSemanticHead -> shape_embed "
+              f"(2nd path alongside MeanColorHead)")
+
+    def forward(self, shape_embed: torch.Tensor) -> torch.Tensor:
+        """
+        shape_embed: [B, width]
+        returns:     [B, 72]  softmax distribution (sums to 1 per scene)
+        """
+        logits = self.head(shape_embed)          # [B, 72]
+        return F.softmax(logits, dim=-1)          # [B, 72]
 
 
 # ============================================================================
@@ -418,12 +489,15 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
     Full Can3Tok autoencoder with optional semantic heads and Step 1 color residual.
 
     Key gradient paths:
-      Reconstruction: L2_recon -> GS_decoder -> post_kl -> transformer -> mu
-      InfoNCE:        InfoNCE  -> SemanticHead -> GS_decoder hidden -> ... -> mu
-      Step 1 color:   MSE_color -> MeanColorHead -> shape_embed -> encoder token 0
+      Reconstruction:   L2_recon  -> GS_decoder -> post_kl -> transformer -> mu
+      InfoNCE:          InfoNCE   -> SemanticHead -> GS_decoder hidden -> ... -> mu
+      Step 1 color:     MSE_color -> MeanColorHead -> shape_embed -> encoder token 0
+      Move 1 semantic:  KL_sem    -> SceneSemanticHead -> shape_embed -> encoder token 0
 
     shape_embed and GS_decoder hidden are independent — no interference.
     MeanColorHead is only added when color_residual=True.
+    SceneSemanticHead is only added when scene_semantic_head=True.
+    Both heads share shape_embed but have independent losses and output heads.
     """
 
     def __init__(self, *, device, dtype, num_latents, point_feats=0, embed_dim=0,
@@ -431,7 +505,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  num_decoder_layers, init_scale=0.25, qkv_bias=True, flash=True,
                  use_ln_post=False, use_checkpoint=False,
                  semantic_mode: str = 'none',
-                 color_residual: bool = False):
+                 color_residual: bool = False,
+                 scene_semantic_head: bool = False):
 
         super().__init__(
             device=device, dtype=dtype,
@@ -446,23 +521,38 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             color_residual=color_residual,   # passed to GS_decoder
         )
 
-        self.width          = width
-        self.semantic_mode  = semantic_mode
-        self.color_residual = color_residual
+        self.width               = width
+        self.semantic_mode       = semantic_mode
+        self.color_residual      = color_residual
+        self.scene_semantic_head = scene_semantic_head
 
         print(f"\n{'='*70}")
-        print(f"  CAN3TOK | semantic='{semantic_mode}' | color_residual={color_residual}")
+        print(f"  CAN3TOK | semantic='{semantic_mode}' | color_residual={color_residual}"
+              f" | scene_semantic_head={scene_semantic_head}")
         print(f"{'='*70}")
 
         # ── Step 1: Mean Color Head ───────────────────────────────────────────
-        self.mean_color_head = None
+        # shape_embed [B, width] -> MeanColorHead -> [B, 3] mean RGB
+        self.mean_color_head      = None
+        self.last_mean_color_pred = None  # populated in forward, read by training loop
         if color_residual:
             self.mean_color_head = MeanColorHead(width=width)
             print(f"  Step 1 ENABLED: shape_embed -> MeanColorHead -> [B,3] mean RGB")
         else:
             print(f"  Step 1 DISABLED: shape_embed [B,{width}] idle (no gradient)")
 
-        # ── Semantic heads ────────────────────────────────────────────────────
+        # ── Move 1: Scene Semantic Head ───────────────────────────────────────
+        # shape_embed [B, width] -> SceneSemanticHead -> [B, 72] label distribution
+        # Independent of MeanColorHead: different output, different loss, same input token.
+        self.scene_semantic_module      = None
+        self.last_scene_semantic_pred   = None  # populated in forward, read by training loop
+        if scene_semantic_head:
+            self.scene_semantic_module = SceneSemanticHead(width=width)
+            print(f"  Move 1 ENABLED: shape_embed -> SceneSemanticHead -> [B,72] label dist")
+        else:
+            print(f"  Move 1 DISABLED: SceneSemanticHead not active")
+
+        # ── Semantic heads (per-Gaussian, InfoNCE) ────────────────────────────
         self.semantic_projection_hidden    = None
         self.semantic_projection_geometric = None
         self.semantic_attention_head       = None
@@ -497,7 +587,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         """
         Returns:
           shape_embed [B, width]      — encoder token 0
-                                        gets gradient via MeanColorHead if color_residual=True
+                                        gets gradient via MeanColorHead (Step 1)
+                                        and/or SceneSemanticHead (Move 1)
           latents     [B, 512, width] — flows to mu [B, 16384]
         """
         x, _ = self.encoder(pc, feats)
@@ -528,7 +619,6 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         Returns:
           reconstruction    [B, N*14]   always
           semantic_features [B, N, 32] or [B, 72] or None
-          mean_color_pred   [B, 3]      only when color_residual=True, else None
         """
         latents             = self.post_kl(latents)
         latents_transformed = self.transformer(latents)
@@ -547,7 +637,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         else:
             reconstruction = self.GS_decoder(latents_flat, return_hidden=False)
 
-        # Semantic features
+        # Per-Gaussian semantic features (InfoNCE / dist)
         semantic_features = None
         if return_semantic_features and self.training and has_sem_head:
             B = reconstruction.shape[0]
@@ -573,17 +663,51 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             return_semantic_features=self.training,
         )
 
-        # ── Step 1: predict mean color from shape_embed ───────────────────────
-        # Stored as self.last_mean_color_pred (instance attribute) instead of
-        # a 7th return value — keeps the 6-value return signature that
-        # asl_pl_module.py expects, requiring zero changes to that wrapper.
-        # Training loop reads it via: gs_autoencoder.shape_model.last_mean_color_pred
+        # ── Step 1 + Move 1: shape_embed predictions ─────────────────────────
+        # Both heads operate on the same shape_embed token but have independent
+        # output heads, losses, and gradient signals. We compute shape_embed once
+        # and pass it to whichever heads are active.
         #
-        # Gradient: MSE_color_loss -> MeanColorHead -> shape_embed -> encoder token 0.
-        # Independent of InfoNCE path (GS_decoder hidden).
-        if self.mean_color_head is not None:
-            self.last_mean_color_pred = self.mean_color_head(shape_embed)  # [B, 3]
+        # Results stored as instance attributes (not return values) to keep the
+        # 6-value return signature that asl_pl_module.py expects unchanged.
+        # Training loop reads them via:
+        #   gs_autoencoder.shape_model.last_mean_color_pred      (Step 1)
+        #   gs_autoencoder.shape_model.last_scene_semantic_pred  (Move 1)
+
+        if self.mean_color_head is not None or self.scene_semantic_module is not None:
+            # shape_embed is already in [B, width] from encode_latents above
+            # We need it here — re-extract from the encoder output via encode_latents
+            # NOTE: shape_embed was already computed in encode() but not stored.
+            # To avoid a second encoder pass, we store it during encode().
+            # See _shape_embed_cache set in encode() below.
+            _se = self._shape_embed_cache  # set by encode() above
+
+            if self.mean_color_head is not None:
+                self.last_mean_color_pred = self.mean_color_head(_se)   # [B, 3]
+            else:
+                self.last_mean_color_pred = None
+
+            if self.scene_semantic_module is not None:
+                self.last_scene_semantic_pred = self.scene_semantic_module(_se)  # [B, 72]
+            else:
+                self.last_scene_semantic_pred = None
         else:
-            self.last_mean_color_pred = None
+            self.last_mean_color_pred     = None
+            self.last_scene_semantic_pred = None
 
         return shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
+
+    def encode(self, pc, feats=None, sample_posterior=True):
+        """
+        Override to cache shape_embed so forward() can pass it to the heads
+        without a second encoder pass.
+        """
+        shape_embed, latents        = self.encode_latents(pc, feats)
+        self._shape_embed_cache     = shape_embed          # cache for forward()
+        kl_embed, posterior         = self.encode_kl_embed(latents, sample_posterior)
+        kl_embed_flat               = kl_embed.reshape([kl_embed.shape[0], -1])
+        mu      = self.kl_emb_proj_mean(kl_embed_flat)
+        log_var = self.kl_emb_proj_var(kl_embed_flat)
+        std     = torch.exp(0.5 * log_var)
+        z       = mu + std * torch.randn_like(std)
+        return shape_embed, mu, log_var, z, posterior

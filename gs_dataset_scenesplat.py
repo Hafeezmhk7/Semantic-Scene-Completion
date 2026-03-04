@@ -324,6 +324,15 @@ class gs_dataset(Dataset):
             )  # (T, 18)
             assert gs_full_params.shape == (T, 18)
 
+        # Precompute ScanNet72 label distribution for SceneSemanticHead (Move 1)
+        # Computed here in DataLoader workers (CPU) so training loop pays zero cost.
+        label_dist = np.zeros(72, dtype=np.float32)
+        valid_seg = segment[segment >= 0]
+        if len(valid_seg) > 0:
+            for k in range(72):
+                label_dist[k] = (valid_seg == k).sum()
+            label_dist /= label_dist.sum()
+
         return {
             'features':        gs_full_params.astype(np.float32),
             'segment_labels':  segment,
@@ -331,9 +340,9 @@ class gs_dataset(Dataset):
             'scene_idx':       idx,
             'has_semantics':   has_semantics,
             'num_categories':  self.num_segment_categories,
-            'mean_color':      mean_color,   # [3] float32, zeros if color_residual=False
+            'mean_color':      mean_color,
+            'label_dist':      label_dist,    # ← ADD THIS LINE to the existing return dict
         }
-
     # ─────────────────────────────────────────────────────────────────────────
     # Analysis helpers
     # ─────────────────────────────────────────────────────────────────────────

@@ -1,55 +1,41 @@
 """
-Can3Tok Training — Step 1: Color Residual + Hidden Semantic Baseline
-======================================================================
+Can3Tok Training — Step 1: Color Residual + Move 1: Scene Semantic Head
+========================================================================
 
 WHAT THIS FILE IMPLEMENTS
 --------------------------
-This is the complete training script for the 2000-scene hidden semantic
-baseline with Step 1 color residual encoding.
+This is the complete training script for Can3Tok VAE with:
+  - Step 1 Color Residual (--color_residual)
+  - Move 1 Scene Semantic Head (--scene_semantic_head) ← NEW
 
-Step 1 adds three coordinated changes vs the plain hidden baseline:
+MOVE 1 — SCENE SEMANTIC HEAD
+------------------------------
+Adds SceneSemanticHead to shape_embed: a second explicit gradient path
+into the global scene token alongside MeanColorHead.
 
-  DATASET (gs_dataset_scenesplat.py, color_residual=True):
-    After top-40k sampling:
-      mean_color  = color.mean(axis=0)    # [3] scene DC term
-      color       = color - mean_color    # [N,3] AC residuals ~[-0.3, +0.3]
-    mean_color returned in batch dict.
-
-  MODEL (sal_perceiver.py, color_residual=True):
-    MeanColorHead: shape_embed [B,384] -> Linear(384,64) -> ReLU
-                                       -> Linear(64,3) -> Sigmoid -> [B,3]
-    Stored as self.last_mean_color_pred (instance attribute) — NOT a 7th return
-    value. Keeps the 6-value return signature that asl_pl_module.py expects.
-    Gradient path: MSE_color -> MeanColorHead -> shape_embed -> encoder token 0.
+  MODEL (sal_perceiver_II_initialization.py):
+    SceneSemanticHead: shape_embed [B,384] -> MLP(128->128) -> [B,72] softmax
+    Stored as self.last_scene_semantic_pred (instance attribute).
 
   TRAINING LOOP (this file):
-    mean_color_gt   = batch['mean_color'].to(device)                   # [B,3]
-    mean_color_pred = gs_autoencoder.shape_model.last_mean_color_pred  # [B,3]
-    color_pred_loss = F.mse_loss(mean_color_pred, mean_color_gt)
-    total_loss += mean_color_weight * color_pred_loss
+    p_s   = compute_label_distribution(segment_labels)   # [B, 72] gt dist
+    p_hat = gs_autoencoder.shape_model.last_scene_semantic_pred  # [B, 72]
+    scene_semantic_loss = scene_semantic_kl_loss(p_hat, p_s)
+    total_loss += scene_semantic_weight * scene_semantic_loss
 
-    At PLY save time: add mean_color back to residuals before saving.
-      absolute_color = predicted_residual + mean_color_gt
+  Gradient path: KL_loss -> SceneSemanticHead -> shape_embed -> encoder token 0
+  Independent of MeanColorHead and InfoNCE paths.
 
-SEMANTIC MODE
--------------
-  semantic_mode='hidden'  → InfoNCE on GS_decoder hidden state [B,1024]
-  segment_weight=0.3      → beta, must be >0 to activate
-  Both conditions required (gs_can3tok_2.py checks: semantic_mode != 'none'
-  AND segment_loss_weight > 0).
+CHECKPOINT METADATA
+-------------------
+  scene_semantic_head: bool — stored in every checkpoint so probe/resume
+  scripts can auto-detect and build the correct model architecture.
 
-  shape_embed -> MeanColorHead path and GS_decoder hidden -> InfoNCE path
-  are completely independent. No interference.
-
-MODEL FORWARD RETURN VALUES  (6 values, unchanged)
----------------------------------------------------
-  shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
-  mean_color_pred accessed via: gs_autoencoder.shape_model.last_mean_color_pred
-
-CHECKPOINT
-----------
-  Stores color_residual=True/False so probe and resume scripts can verify
-  compatibility automatically.
+ABLATION TABLE (runs to compare):
+  Run A: color_residual only              (done: job 20207686, L2=1.43)
+  Run B: color_residual + InfoNCE hidden  (done: job 20231337, L2=1.99)
+  Run C: color_residual + scene_semantic  (NEW: isolates Move 1)
+  Run D: color_residual + scene_semantic + InfoNCE hidden (NEW: full model)
 """
 
 import torch
@@ -79,8 +65,6 @@ os.environ['PYTHONUNBUFFERED'] = '1'
 # ============================================================================
 # PARAMETER INDICES  (identical for label_input=True/False)
 # ============================================================================
-# Feature tensor cols 4-17 → 14-dim reconstruction target:
-#   [0:3] xyz  [3:6] rgb-or-residual  [6] opacity  [7:10] scale  [10:14] quat
 
 PARAM_SLICES = {
     'position': slice(0, 3),
@@ -97,6 +81,68 @@ GEOMETRIC_INDICES = (
   + list(range(11, 14)) # scale
   + list(range(14, 18)) # quaternion
 )  # 14 values, cols 4-17
+
+# ============================================================================
+# MOVE 1 HELPERS
+# ============================================================================
+
+# def compute_label_distribution(
+#     segment_labels: torch.Tensor,
+#     n_labels: int = 72,
+# ) -> torch.Tensor:
+#     """
+#     Compute per-scene ScanNet72 label distribution from raw segment labels.
+
+#     segment_labels: [B, N]  long tensor, values 0-71 (valid) or <0 (missing)
+#     returns:        [B, 72] float tensor, rows sum to 1.0
+#                     All-zero row if scene has no valid labels.
+
+#     Uses vectorised torch ops — no Python loop over batch items.
+#     This is the ground truth that SceneSemanticHead is trained to predict.
+#     Same computation as in probe_label_distribution.py LabelDistributionDataset.
+#     """
+#     B, N = segment_labels.shape
+#     device = segment_labels.device
+
+#     p_s = torch.zeros(B, n_labels, dtype=torch.float32, device=device)
+
+#     # One-hot encode valid labels, ignore negative (missing) labels
+#     valid_mask = segment_labels >= 0                             # [B, N]
+#     safe_labels = segment_labels.clone()
+#     safe_labels[~valid_mask] = 0                                 # clamp for one_hot, masked out next
+
+#     one_hot = F.one_hot(safe_labels, num_classes=n_labels).float()  # [B, N, 72]
+#     one_hot = one_hot * valid_mask.unsqueeze(-1).float()             # zero out invalid
+
+#     counts     = one_hot.sum(dim=1)                              # [B, 72]
+#     n_valid    = valid_mask.float().sum(dim=1, keepdim=True)     # [B, 1]
+#     n_valid    = n_valid.clamp(min=1.0)                          # avoid div by zero
+
+#     p_s = counts / n_valid                                       # [B, 72]  sums to 1
+
+#     return p_s
+
+
+def scene_semantic_kl_loss(
+    p_hat: torch.Tensor,
+    p_s:   torch.Tensor,
+    eps:   float = 1e-8,
+) -> torch.Tensor:
+    """
+    KL divergence loss: D_KL(p_s || p_hat) for scene-level semantic distribution.
+
+    p_hat: [B, 72]  model predictions (softmax, sums to 1)
+    p_s:   [B, 72]  ground truth distributions (sums to 1)
+    returns: scalar mean KL divergence across batch
+
+    D_KL(p_s || p_hat) = Σ p_s * log(p_s / p_hat)
+
+    Scenes where p_s is all-zero (no valid labels) contribute zero loss
+    because p_s * log(...) = 0. No masking needed.
+    """
+    p_hat_clamped = torch.clamp(p_hat, min=eps)
+    kl_per_scene  = (p_s * (torch.log(p_s + eps) - torch.log(p_hat_clamped))).sum(dim=-1)
+    return kl_per_scene.mean()
 
 # ============================================================================
 # LOSS HELPERS
@@ -137,7 +183,7 @@ parser.add_argument('--val_scenes',           type=int,   default=None)
 parser.add_argument('--sampling_method',      type=str,   default='opacity',
                     choices=['random', 'opacity', 'hybrid'])
 
-# Semantic
+# Semantic (per-Gaussian InfoNCE)
 parser.add_argument('--semantic_mode',        type=str,   default='none',
                     choices=['none', 'hidden', 'geometric', 'attention', 'dist'])
 parser.add_argument('--segment_loss_weight',  type=float, default=0.0)
@@ -152,8 +198,17 @@ parser.add_argument('--color_residual',       action='store_true', default=False
     help='Enable Step 1 color residual. Dataset stores color-mean_color; '
          'model predicts mean_color from shape_embed via MeanColorHead.')
 parser.add_argument('--mean_color_weight',    type=float, default=1.0,
-    help='Weight on MSE(mean_color_pred, mean_color_gt). '
-         'total_loss += mean_color_weight * color_pred_loss')
+    help='Weight on MSE(mean_color_pred, mean_color_gt).')
+
+# Move 1: Scene semantic head  ← NEW
+parser.add_argument('--scene_semantic_head',   action='store_true', default=False,
+    help='Move 1: Add SceneSemanticHead to shape_embed. Predicts per-scene '
+         'ScanNet72 label distribution [B,72] from shape_embed. '
+         'Loss: KL(p_s || p_hat) weighted by --scene_semantic_weight. '
+         'Gives shape_embed a 2nd gradient path alongside MeanColorHead.')
+parser.add_argument('--scene_semantic_weight', type=float, default=0.3,
+    help='Weight for SceneSemanticHead KL loss (default 0.3). '
+         'total_loss += scene_semantic_weight * KL(p_s || p_hat).')
 
 # Option 1: label as encoder input
 parser.add_argument('--label_input',          action='store_true', default=False)
@@ -199,6 +254,9 @@ semantic_loss_enabled = (args.segment_loss_weight > 0 or args.instance_loss_weig
 enable_semantic       = semantic_requested and semantic_loss_enabled
 effective_semantic_mode = args.semantic_mode if enable_semantic else 'none'
 
+# Need segment_labels if InfoNCE OR SceneSemanticHead is active
+need_segment_labels = enable_semantic or args.scene_semantic_head
+
 # ============================================================================
 # W&B
 # ============================================================================
@@ -209,10 +267,11 @@ if args.use_wandb:
         import wandb
         job_id   = os.environ.get('SLURM_JOB_ID', 'local')
         run_name = f"can3tok_job_{job_id}_{effective_semantic_mode}"
-        if args.color_residual:   run_name += "_colorresidual"
-        if args.label_input:      run_name += "_labelinput"
-        if enable_semantic:       run_name += f"_beta{args.segment_loss_weight}"
-        if args.resume_checkpoint: run_name += "_resumed"
+        if args.color_residual:       run_name += "_colorresidual"
+        if args.scene_semantic_head:  run_name += "_scenesemantic"
+        if args.label_input:          run_name += "_labelinput"
+        if enable_semantic:           run_name += f"_beta{args.segment_loss_weight}"
+        if args.resume_checkpoint:    run_name += "_resumed"
         wandb_run = wandb.init(
             entity=args.wandb_entity, project=args.wandb_project, name=run_name,
             config=vars(args)
@@ -243,9 +302,10 @@ job_id = os.environ.get('SLURM_JOB_ID', None)
 tag = f"RGB_job_{job_id}_{effective_semantic_mode}" if job_id else \
       f"RGB_local_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{effective_semantic_mode}"
 
-if args.color_residual:   tag += "_colorresidual"
-if args.label_input:      tag += "_labelinput"
-if enable_semantic:       tag += f"_beta{args.segment_loss_weight}"
+if args.color_residual:       tag += "_colorresidual"
+if args.scene_semantic_head:  tag += "_scenesemantic"
+if args.label_input:          tag += "_labelinput"
+if enable_semantic:           tag += f"_beta{args.segment_loss_weight}"
 if not args.use_canonical_norm: tag += "_raw"
 
 save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{tag}/"
@@ -258,18 +318,24 @@ os.makedirs(save_path, exist_ok=True)
 print(f"\n{'='*70}")
 print(f"CAN3TOK TRAINING")
 print(f"{'='*70}")
-print(f"  Semantic mode:    {effective_semantic_mode}")
-print(f"  Enable semantic:  {enable_semantic}")
-print(f"  Color residual:   {args.color_residual}  "
-      f"(Step 1 — shape_embed -> MeanColorHead)")
-print(f"  Mean color weight:{args.mean_color_weight}  (weight on color pred loss)")
-print(f"  Label input:      {args.label_input}")
-print(f"  Scale norm mode:  {args.scale_norm_mode}")
-print(f"  Canonical norm:   {args.use_canonical_norm}")
-print(f"  Device:           {device}")
-print(f"  Save path:        {save_path}")
+print(f"  Semantic mode:         {effective_semantic_mode}")
+print(f"  Enable semantic:       {enable_semantic}")
+print(f"  Color residual:        {args.color_residual}  (Step 1 — MeanColorHead)")
+print(f"  Mean color weight:     {args.mean_color_weight}")
+print(f"  Scene semantic head:   {args.scene_semantic_head}  (Move 1 — SceneSemanticHead)")
+print(f"  Scene semantic weight: {args.scene_semantic_weight}")
+print(f"  Label input:           {args.label_input}")
+print(f"  Scale norm mode:       {args.scale_norm_mode}")
+print(f"  Canonical norm:        {args.use_canonical_norm}")
+print(f"  Device:                {device}")
+print(f"  Save path:             {save_path}")
 if args.resume_checkpoint:
-    print(f"  Resume from:      {args.resume_checkpoint}")
+    print(f"  Resume from:           {args.resume_checkpoint}")
+if args.scene_semantic_head:
+    print(f"\n  Move 1 ACTIVE: shape_embed -> SceneSemanticHead -> [B,72] softmax")
+    print(f"    Loss: KL(p_s || p_hat), weight={args.scene_semantic_weight}")
+    print(f"    Supervision: ScanNet72 label dist from segment.npy")
+    print(f"    Gradient: independent of MeanColorHead and InfoNCE paths")
 print(f"{'='*70}\n")
 
 # ============================================================================
@@ -280,8 +346,9 @@ print("Loading model config...")
 config_path = "./model/configs/aligned_shape_latents/shapevae-256.yaml"
 model_config_perceiver = get_config_from_file(config_path)
 model_config = model_config_perceiver.model
-model_config.params.shape_module_cfg.params.semantic_mode = effective_semantic_mode
-model_config.params.shape_module_cfg.params.color_residual = args.color_residual  # Step 1
+model_config.params.shape_module_cfg.params.semantic_mode     = effective_semantic_mode
+model_config.params.shape_module_cfg.params.color_residual    = args.color_residual
+model_config.params.shape_module_cfg.params.scene_semantic_head = args.scene_semantic_head  # Move 1
 
 cfg_point_feats = model_config.params.shape_module_cfg.params.point_feats
 expected_feats  = 12 if args.label_input else 11
@@ -311,27 +378,34 @@ if args.resume_checkpoint:
         raise FileNotFoundError(f"Checkpoint not found: {args.resume_checkpoint}")
     ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
 
-    # Verify color_residual compatibility — changes input to decoder color head
+    # Verify color_residual compatibility
     saved_cr = ckpt.get('color_residual', False)
     if saved_cr != args.color_residual:
         raise ValueError(
             f"color_residual mismatch: checkpoint={saved_cr}, current={args.color_residual}. "
-            f"These are incompatible — the MeanColorHead exists only when color_residual=True."
+            f"MeanColorHead exists only when color_residual=True — incompatible."
         )
-    # Verify label_input — changes input_proj dimension
+    # Verify label_input
     saved_li = ckpt.get('label_input', False)
     if saved_li != args.label_input:
         raise ValueError(
             f"label_input mismatch: checkpoint={saved_li}, current={args.label_input}. "
             f"input_proj dimension differs — cannot resume across this boundary."
         )
-
-    saved_mode = ckpt.get('semantic_mode', 'none')
-    if saved_mode != effective_semantic_mode:
-        print(f"  Semantic mode changed: {saved_mode} -> {effective_semantic_mode} (strict=False)")
+    # Verify scene_semantic_head
+    saved_ssh = ckpt.get('scene_semantic_head', False)
+    if saved_ssh != args.scene_semantic_head:
+        print(f"  scene_semantic_head changed: {saved_ssh} -> {args.scene_semantic_head} "
+              f"(strict=False)")
         gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=False)
     else:
-        gs_autoencoder.load_state_dict(ckpt['model_state_dict'])
+        saved_mode = ckpt.get('semantic_mode', 'none')
+        if saved_mode != effective_semantic_mode:
+            print(f"  Semantic mode changed: {saved_mode} -> {effective_semantic_mode} "
+                  f"(strict=False)")
+            gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=False)
+        else:
+            gs_autoencoder.load_state_dict(ckpt['model_state_dict'])
 
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     saved_epoch = ckpt.get('epoch', 0)
@@ -393,14 +467,16 @@ print(f"{'='*70}\n")
 # ============================================================================
 
 _ckpt_meta = {
-    'semantic_mode':      effective_semantic_mode,
-    'enable_semantic':    enable_semantic,
-    'label_input':        args.label_input,
-    'color_residual':     args.color_residual,
-    'mean_color_weight':  args.mean_color_weight,
-    'color_loss_weight':  args.color_loss_weight,
-    'use_canonical_norm': args.use_canonical_norm,
-    'scale_norm_mode':    args.scale_norm_mode,
+    'semantic_mode':        effective_semantic_mode,
+    'enable_semantic':      enable_semantic,
+    'label_input':          args.label_input,
+    'color_residual':       args.color_residual,
+    'scene_semantic_head':  args.scene_semantic_head,   # Move 1
+    'mean_color_weight':    args.mean_color_weight,
+    'scene_semantic_weight': args.scene_semantic_weight,
+    'color_loss_weight':    args.color_loss_weight,
+    'use_canonical_norm':   args.use_canonical_norm,
+    'scale_norm_mode':      args.scale_norm_mode,
 }
 
 # ============================================================================
@@ -410,13 +486,14 @@ _ckpt_meta = {
 def evaluate_model(model, dataloader, device, epoch=None):
     model.eval()
     total_l2 = total_kl = 0.0
-    total_color_pred_loss = 0.0
+    total_color_pred_loss    = 0.0
+    total_scene_semantic_kl  = 0.0
     per_param = {k: 0.0 for k in PARAM_SLICES}
     n_scenes  = 0
 
     scene_data_list  = []
     recon_preds_list = []
-    recon_means_list = []   # mean_color for each collected scene (Step 1)
+    recon_means_list = []
 
     do_pca   = (epoch is not None and epoch % args.pca_vis_freq  == 0 and enable_semantic)
     do_recon = (epoch is not None and epoch % args.recon_ply_freq == 0)
@@ -424,13 +501,17 @@ def evaluate_model(model, dataloader, device, epoch=None):
     with torch.no_grad():
         for batch_data in tqdm(dataloader, desc="Evaluating", leave=False):
             UV_gs_batch    = batch_data['features'].float().to(device)
-            mean_color_gt  = batch_data['mean_color'].float().to(device)  # [B,3]
-            segment_labels = batch_data.get('segment_labels', None)
+            mean_color_gt  = batch_data['mean_color'].float().to(device)
             B = UV_gs_batch.shape[0]
 
-            # Need model.train() to get per_gaussian_features for PCA collection
+            # # Load segment labels if needed for Move 1 eval metric
+            # segment_labels_cpu = batch_data.get('segment_labels', None)
+            # segment_labels_gpu = None
+            # if need_segment_labels and segment_labels_cpu is not None:
+            #     segment_labels_gpu = segment_labels_cpu.long().to(device)
+            segment_labels_cpu = batch_data.get('segment_labels', None)
             need_sem = (do_pca and len(scene_data_list) < args.pca_num_scenes
-                        and segment_labels is not None)
+                        and segment_labels_cpu is not None)
             was_train = model.training
             if need_sem:
                 model.train()
@@ -439,7 +520,8 @@ def evaluate_model(model, dataloader, device, epoch=None):
              UV_gs_recover, per_gaussian_features) = model(
                 UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3]
             )
-            mean_color_pred = model.shape_model.last_mean_color_pred
+            mean_color_pred       = model.shape_model.last_mean_color_pred
+            scene_semantic_pred   = model.shape_model.last_scene_semantic_pred
 
             if need_sem and not was_train:
                 model.eval()
@@ -456,6 +538,12 @@ def evaluate_model(model, dataloader, device, epoch=None):
             if mean_color_pred is not None and args.color_residual:
                 cp_loss = F.mse_loss(mean_color_pred, mean_color_gt).item()
                 total_color_pred_loss += cp_loss * B
+
+            # Move 1: scene semantic KL error
+            if scene_semantic_pred is not None and args.scene_semantic_head:
+                p_s   = batch_data['label_dist'].float().to(device)       # ← precomputed
+                ss_kl = scene_semantic_kl_loss(scene_semantic_pred, p_s).item()
+                total_scene_semantic_kl += ss_kl * B
 
             total_l2 += recon_loss.item()
             total_kl += kl_loss.sum().item()
@@ -504,14 +592,13 @@ def evaluate_model(model, dataloader, device, epoch=None):
             except Exception as e:
                 print(f"  PCA error scene {si}: {e}")
 
-    # PLY reconstruction
-    # Step 1: add mean_color back to residuals before saving
+    # PLY reconstruction — add mean_color back to residuals before saving
     if do_recon and recon_preds_list and save_path:
         try:
-            all_preds = np.stack(recon_preds_list, axis=0)   # [S, N, 14]
+            all_preds = np.stack(recon_preds_list, axis=0)
             if args.color_residual:
                 for si in range(len(all_preds)):
-                    all_preds[si, :, 3:6] += recon_means_list[si]   # add DC term
+                    all_preds[si, :, 3:6] += recon_means_list[si]
                     all_preds[si, :, 3:6]  = np.clip(all_preds[si, :, 3:6], 0, 1)
             recon_dir = Path(save_path) / "reconstructed_gaussians" / f"epoch_{epoch:03d}"
             save_reconstructed_gaussians(
@@ -524,9 +611,10 @@ def evaluate_model(model, dataloader, device, epoch=None):
 
     model.train()
     return {
-        'avg_l2_error':        total_l2,
-        'avg_kl':              total_kl / max(n_scenes, 1),
-        'color_pred_loss':     total_color_pred_loss / max(n_scenes, 1),
+        'avg_l2_error':           total_l2,
+        'avg_kl':                 total_kl / max(n_scenes, 1),
+        'color_pred_loss':        total_color_pred_loss / max(n_scenes, 1),
+        'scene_semantic_kl':      total_scene_semantic_kl / max(n_scenes, 1),
         **{f'{k}_loss': v / max(n_scenes, 1) for k, v in per_param.items()},
     }
 
@@ -543,30 +631,32 @@ global_step = 0
 for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     gs_autoencoder.train()
 
-    epoch_loss = epoch_recon = epoch_kl = epoch_sem = epoch_color_pred = 0.0
+    epoch_loss = epoch_recon = epoch_kl = epoch_sem = 0.0
+    epoch_color_pred = epoch_scene_semantic = 0.0
     epoch_pos = epoch_col = epoch_opa = epoch_scl = epoch_rot = 0.0
 
     for i_batch, batch_data in enumerate(trainDataLoader):
         UV_gs_batch   = batch_data['features'].float().to(device)
-        mean_color_gt = batch_data['mean_color'].float().to(device)   # [B,3]
+        mean_color_gt = batch_data['mean_color'].float().to(device)
         B = UV_gs_batch.shape[0]
 
-        segment_labels = instance_labels = None
-        if enable_semantic:
+        # Load segment labels when needed for InfoNCE or SceneSemanticHead
+        segment_labels  = None
+        instance_labels = None
+        if need_segment_labels:
             segment_labels  = batch_data['segment_labels'].long().to(device)
-            instance_labels = batch_data['instance_labels'].long().to(device)
+            if enable_semantic:
+                instance_labels = batch_data['instance_labels'].long().to(device)
 
         optimizer.zero_grad()
 
         # ── Forward ──────────────────────────────────────────────────────────
-        # asl_pl_module.py wraps shape_model and expects exactly 6 return values.
-        # mean_color_pred is stored as shape_model.last_mean_color_pred to avoid
-        # touching asl_pl_module.py.
         (shape_embed, mu, log_var, z,
          UV_gs_recover, per_gaussian_features) = gs_autoencoder(
             UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3]
         )
-        mean_color_pred = gs_autoencoder.shape_model.last_mean_color_pred
+        mean_color_pred     = gs_autoencoder.shape_model.last_mean_color_pred
+        scene_semantic_pred = gs_autoencoder.shape_model.last_scene_semantic_pred
 
         # ── Reconstruction loss ───────────────────────────────────────────────
         target   = UV_gs_batch[:, :, GEOMETRIC_INDICES]
@@ -580,12 +670,20 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
         # ── Step 1: mean color prediction loss ───────────────────────────────
         # Gradient: MSE -> MeanColorHead -> shape_embed -> encoder token 0
-        # Completely independent from reconstruction and InfoNCE paths.
         color_pred_loss = torch.tensor(0.0, device=device)
         if mean_color_pred is not None and args.color_residual:
             color_pred_loss = F.mse_loss(mean_color_pred, mean_color_gt)
 
-        # ── Semantic loss ─────────────────────────────────────────────────────
+        # ── Move 1: scene semantic distribution loss ──────────────────────────
+        # Gradient: KL -> SceneSemanticHead -> shape_embed -> encoder token 0
+        # Independent of MeanColorHead (different output head, different loss).
+        # Independent of InfoNCE (different network path entirely).
+        scene_semantic_loss = torch.tensor(0.0, device=device)
+        if scene_semantic_pred is not None and args.scene_semantic_head:
+            p_s = batch_data['label_dist'].float().to(device)   # [B, 72] — precomputed
+            scene_semantic_loss = scene_semantic_kl_loss(scene_semantic_pred, p_s)
+
+        # ── Semantic loss (per-Gaussian InfoNCE) ─────────────────────────────
         semantic_loss    = torch.tensor(0.0, device=device)
         semantic_metrics = {}
         if enable_semantic and segment_labels is not None and per_gaussian_features is not None:
@@ -610,18 +708,20 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
         # ── Total loss ────────────────────────────────────────────────────────
         loss = (recon_loss
-                + args.kl_weight    * KL_loss
-                + semantic_loss
-                + args.mean_color_weight * color_pred_loss)
+                + args.kl_weight            * KL_loss
+                + args.mean_color_weight    * color_pred_loss
+                + args.scene_semantic_weight * scene_semantic_loss
+                + semantic_loss)
         loss.backward()
         optimizer.step()
 
         ind = compute_individual_losses(pred_3d, target)
-        epoch_loss       += loss.item()
-        epoch_recon      += recon_loss.item()
-        epoch_kl         += KL_loss.item()
-        epoch_sem        += semantic_loss.item()
-        epoch_color_pred += color_pred_loss.item()
+        epoch_loss            += loss.item()
+        epoch_recon           += recon_loss.item()
+        epoch_kl              += KL_loss.item()
+        epoch_sem             += semantic_loss.item()
+        epoch_color_pred      += color_pred_loss.item()
+        epoch_scene_semantic  += scene_semantic_loss.item()
         epoch_pos += ind['position']
         epoch_col += ind['color']
         epoch_opa += ind['opacity']
@@ -631,37 +731,39 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         # Epoch 0 first-batch diagnostic
         if epoch == start_epoch and i_batch == 0:
             print(f"\nEPOCH {epoch} DIAGNOSTIC (batch 0):")
-            print(f"  mu range:         [{mu.min().item():.3f}, {mu.max().item():.3f}]")
-            print(f"  recon_loss:       {recon_loss.item():.4f}")
-            print(f"  KL_loss:          {KL_loss.item():.4f}")
+            print(f"  mu range:              [{mu.min().item():.3f}, {mu.max().item():.3f}]")
+            print(f"  recon_loss:            {recon_loss.item():.4f}")
+            print(f"  KL_loss:               {KL_loss.item():.4f}")
             if args.color_residual and mean_color_pred is not None:
-                print(f"  color_pred_loss:  {color_pred_loss.item():.6f}"
-                      f"  (MSE of mean color prediction)")
+                print(f"  color_pred_loss:       {color_pred_loss.item():.6f}")
                 mc_pred = mean_color_pred[0].detach().cpu().numpy()
                 mc_gt   = mean_color_gt[0].cpu().numpy()
-                print(f"  mean_color gt:    {mc_gt.round(3)}")
-                print(f"  mean_color pred:  {mc_pred.round(3)}")
+                print(f"  mean_color gt:         {mc_gt.round(3)}")
+                print(f"  mean_color pred:       {mc_pred.round(3)}")
                 color_col = UV_gs_batch[:, :, 7:10].detach().cpu().numpy()
-                print(f"  color col range:  [{color_col.min():.3f}, {color_col.max():.3f}]"
-                      f"  (should be negative — these are residuals)")
-            else:
-                color_col = UV_gs_batch[:, :, 7:10].detach().cpu().numpy()
-                print(f"  color col range:  [{color_col.min():.3f}, {color_col.max():.3f}]"
-                      f"  (absolute [0,1])")
+                print(f"  color col range:       [{color_col.min():.3f}, {color_col.max():.3f}]"
+                      f"  (residuals — should be negative)")
+            if args.scene_semantic_head and scene_semantic_pred is not None:
+                print(f"  scene_semantic_loss:   {scene_semantic_loss.item():.4f}")
+                pred_top = scene_semantic_pred[0].detach().cpu()
+                top3_idx = pred_top.topk(3).indices.numpy()
+                top3_val = pred_top.topk(3).values.numpy()
+                print(f"  scene_semantic top3:   labels={top3_idx}, probs={top3_val.round(3)}")
             if semantic_loss.item() > 0:
-                print(f"  semantic_loss:    {semantic_loss.item():.4f}")
+                print(f"  semantic_loss (InfoNCE):{semantic_loss.item():.4f}")
 
         if wandb_enabled:
             log = {
-                "train/step_loss":       loss.item(),
-                "train/step_recon":      recon_loss.item(),
-                "train/step_kl":         KL_loss.item(),
-                "train/step_color_pred": color_pred_loss.item(),
-                "train/step_position":   ind['position'],
-                "train/step_color":      ind['color'],
-                "train/step_opacity":    ind['opacity'],
-                "train/step_scale":      ind['scale'],
-                "train/step_rotation":   ind['rotation'],
+                "train/step_loss":            loss.item(),
+                "train/step_recon":           recon_loss.item(),
+                "train/step_kl":              KL_loss.item(),
+                "train/step_color_pred":      color_pred_loss.item(),
+                "train/step_scene_semantic":  scene_semantic_loss.item(),
+                "train/step_position":        ind['position'],
+                "train/step_color":           ind['color'],
+                "train/step_opacity":         ind['opacity'],
+                "train/step_scale":           ind['scale'],
+                "train/step_rotation":        ind['rotation'],
             }
             if semantic_metrics:
                 log.update({f"train/step_{k}": v for k, v in semantic_metrics.items()})
@@ -669,11 +771,12 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
         global_step += 1
 
-    # ── End-of-epoch logging (EVERY epoch) ───────────────────────────────────
+    # ── End-of-epoch logging ──────────────────────────────────────────────────
     nb = len(trainDataLoader)
     print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | "
           f"Recon={epoch_recon/nb:.4f} | KL={epoch_kl/nb:.4f} | "
-          f"Sem={epoch_sem/nb:.4f} | ColorPred={epoch_color_pred/nb:.6f}")
+          f"InfoNCE={epoch_sem/nb:.4f} | ColorPred={epoch_color_pred/nb:.6f} | "
+          f"SceneSem={epoch_scene_semantic/nb:.4f}")
     print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
           f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | "
           f"Rot={epoch_rot/nb:.3f}")
@@ -684,16 +787,19 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
         print(f"\n--- Validation (epoch {epoch}) ---")
         val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=epoch)
-        print(f"  L2:           {val_metrics['avg_l2_error']:.4f}")
-        print(f"  Position:     {val_metrics['position_loss']:.4f}")
-        print(f"  Color:        {val_metrics['color_loss']:.4f}"
+        print(f"  L2:                {val_metrics['avg_l2_error']:.4f}")
+        print(f"  Position:          {val_metrics['position_loss']:.4f}")
+        print(f"  Color:             {val_metrics['color_loss']:.4f}"
               f"  {'(residuals)' if args.color_residual else '(absolute)'}")
-        print(f"  Opacity:      {val_metrics['opacity_loss']:.4f}")
-        print(f"  Scale:        {val_metrics['scale_loss']:.4f}")
-        print(f"  Rotation:     {val_metrics['rotation_loss']:.4f}")
+        print(f"  Opacity:           {val_metrics['opacity_loss']:.4f}")
+        print(f"  Scale:             {val_metrics['scale_loss']:.4f}")
+        print(f"  Rotation:          {val_metrics['rotation_loss']:.4f}")
         if args.color_residual:
-            print(f"  ColorPredMSE: {val_metrics['color_pred_loss']:.6f}"
-                  f"  (shape_embed -> mean RGB prediction)")
+            print(f"  ColorPredMSE:      {val_metrics['color_pred_loss']:.6f}"
+                  f"  (MeanColorHead: shape_embed -> mean RGB)")
+        if args.scene_semantic_head:
+            print(f"  SceneSemanticKL:   {val_metrics['scene_semantic_kl']:.4f}"
+                  f"  (SceneSemanticHead: shape_embed -> label dist)")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
@@ -709,16 +815,17 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
     if wandb_enabled and val_metrics:
         wandb_run.log({
-            "val/l2_error":       val_metrics['avg_l2_error'],
-            "val/position_loss":  val_metrics['position_loss'],
-            "val/color_loss":     val_metrics['color_loss'],
-            "val/color_pred_mse": val_metrics['color_pred_loss'],
-            "val/opacity_loss":   val_metrics['opacity_loss'],
-            "val/scale_loss":     val_metrics['scale_loss'],
-            "val/rotation_loss":  val_metrics['rotation_loss'],
-            "best/val_l2":        best_val_loss,
-            "best/epoch":         best_epoch,
-            "train/epoch":        epoch,
+            "val/l2_error":             val_metrics['avg_l2_error'],
+            "val/position_loss":        val_metrics['position_loss'],
+            "val/color_loss":           val_metrics['color_loss'],
+            "val/color_pred_mse":       val_metrics['color_pred_loss'],
+            "val/scene_semantic_kl":    val_metrics['scene_semantic_kl'],
+            "val/opacity_loss":         val_metrics['opacity_loss'],
+            "val/scale_loss":           val_metrics['scale_loss'],
+            "val/rotation_loss":        val_metrics['rotation_loss'],
+            "best/val_l2":              best_val_loss,
+            "best/epoch":               best_epoch,
+            "train/epoch":              epoch,
         }, step=global_step)
 
     # ── Periodic checkpoint ───────────────────────────────────────────────────
@@ -738,16 +845,19 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
 print(f"\n{'='*70}\nTRAINING COMPLETE\n{'='*70}")
 
-final_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=args.num_epochs - 1)
+final_metrics = evaluate_model(gs_autoencoder, valDataLoader, device,
+                               epoch=args.num_epochs - 1)
 
 print(f"\nFinal Results:")
-print(f"  Final L2:  {final_metrics['avg_l2_error']:.4f}")
-print(f"  Best L2:   {best_val_loss:.4f} (epoch {best_epoch})")
-print(f"  Position:  {final_metrics['position_loss']:.4f}")
-print(f"  Color:     {final_metrics['color_loss']:.4f}"
+print(f"  Final L2:   {final_metrics['avg_l2_error']:.4f}")
+print(f"  Best L2:    {best_val_loss:.4f} (epoch {best_epoch})")
+print(f"  Position:   {final_metrics['position_loss']:.4f}")
+print(f"  Color:      {final_metrics['color_loss']:.4f}"
       f"  {'(residuals)' if args.color_residual else '(absolute)'}")
 if args.color_residual:
-    print(f"  ColorPredMSE: {final_metrics['color_pred_loss']:.6f}")
+    print(f"  ColorPredMSE:    {final_metrics['color_pred_loss']:.6f}")
+if args.scene_semantic_head:
+    print(f"  SceneSemanticKL: {final_metrics['scene_semantic_kl']:.4f}")
 
 torch.save({
     'epoch':                args.num_epochs - 1,
@@ -764,9 +874,9 @@ print(f"\nSaved: {save_path}final.pth")
 
 if wandb_enabled:
     wandb_run.summary.update({
-        "final_val_l2": final_metrics['avg_l2_error'],
-        "best_val_l2":  best_val_loss,
-        "best_epoch":   best_epoch,
+        "final_val_l2":   final_metrics['avg_l2_error'],
+        "best_val_l2":    best_val_loss,
+        "best_epoch":     best_epoch,
     })
     wandb_run.finish()
 
