@@ -1,0 +1,68 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_tsne
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=00:30:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --output=logs/tsne_%j.out
+#SBATCH --error=logs/tsne_%j.err
+
+# ============================================================================
+# Can3Tok t-SNE — Deterministic Latent Space Analysis
+#
+# Compares three models in two experiments:
+#   Exp A: Do same room types cluster in shape_embed?
+#   Exp B: Do spatial chunks of the same room produce consistent latents?
+#
+# Edit MODEL_CHECKPOINTS inside can3tok_tsne.py before submitting.
+#
+# Re-run without re-encoding (uses cache):
+#   sbatch run_tsne.job
+#
+# Force re-encode everything:
+#   sbatch run_tsne.job --no_cache
+#
+# Only one experiment:
+#   sbatch run_tsne.job --skip_exp_b
+# ============================================================================
+
+# ── ENVIRONMENT ───────────────────────────────────────────────────────────────
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs
+
+echo "========================================================================"
+echo "  Can3Tok t-SNE  —  Deterministic Latent Space Analysis"
+echo "========================================================================"
+echo "  Job ID:  $SLURM_JOB_ID"
+echo "  Node:    $(hostname)"
+echo "  Start:   $(date)"
+echo "========================================================================"
+
+OUTPUT_DIR="tsne_results_job_${SLURM_JOB_ID}"
+
+python can3tok_tsne.py \
+    --output_dir "$OUTPUT_DIR" \
+    "$@"    # pass through any extra flags (--no_cache, --skip_exp_b, etc.)
+
+EXIT_CODE=$?
+
+echo ""
+echo "========================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "  DONE"
+    echo ""
+    echo "  Collect outputs:"
+    echo "  scp $(whoami)@snellius.surf.nl:$(pwd)/$OUTPUT_DIR/can3tok_tsne.png ."
+    echo "  scp $(whoami)@snellius.surf.nl:$(pwd)/$OUTPUT_DIR/can3tok_tsne.pdf ."
+else
+    echo "  FAILED (exit $EXIT_CODE)"
+    echo "  Check: logs/tsne_${SLURM_JOB_ID}.err"
+fi
+echo "  End: $(date)"
+echo "========================================================================"

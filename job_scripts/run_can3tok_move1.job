@@ -2,7 +2,7 @@
 #SBATCH --job-name=can3tok_move1
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
-#SBATCH --time=48:00:00
+#SBATCH --time=96:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=128G
@@ -43,8 +43,8 @@ echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 # CHECKPOINT RESUMING
 # ============================================================================
 
-RESUME_CHECKPOINT=""   # path to .pth to resume; empty = fresh start
-RESUME_EPOCH=""        # override epoch counter; empty = auto (saved epoch + 1)
+RESUME_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20273723_hidden_colorresidual_scenesemantic_beta0.3/epoch_200.pth"   # path to .pth to resume; empty = fresh start
+RESUME_EPOCH="200"        # override epoch counter; empty = auto (saved epoch + 1)
 
 # ============================================================================
 # CORE TRAINING FLAGS

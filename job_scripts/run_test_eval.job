@@ -1,0 +1,89 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_test
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=00:30:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --output=logs/test_eval_%j.out
+#SBATCH --error=logs/test_eval_%j.err
+
+# ============================================================================
+# Can3Tok — Test Set Generalization Evaluation
+#
+# Evaluates trained models on UNSEEN test scenes and compares them.
+# All model flags (color_residual, scene_semantic_head, semantic_mode, etc.)
+# are read automatically from each checkpoint — nothing to configure here
+# except the checkpoint paths and number of scenes.
+#
+# Metrics match training exactly:
+#   L2, Position, Color, Opacity, Scale, Rotation, ColorPredMSE, SceneSemanticKL
+#
+# Usage:
+#   sbatch run_test_eval.job                     # default: 20 scenes, 3 models
+#   sbatch run_test_eval.job --n_scenes 30       # more scenes
+#   sbatch run_test_eval.job --save_ply          # also save PLY reconstructions
+# ============================================================================
+
+# ── CONFIGURATION — edit checkpoint paths here ────────────────────────────────
+
+CKPT_A="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20207686_none_colorresidual/best_model.pth"
+CKPT_B="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20231337_hidden_colorresidual_beta0.3/best_model.pth"
+CKPT_C="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20242092_hidden_colorresidual_scenesemantic_beta0.3/best_model.pth"
+
+DATASET_ROOT="/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs"
+SPLIT="test"
+
+N_SCENES=32         # number of test scenes to evaluate
+BATCH_SIZE=16        # scenes per GPU batch
+OUTPUT_DIR="test_eval_results_job_${SLURM_JOB_ID}"
+
+# ── ENVIRONMENT ───────────────────────────────────────────────────────────────
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs
+
+echo "========================================================================"
+echo "  Can3Tok — Test Set Generalization Evaluation"
+echo "========================================================================"
+echo "  Job ID:    $SLURM_JOB_ID"
+echo "  Node:      $(hostname)"
+echo "  Start:     $(date)"
+echo "  N scenes:  $N_SCENES"
+echo "  Split:     $SPLIT"
+echo "========================================================================"
+
+python can3tok_test_eval.py \
+    --checkpoint      "$CKPT_A" "$CKPT_B" "$CKPT_C" \
+    --checkpoint_names "Run A: Color Residual" \
+                       "Run B: Color Residual + InfoNCE" \
+                       "Run C: Color Residual + InfoNCE + LabelDist" \
+    --dataset_root    "$DATASET_ROOT" \
+    --split           "$SPLIT" \
+    --n_scenes        "$N_SCENES" \
+    --batch_size      "$BATCH_SIZE" \
+    --output_dir      "$OUTPUT_DIR" \
+    "$@"   # pass-through flags: --save_ply, --ply_n_scenes N, etc.
+
+EXIT_CODE=$?
+
+echo ""
+echo "========================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "  DONE"
+    echo ""
+    echo "  Collect results:"
+    echo "  scp $(whoami)@snellius.surf.nl:$(pwd)/$OUTPUT_DIR/test_metrics.json ."
+    echo ""
+    echo "  View log:"
+    echo "  cat logs/test_eval_${SLURM_JOB_ID}.out"
+else
+    echo "  FAILED (exit $EXIT_CODE)"
+    echo "  Check: logs/test_eval_${SLURM_JOB_ID}.err"
+fi
+echo "  End: $(date)"
+echo "========================================================================"
