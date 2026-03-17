@@ -2,7 +2,7 @@
 #SBATCH --job-name=can3tok_move1
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
-#SBATCH --time=96:00:00
+#SBATCH --time=48:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=128G
@@ -10,31 +10,32 @@
 #SBATCH --error=logs/can3tok_move1_%j.err
 
 # ============================================================================
-# CAN3TOK — MOVE 1: SCENE SEMANTIC HEAD (2000 SCENES)
+# CAN3TOK — MOVE 1: SCENE SEMANTIC HEAD + JEPA IDEA 1: SPATIAL SEMANTIC HEAD
 # ============================================================================
 #
-# What this run tests (Move 1):
-#   Adds SceneSemanticHead to shape_embed alongside the existing MeanColorHead.
-#   shape_embed [B,384] -> MLP(128->128) -> [B,72] softmax.
-#   Loss: KL(p_s || p_hat) where p_s is the per-scene ScanNet72 label
-#   distribution precomputed in DataLoader workers (zero GPU overhead).
+# What this script covers (four ablation runs via flag changes):
 #
-# Why:
-#   After Step 1, shape_embed encodes only 3 numbers (mean RGB).
-#   Move 1 gives it a second task: encode the semantic character of the scene
-#   (dominant object categories). A bedroom has different p_s than a kitchen.
-#   This makes shape_embed a richer global descriptor for the completion model.
+#   Run C: color_residual + scene_semantic                (SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=False)
+#   Run D: color_residual + scene_semantic + InfoNCE      (SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=False, SEMANTIC_MODE=hidden)
+#   Run E: color_residual + scene_semantic + jepa_idea1   (SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=True)  ← NEW default
+#   Run F: color_residual + jepa_idea1 (no SceneSemHead)  (SCENE_SEMANTIC_HEAD=False, JEPA_IDEA1=True)
 #
-# ABLATION TABLE:
-#   Run A: color_residual only              (done: job 20207686, L2=1.43)
-#   Run B: color_residual + InfoNCE hidden  (done: job 20231337, L2=1.99)
-#   Run C: color_residual + scene_semantic  (SEMANTIC_MODE=none, this script default)
-#   Run D: color_residual + scene_semantic + InfoNCE (SEMANTIC_MODE=hidden)
+# JEPA Idea 1 summary:
+#   Extends Move 1 (global label dist) to spatial: for each occupied voxel
+#   in the scene, predict its ScanNet72 label distribution from shape_embed
+#   and the voxel's 3D position.  Supervision from segment.npy aggregated in
+#   DataLoader workers — zero GPU overhead.
 #
-# Expected outcome (Run C vs Run A):
-#   Val L2 should improve vs Run A (1.43) because shape_embed has richer signal.
-#   SceneSemanticKL should decrease as training progresses.
-#   ColorPredMSE should stay stable (MeanColorHead path unchanged).
+#   gradient path: KL_spatial -> SpatialSemanticHead -> shape_embed -> encoder
+#   independent of MeanColorHead, SceneSemanticHead, and InfoNCE paths.
+#
+#   Diagnostic to watch:
+#     SpatialKL  in validation output — should decrease across training
+#     Compare val/l2_error against Run C (no JEPA) and Run A (no Move1 either)
+#
+# Prior results for comparison:
+#   Run A (color_residual only):             L2=1.43
+#   Run B (color_residual + InfoNCE):        L2=1.99
 # ============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
@@ -43,192 +44,155 @@ echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 # CHECKPOINT RESUMING
 # ============================================================================
 
-RESUME_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_20273723_hidden_colorresidual_scenesemantic_beta0.3/epoch_200.pth"   # path to .pth to resume; empty = fresh start
-RESUME_EPOCH="200"        # override epoch counter; empty = auto (saved epoch + 1)
+RESUME_CHECKPOINT=""   # path to .pth to resume; empty = fresh start
+RESUME_EPOCH=""        # override epoch counter; empty = auto (saved epoch + 1)
 
 # ============================================================================
 # CORE TRAINING FLAGS
 # ============================================================================
 
 BATCH_SIZE=64
-# Scenes per gradient step.
-
-NUM_EPOCHS=500
-# 2000 scenes / 64 = 31 batches/epoch → 46,500 total gradient steps.
-
+NUM_EPOCHS=1500
 LEARNING_RATE=1e-4
-# Adam LR. Same as Run A and Run B.
-
 KL_WEIGHT=1e-6
-# Weight on KL divergence.
-
 EVAL_EVERY=50
-# Run validation every N epochs.
-
 FAILURE_THRESHOLD=100
-# Per-scene L2 above this is logged as a failure. Diagnostic only.
 
 # ============================================================================
 # STEP 1: COLOR RESIDUAL FLAGS
 # ============================================================================
 
 COLOR_RESIDUAL=True
-# Enable Step 1. Dataset stores (color - mean_color), model predicts
-# mean_color from shape_embed via MeanColorHead.
-# Must be True for all Move 1 runs — Step 1 is a prerequisite.
-
 MEAN_COLOR_WEIGHT=1.0
-# Weight on MSE(pred_mean_color, gt_mean_color).
-# total_loss += mean_color_weight * color_pred_loss
-
 COLOR_LOSS_WEIGHT=1.0
-# Weight on the color component of the main reconstruction loss.
 
 # ============================================================================
 # MOVE 1: SCENE SEMANTIC HEAD FLAGS
 # ============================================================================
 
 SCENE_SEMANTIC_HEAD=True
-# Adds SceneSemanticHead to shape_embed.
-# shape_embed [B,384] -> MLP(128->128) -> [B,72] softmax
-# Loss: KL(p_s || p_hat), supervision from label_dist precomputed in dataset.
-# Gradient path: independent of MeanColorHead and InfoNCE.
-# Set False to reproduce Run A exactly (color_residual only).
+# Adds SceneSemanticHead: shape_embed -> MLP(128->128) -> [B,72] softmax.
+# Loss: KL(p_s || p_hat). Independent gradient path into shape_embed.
+# Set False to isolate JEPA Idea 1 without Move 1.
 
 SCENE_SEMANTIC_WEIGHT=0.3
-# Weight on KL(p_s || p_hat).
-# total_loss += scene_semantic_weight * KL_loss
-# 0.3 = same scale as InfoNCE beta in Run B. Lower if recon degrades.
+
+# ============================================================================
+# JEPA IDEA 1: SPATIAL SEMANTIC HEAD FLAGS  ← NEW
+# ============================================================================
+
+JEPA_IDEA1=True
+# Adds SpatialSemanticHead: (shape_embed + voxel_center) -> [B,K,72] softmax.
+# Loss: mean KL(p_k || p_hat_k) over all occupied voxels per scene.
+# Forces shape_embed to encode WHERE categories are (spatially-resolved),
+# not just WHAT categories exist globally (Move 1).
+#
+# Dataset side: activates per-voxel label distribution computation in
+# gs_dataset_scenesplat.py (reuses the existing voxelization — no extra IO).
+# Returns voxel_centers_jepa [B,512,3], voxel_dists_jepa [B,512,72],
+# num_voxels_jepa [B] in each batch.
+#
+# Model side: instantiates SpatialSemanticHead in AlignedShapeLatentPerceiver.
+# NOT called inside forward() — training loop calls it directly after
+# forward() using _shape_embed_cache.  Forward() signature unchanged.
+#
+# Set False to reproduce Run C exactly (color_residual + scene_semantic only).
+
+JEPA_IDEA1_WEIGHT=1.0
+# Weight on spatial KL loss.
+# total_loss += jepa_idea1_weight * mean_KL(p_k || p_hat_k)
+# Start with 1.0 (same order of magnitude as scene_semantic_weight=0.3
+# because spatial KL is averaged over ~300 voxels which naturally makes
+# it smaller per-batch than the global 72-dim KL).
+# Increase if SpatialKL stays high and doesn't drive useful gradients.
+# Decrease if reconstruction L2 degrades.
 
 # ============================================================================
 # SEMANTIC (HIDDEN INFONCE) FLAGS
 # ============================================================================
 
 SEMANTIC_MODE="hidden"
-# Run C (default): "none" — isolates Move 1 without InfoNCE.
-# Run D:           "hidden" — adds InfoNCE on GS_decoder hidden state.
-# BOTH --semantic_mode and --segment_loss_weight >0 are required to activate.
+# "none"   = Run C/E: isolates shape_embed heads without InfoNCE.
+# "hidden" = Run D:   adds InfoNCE on GS_decoder hidden state.
 
 SEGMENT_WEIGHT=0.3
-# Run C (default): 0.0 — InfoNCE disabled.
-# Run D:           0.3 — must set SEMANTIC_MODE="hidden" as well.
-
 INSTANCE_WEIGHT=0.0
-# Instance-level contrastive loss weight. Disabled.
-
 SEMANTIC_TEMP=0.07
-# InfoNCE temperature. Only used when SEMANTIC_MODE=hidden.
-
 SEMANTIC_SUBSAMPLE=10000
-# Gaussians sampled per scene for InfoNCE.
-
 SAMPLING_STRATEGY="balanced"
-# 'balanced' = equal counts per ScanNet72 label class (reduces wall/floor bias).
-# 'random'   = uniform random sample from 40k Gaussians.
-
-# ============================================================================
-# LABEL INPUT  (DISABLED)
-# ============================================================================
-
-# label_input=False: standard 18-col tensor, encoder Linear(11, d_model).
-# Do not pass --label_input below.
-# Requires point_feats: 11 in shapevae-256.yaml.
 
 # ============================================================================
 # DATASET FLAGS
 # ============================================================================
 
-TRAIN_SCENES=3500
-# Training scenes. 2000/64 = 31 batches/epoch.
-
+TRAIN_SCENES=300
 VAL_SCENES=50
-# Validation scenes.
-
 SAMPLING_METHOD="opacity"
-# 'opacity' = keep top-40k by opacity (most visible Gaussians).
 
 # ============================================================================
 # NORMALIZATION FLAGS
 # ============================================================================
 
 USE_CANONICAL_NORM=True
-# Normalise each scene to a canonical sphere (radius=10m).
-# Must match any checkpoint you resume from.
-
 SCALE_NORM_MODE="linear"
-# 'linear' = scale * factor → small positive metres, decoder uses exp().
 
 # ============================================================================
 # VISUALIZATION FLAGS
 # ============================================================================
 
 PCA_VIS_FREQ=50
-# Save PCA plots of per-Gaussian semantic features every N epochs.
-# Only active when SEMANTIC_MODE != none.
-
 PCA_NUM_SCENES=3
-# Scenes to visualise per PCA run.
-
 PCA_BRIGHTNESS=1.25
-# Brightness multiplier for PCA color output images.
-
 RECON_PLY_FREQ=50
-# Save reconstructed .ply Gaussian files every N epochs.
-# mean_color is added back to residuals before saving → correct absolute RGB.
-
 RECON_PLY_NUM_SCENES=3
-# Scenes to reconstruct per PLY save.
-
 RECON_PLY_MAX_SH=3
-# Max spherical harmonics degree in saved PLY files.
 
 # ============================================================================
 # W&B
 # ============================================================================
 
 export WANDB_API_KEY="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"
-USE_WANDB=False.
-# Set False to disable W&B entirely — no other changes needed.
-# Key metrics to watch:
-#   val/scene_semantic_kl  — should decrease as shape_embed learns label dist
-#   val/color_pred_mse     — should stay stable (Step 1 path unchanged)
-#   val/l2_error           — target: better than Run A (1.43)
+USE_WANDB=True
 
 # ============================================================================
 # CONFIGURATION SUMMARY
 # ============================================================================
 
 echo "========================================================================"
-echo "  MOVE 1: SCENE SEMANTIC HEAD + STEP 1 COLOR RESIDUAL"
+echo "  CAN3TOK: STEP 1 + MOVE 1 + JEPA IDEA 1"
 echo "========================================================================"
-echo "  color_residual:        $COLOR_RESIDUAL  (Step 1 — MeanColorHead on shape_embed)"
+echo "  color_residual:        $COLOR_RESIDUAL  (Step 1 — MeanColorHead)"
 echo "  mean_color_weight:     $MEAN_COLOR_WEIGHT"
-echo "  scene_semantic_head:   $SCENE_SEMANTIC_HEAD  (Move 1 — SceneSemanticHead on shape_embed)"
+echo "  scene_semantic_head:   $SCENE_SEMANTIC_HEAD  (Move 1 — SceneSemanticHead)"
 echo "  scene_semantic_weight: $SCENE_SEMANTIC_WEIGHT"
-echo "  semantic_mode:         $SEMANTIC_MODE  (none=Run C, hidden=Run D)"
-echo "  segment_weight:        $SEGMENT_WEIGHT  (0.0=Run C, 0.3=Run D)"
-echo "  label_input:           DISABLED  (point_feats=11, 18-col tensor)"
+echo "  jepa_idea1:            $JEPA_IDEA1  (JEPA Idea 1 — SpatialSemanticHead)"
+echo "  jepa_idea1_weight:     $JEPA_IDEA1_WEIGHT"
+echo "  semantic_mode:         $SEMANTIC_MODE"
+echo "  segment_weight:        $SEGMENT_WEIGHT"
 echo "  train_scenes:          $TRAIN_SCENES"
 echo "  val_scenes:            $VAL_SCENES"
-echo "  epochs:                $NUM_EPOCHS  (31 batches/epoch = 46,500 steps)"
+echo "  epochs:                $NUM_EPOCHS"
 echo "  batch_size:            $BATCH_SIZE"
 echo "  lr:                    $LEARNING_RATE"
 echo "  kl_weight:             $KL_WEIGHT"
-echo "  scale_norm_mode:       $SCALE_NORM_MODE"
-echo "  wandb:                 $USE_WANDB"
 echo ""
-echo "  Gradient paths active:"
-echo "    recon:    L2_recon -> GS_decoder -> mu"
-echo "    Step 1:   MSE_color -> MeanColorHead -> shape_embed -> encoder token 0"
-echo "    Move 1:   KL_sem -> SceneSemanticHead -> shape_embed -> encoder token 0"
-if [ "$SEMANTIC_MODE" != "none" ]; then
-echo "    InfoNCE:  InfoNCE -> SemanticHead -> GS_decoder hidden -> mu"
+echo "  Gradient paths active into shape_embed:"
+echo "    Step 1:      MSE_color  -> MeanColorHead      -> shape_embed"
+if [ "$SCENE_SEMANTIC_HEAD" = "True" ]; then
+echo "    Move 1:      KL_sem     -> SceneSemanticHead   -> shape_embed"
+fi
+if [ "$JEPA_IDEA1" = "True" ]; then
+echo "    JEPA Idea 1: KL_spatial -> SpatialSemanticHead -> shape_embed"
+echo "                 (spatially-resolved: position + shape_embed -> voxel label dist)"
+fi
+if [ "$SEMANTIC_MODE" != "none" ] && [ "$SEGMENT_WEIGHT" != "0.0" ]; then
+echo "    InfoNCE:     InfoNCE    -> SemanticHead        -> GS_decoder hidden -> mu"
 fi
 echo "    (all paths are independent)"
 echo ""
 echo "  Prior results to beat:"
-echo "    Run A (color_residual only):         L2=1.43"
-echo "    Run B (color_residual + InfoNCE):    L2=1.99"
+echo "    Run A (color_residual only):             L2=1.43"
+echo "    Run B (color_residual + InfoNCE):        L2=1.99"
 echo "========================================================================"
 echo ""
 
@@ -272,7 +236,7 @@ echo ""
 
 TRAIN_CMD="python gs_can3tok_2.py"
 
-# Core training
+# Core
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
@@ -285,29 +249,32 @@ TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
 TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
 
-# Step 1: Color residual
+# Step 1
 if [ "$COLOR_RESIDUAL" = "True" ]; then
     TRAIN_CMD="$TRAIN_CMD --color_residual"
 fi
 TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
 
-# Move 1: Scene semantic head
+# Move 1
 if [ "$SCENE_SEMANTIC_HEAD" = "True" ]; then
     TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
 fi
 TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
 
-# Semantic: InfoNCE (disabled for Run C, enabled for Run D)
-# BOTH --semantic_mode hidden AND --segment_loss_weight >0 are required to activate
+# JEPA Idea 1  ← NEW
+if [ "$JEPA_IDEA1" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --jepa_idea1"
+fi
+TRAIN_CMD="$TRAIN_CMD --jepa_idea1_weight $JEPA_IDEA1_WEIGHT"
+
+# InfoNCE
 TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
 TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
-
-# No --label_input flag → defaults to False → 18-col tensor, point_feats=11
 
 # Normalization
 TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
@@ -349,40 +316,46 @@ TRAIN_EXIT=$?
 echo ""
 echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
 
-CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SEMANTIC_MODE}_colorresidual_scenesemantic_beta${SEGMENT_WEIGHT}"
+# Build expected checkpoint dir name (mirrors tag logic in gs_can3tok_2.py)
+CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SEMANTIC_MODE}"
+[ "$COLOR_RESIDUAL"      = "True"  ] && CKPT_DIR="${CKPT_DIR}_colorresidual"
+[ "$SCENE_SEMANTIC_HEAD" = "True"  ] && CKPT_DIR="${CKPT_DIR}_scenesemantic"
+[ "$JEPA_IDEA1"          = "True"  ] && CKPT_DIR="${CKPT_DIR}_jepa1"
+[ "$SEGMENT_WEIGHT"     != "0.0"   ] && CKPT_DIR="${CKPT_DIR}_beta${SEGMENT_WEIGHT}"
 
 if [ $TRAIN_EXIT -eq 0 ]; then
     echo ""
     echo "Checkpoints: $CKPT_DIR"
     echo ""
     echo "NEXT STEPS:"
-    echo "  1. Check Move 1 metrics:"
-    echo "       grep -E 'SceneSem|ColorPred|L2' logs/can3tok_move1_${SLURM_JOB_ID}.out | tail -30"
-    echo "       val/scene_semantic_kl  — should decrease during training"
-    echo "       val/color_pred_mse     — should stay stable (~same as Run A)"
-    echo "       val/l2_error           — target: better than Run A (1.43)"
+    echo "  1. Check key metrics:"
+    echo "       grep -E 'SpatialKL|SceneSem|L2' logs/can3tok_move1_${SLURM_JOB_ID}.out | tail -30"
+    echo "       SpatialKL  — should decrease (shape_embed learning spatial structure)"
+    echo "       SceneSemKL — should decrease (shape_embed learning global categories)"
+    echo "       val/l2_error — target: better than Run A (1.43)"
     echo ""
-    echo "  2. Run probe to measure label encoding improvement:"
+    echo "  2. Run probe to measure shape_embed encoding quality:"
     echo "       Set CKPT_SEMANTIC=$CKPT_DIR/best_model.pth in run_probe_label_distribution.sh"
     echo "       sbatch run_probe_label_distribution.sh"
-    echo "       Target: dominant_acc > 32% (Run A baseline from probe experiments)"
+    echo "       Target: dominant_acc > 32%  (Run A baseline)"
     echo ""
-    echo "  3. Compare to prior runs:"
-    echo "       Run A (color_residual only):         L2=1.43, dominant_acc=32%"
-    echo "       Run B (color_residual + InfoNCE):    L2=1.99, dominant_acc=22%"
-    echo "       This run (Run C): target L2<1.43, dominant_acc>32%"
+    echo "  3. JEPA Idea 1 ablation — compare:"
+    echo "       Run C: SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=False  (Move 1 only)"
+    echo "       Run E: SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=True   (this run)"
+    echo "       Run F: SCENE_SEMANTIC_HEAD=False, JEPA_IDEA1=True   (spatial only)"
+    echo "       Run A: both False                                    (baseline)"
     echo ""
-    echo "  4. To run Run D (add InfoNCE on top of Move 1):"
-    echo "       Set SEMANTIC_MODE=hidden and SEGMENT_WEIGHT=0.3 and resubmit."
-    echo ""
-    echo "  5. Resume if time limit hit:"
+    echo "  4. Resume if time limit hit:"
     echo "       RESUME_CHECKPOINT=$CKPT_DIR/best_model.pth"
-    echo "       (resume verifies scene_semantic_head=True matches checkpoint)"
+    echo "       (resume verifies jepa_idea1 matches checkpoint — uses strict=False if changed)"
 else
     echo ""
     echo "FAILED. Common fixes:"
-    echo "  point_feats wrong:  grep point_feats $YAML_PATH  (must be 11)"
-    echo "  label_dist missing: ensure gs_dataset_scenesplat.py returns 'label_dist' key"
-    echo "  OOM:                reduce SEMANTIC_SUBSAMPLE to 5000"
-    echo "  Error log:          cat logs/can3tok_move1_${SLURM_JOB_ID}.err"
+    echo "  point_feats wrong:      grep point_feats $YAML_PATH  (must be 11)"
+    echo "  missing dataset keys:   ensure gs_dataset returns voxel_centers_jepa,"
+    echo "                          voxel_dists_jepa, num_voxels_jepa when jepa_idea1=True"
+    echo "  missing model attr:     ensure sal_perceiver has SpatialSemanticHead class"
+    echo "                          and AlignedShapeLatentPerceiver accepts jepa_idea1 param"
+    echo "  OOM:                    reduce BATCH_SIZE to 32 or SEMANTIC_SUBSAMPLE to 5000"
+    echo "  Error log:              cat logs/can3tok_move1_${SLURM_JOB_ID}.err"
 fi

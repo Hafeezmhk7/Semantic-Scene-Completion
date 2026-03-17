@@ -1,41 +1,64 @@
 """
 Can3Tok Training — Step 1: Color Residual + Move 1: Scene Semantic Head
-========================================================================
+                 + Position Scaffold (Scaffold-GS inspired)
+=========================================================================
 
 WHAT THIS FILE IMPLEMENTS
 --------------------------
-This is the complete training script for Can3Tok VAE with:
-  - Step 1 Color Residual (--color_residual)
-  - Move 1 Scene Semantic Head (--scene_semantic_head) ← NEW
+Complete training script for Can3Tok VAE with:
+  Step 1:  Color Residual  (--color_residual)
+  Move 1:  Scene Semantic Head  (--scene_semantic_head)
+  Scaffold: Position scaffold  (--position_scaffold)   ← NEW
+  InfoNCE:  Per-Gaussian contrastive  (--semantic_mode hidden)
 
-MOVE 1 — SCENE SEMANTIC HEAD
-------------------------------
-Adds SceneSemanticHead to shape_embed: a second explicit gradient path
-into the global scene token alongside MeanColorHead.
+POSITION SCAFFOLD (--position_scaffold)
+----------------------------------------
+Inspired by Scaffold-GS (Lu et al., CVPR 2024) and LION (Zeng et al., NeurIPS 2022).
 
-  MODEL (sal_perceiver_II_initialization.py):
-    SceneSemanticHead: shape_embed [B,384] -> MLP(128->128) -> [B,72] softmax
-    Stored as self.last_scene_semantic_pred (instance attribute).
+The dataset divides each scene into 8×8×8 = 512 super-voxels, one per latent
+token. For each super-voxel k, an anchor position â_k = mean(positions in k).
+Position offsets δp_i = p_i − â_{k(i)} replace absolute coordinates as the
+decoder reconstruction target.
+
+  MODEL (sal_perceiver_dist_changes.py):
+    AnchorPositionHead: shape_embed [B,384] → MLP(512→512) → [B,512,3] anchors
+    Stored as self.last_anchor_pred (instance attribute).
+
+  DATASET (gs_dataset_scenesplat.py):
+    Returns: scaffold_anchors [B,512,3], scaffold_token_ids [B,40000],
+             position_offsets [B,40000,3]
 
   TRAINING LOOP (this file):
-    p_s   = compute_label_distribution(segment_labels)   # [B, 72] gt dist
-    p_hat = gs_autoencoder.shape_model.last_scene_semantic_pred  # [B, 72]
-    scene_semantic_loss = scene_semantic_kl_loss(p_hat, p_s)
-    total_loss += scene_semantic_weight * scene_semantic_loss
+    target_pos = batch_data['position_offsets']   ← offsets, not absolute
+    anchor_pred = gs_autoencoder.shape_model.last_anchor_pred
+    anchor_loss = MSE(anchor_pred, scaffold_anchors)
+    total_loss += anchor_loss_weight * anchor_loss
 
-  Gradient path: KL_loss -> SceneSemanticHead -> shape_embed -> encoder token 0
-  Independent of MeanColorHead and InfoNCE paths.
+    Gradient path: MSE_anchor -> AnchorPositionHead -> shape_embed -> encoder
 
-CHECKPOINT METADATA
--------------------
-  scene_semantic_head: bool — stored in every checkpoint so probe/resume
-  scripts can auto-detect and build the correct model architecture.
+  RECONSTRUCTION (validation / PLY):
+    abs_pos = pred_offset + anchor_pred[token_id]
+    (absolute positions recovered for visualization)
 
-ABLATION TABLE (runs to compare):
-  Run A: color_residual only              (done: job 20207686, L2=1.43)
-  Run B: color_residual + InfoNCE hidden  (done: job 20231337, L2=1.99)
-  Run C: color_residual + scene_semantic  (NEW: isolates Move 1)
-  Run D: color_residual + scene_semantic + InfoNCE hidden (NEW: full model)
+ABLATION TABLE
+--------------
+  Run A: color_residual only                      (baseline)
+  Run C: color_residual + scene_semantic
+  Run S: color_residual + position_scaffold        (scaffold only)
+  Run SC: color_residual + scene_semantic + scaffold
+  Run G: color_residual + InfoNCE
+  Run H: color_residual + scene_semantic + InfoNCE
+  Run HS: all objectives including scaffold
+
+VARIANCE REDUCTION EXPECTED
+-----------------------------
+  Position offset range:    ~[-1.0, +1.0]m
+  Absolute position range:  ~[-10.0, +10.0]m
+  Variance ratio:           ~10×
+
+This should manifest as a lower plateau for the position component of the
+reconstruction loss compared to runs without scaffold (compare 'position_loss'
+in the per-parameter breakdown printed each epoch).
 """
 
 import torch
@@ -63,7 +86,7 @@ sys.stderr.reconfigure(line_buffering=True)
 os.environ['PYTHONUNBUFFERED'] = '1'
 
 # ============================================================================
-# PARAMETER INDICES  (identical for label_input=True/False)
+# PARAMETER INDICES
 # ============================================================================
 
 PARAM_SLICES = {
@@ -75,80 +98,25 @@ PARAM_SLICES = {
 }
 
 GEOMETRIC_INDICES = (
-    list(range(4, 7))   # xyz
-  + list(range(7, 10))  # rgb / residuals
-  + [10]                # opacity
-  + list(range(11, 14)) # scale
-  + list(range(14, 18)) # quaternion
-)  # 14 values, cols 4-17
-
-# ============================================================================
-# MOVE 1 HELPERS
-# ============================================================================
-
-# def compute_label_distribution(
-#     segment_labels: torch.Tensor,
-#     n_labels: int = 72,
-# ) -> torch.Tensor:
-#     """
-#     Compute per-scene ScanNet72 label distribution from raw segment labels.
-
-#     segment_labels: [B, N]  long tensor, values 0-71 (valid) or <0 (missing)
-#     returns:        [B, 72] float tensor, rows sum to 1.0
-#                     All-zero row if scene has no valid labels.
-
-#     Uses vectorised torch ops — no Python loop over batch items.
-#     This is the ground truth that SceneSemanticHead is trained to predict.
-#     Same computation as in probe_label_distribution.py LabelDistributionDataset.
-#     """
-#     B, N = segment_labels.shape
-#     device = segment_labels.device
-
-#     p_s = torch.zeros(B, n_labels, dtype=torch.float32, device=device)
-
-#     # One-hot encode valid labels, ignore negative (missing) labels
-#     valid_mask = segment_labels >= 0                             # [B, N]
-#     safe_labels = segment_labels.clone()
-#     safe_labels[~valid_mask] = 0                                 # clamp for one_hot, masked out next
-
-#     one_hot = F.one_hot(safe_labels, num_classes=n_labels).float()  # [B, N, 72]
-#     one_hot = one_hot * valid_mask.unsqueeze(-1).float()             # zero out invalid
-
-#     counts     = one_hot.sum(dim=1)                              # [B, 72]
-#     n_valid    = valid_mask.float().sum(dim=1, keepdim=True)     # [B, 1]
-#     n_valid    = n_valid.clamp(min=1.0)                          # avoid div by zero
-
-#     p_s = counts / n_valid                                       # [B, 72]  sums to 1
-
-#     return p_s
-
-
-def scene_semantic_kl_loss(
-    p_hat: torch.Tensor,
-    p_s:   torch.Tensor,
-    eps:   float = 1e-8,
-) -> torch.Tensor:
-    """
-    KL divergence loss: D_KL(p_s || p_hat) for scene-level semantic distribution.
-
-    p_hat: [B, 72]  model predictions (softmax, sums to 1)
-    p_s:   [B, 72]  ground truth distributions (sums to 1)
-    returns: scalar mean KL divergence across batch
-
-    D_KL(p_s || p_hat) = Σ p_s * log(p_s / p_hat)
-
-    Scenes where p_s is all-zero (no valid labels) contribute zero loss
-    because p_s * log(...) = 0. No masking needed.
-    """
-    p_hat_clamped = torch.clamp(p_hat, min=eps)
-    kl_per_scene  = (p_s * (torch.log(p_s + eps) - torch.log(p_hat_clamped))).sum(dim=-1)
-    return kl_per_scene.mean()
+    list(range(4, 7))    # xyz
+  + list(range(7, 10))   # rgb / residuals
+  + [10]                 # opacity
+  + list(range(11, 14))  # scale
+  + list(range(14, 18))  # quaternion
+)  # 14 values, feature tensor cols 4-17
 
 # ============================================================================
 # LOSS HELPERS
 # ============================================================================
 
 def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0):
+    """
+    L2 reconstruction loss over all 14 Gaussian attributes.
+
+    When position_scaffold=True, 'target' has position columns (0:3)
+    replaced with offsets δp_i. The loss is computed identically; it just
+    rewards the decoder for predicting small offsets rather than large absolutes.
+    """
     if color_weight == 1.0:
         return torch.norm(prediction - target, p=2) / batch_size
     loss_pos   = torch.norm(prediction[:, :, 0:3] - target[:, :, 0:3], p=2)
@@ -163,13 +131,20 @@ def compute_individual_losses(prediction, target):
         for name, sl in PARAM_SLICES.items()
     }
 
+
+def scene_semantic_kl_loss(p_hat, p_s, eps=1e-8):
+    """D_KL(p_s ‖ p_hat) for scene-level label distribution."""
+    p_hat_clamped = torch.clamp(p_hat, min=eps)
+    kl = (p_s * (torch.log(p_s + eps) - torch.log(p_hat_clamped))).sum(dim=-1)
+    return kl.mean()
+
 # ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
 
 parser = argparse.ArgumentParser(description='Can3Tok Training')
 
-# Core training
+# Core
 parser.add_argument('--batch_size',           type=int,   default=64)
 parser.add_argument('--num_epochs',           type=int,   default=1000)
 parser.add_argument('--lr',                   type=float, default=1e-4)
@@ -183,7 +158,7 @@ parser.add_argument('--val_scenes',           type=int,   default=None)
 parser.add_argument('--sampling_method',      type=str,   default='opacity',
                     choices=['random', 'opacity', 'hybrid'])
 
-# Semantic (per-Gaussian InfoNCE)
+# Semantic InfoNCE
 parser.add_argument('--semantic_mode',        type=str,   default='none',
                     choices=['none', 'hidden', 'geometric', 'attention', 'dist'])
 parser.add_argument('--segment_loss_weight',  type=float, default=0.0)
@@ -194,23 +169,25 @@ parser.add_argument('--sampling_strategy',    type=str,   default='balanced',
                     choices=['random', 'balanced'])
 
 # Step 1: Color residual
-parser.add_argument('--color_residual',       action='store_true', default=False,
-    help='Enable Step 1 color residual. Dataset stores color-mean_color; '
-         'model predicts mean_color from shape_embed via MeanColorHead.')
-parser.add_argument('--mean_color_weight',    type=float, default=1.0,
-    help='Weight on MSE(mean_color_pred, mean_color_gt).')
+parser.add_argument('--color_residual',       action='store_true', default=False)
+parser.add_argument('--mean_color_weight',    type=float, default=1.0)
 
-# Move 1: Scene semantic head  ← NEW
-parser.add_argument('--scene_semantic_head',   action='store_true', default=False,
-    help='Move 1: Add SceneSemanticHead to shape_embed. Predicts per-scene '
-         'ScanNet72 label distribution [B,72] from shape_embed. '
-         'Loss: KL(p_s || p_hat) weighted by --scene_semantic_weight. '
-         'Gives shape_embed a 2nd gradient path alongside MeanColorHead.')
-parser.add_argument('--scene_semantic_weight', type=float, default=0.3,
-    help='Weight for SceneSemanticHead KL loss (default 0.3). '
-         'total_loss += scene_semantic_weight * KL(p_s || p_hat).')
+# Move 1: Scene semantic head
+parser.add_argument('--scene_semantic_head',   action='store_true', default=False)
+parser.add_argument('--scene_semantic_weight', type=float, default=0.3)
 
-# Option 1: label as encoder input
+# Position scaffold (NEW)
+parser.add_argument('--position_scaffold',     action='store_true', default=False,
+    help='Enable Scaffold-GS inspired position residual encoding. '
+         'Dataset returns scaffold_anchors [B,512,3], scaffold_token_ids [B,40000], '
+         'position_offsets [B,40000,3]. Model adds AnchorPositionHead on shape_embed. '
+         'Decoder trained on offset targets δp_i instead of absolute positions. '
+         'Reconstruction: abs_pos = offset + anchor_pred[token_id].')
+parser.add_argument('--anchor_loss_weight',    type=float, default=1.0,
+    help='Weight for MSE(anchor_pred, scaffold_anchors). '
+         'total_loss += anchor_loss_weight * anchor_loss.')
+
+# Label input
 parser.add_argument('--label_input',          action='store_true', default=False)
 parser.add_argument('--no_label_input',       dest='label_input', action='store_false')
 
@@ -248,14 +225,11 @@ parser.add_argument('--resume_epoch',         type=int, default=None)
 
 args = parser.parse_args()
 
-# ── Semantic activation ───────────────────────────────────────────────────────
 semantic_requested    = (args.semantic_mode != 'none')
 semantic_loss_enabled = (args.segment_loss_weight > 0 or args.instance_loss_weight > 0)
 enable_semantic       = semantic_requested and semantic_loss_enabled
 effective_semantic_mode = args.semantic_mode if enable_semantic else 'none'
-
-# Need segment_labels if InfoNCE OR SceneSemanticHead is active
-need_segment_labels = enable_semantic or args.scene_semantic_head
+need_segment_labels   = enable_semantic or args.scene_semantic_head
 
 # ============================================================================
 # W&B
@@ -269,41 +243,30 @@ if args.use_wandb:
         run_name = f"can3tok_job_{job_id}_{effective_semantic_mode}"
         if args.color_residual:       run_name += "_colorresidual"
         if args.scene_semantic_head:  run_name += "_scenesemantic"
+        if args.position_scaffold:    run_name += "_scaffold"
         if args.label_input:          run_name += "_labelinput"
         if enable_semantic:           run_name += f"_beta{args.segment_loss_weight}"
-        if args.resume_checkpoint:    run_name += "_resumed"
         wandb_run = wandb.init(
             entity=args.wandb_entity, project=args.wandb_project, name=run_name,
-            config=vars(args)
-        )
+            config=vars(args))
         wandb_enabled = True
-        print("W&B enabled")
     except Exception as e:
         print(f"W&B failed: {e}")
 
 # ============================================================================
-# DEVICE
+# DEVICE + PATHS
 # ============================================================================
 
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-# ============================================================================
-# DATA PATHS
-# ============================================================================
-
+device    = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 data_path = "/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs"
 
-# ============================================================================
-# CHECKPOINT FOLDER
-# ============================================================================
-
 job_id = os.environ.get('SLURM_JOB_ID', None)
-tag = f"RGB_job_{job_id}_{effective_semantic_mode}" if job_id else \
-      f"RGB_local_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{effective_semantic_mode}"
-
+tag    = (f"RGB_job_{job_id}_{effective_semantic_mode}" if job_id
+          else f"RGB_local_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{effective_semantic_mode}")
 if args.color_residual:       tag += "_colorresidual"
 if args.scene_semantic_head:  tag += "_scenesemantic"
+if args.position_scaffold:    tag += "_scaffold"
 if args.label_input:          tag += "_labelinput"
 if enable_semantic:           tag += f"_beta{args.segment_loss_weight}"
 if not args.use_canonical_norm: tag += "_raw"
@@ -319,23 +282,22 @@ print(f"\n{'='*70}")
 print(f"CAN3TOK TRAINING")
 print(f"{'='*70}")
 print(f"  Semantic mode:         {effective_semantic_mode}")
-print(f"  Enable semantic:       {enable_semantic}")
 print(f"  Color residual:        {args.color_residual}  (Step 1 — MeanColorHead)")
 print(f"  Mean color weight:     {args.mean_color_weight}")
 print(f"  Scene semantic head:   {args.scene_semantic_head}  (Move 1 — SceneSemanticHead)")
 print(f"  Scene semantic weight: {args.scene_semantic_weight}")
+print(f"  Position scaffold:     {args.position_scaffold}  (Scaffold-GS inspired)")
+print(f"  Anchor loss weight:    {args.anchor_loss_weight}")
+if args.position_scaffold:
+    print(f"\n  Position scaffold ACTIVE:")
+    print(f"    8x8x8=512 super-voxels → 512 anchor positions â_k")
+    print(f"    Decoder target: δp_i = p_i - â_{{k(i)}}  (range ~[-1,+1]m)")
+    print(f"    AnchorPositionHead: shape_embed → [B,512,3] anchor predictions")
+    print(f"    L_anchor = MSE(pred_anchors, gt_anchors), weight={args.anchor_loss_weight}")
+    print(f"    Reconstruction: abs_pos = δp̂_i + anchor_pred[token_id_i]")
 print(f"  Label input:           {args.label_input}")
-print(f"  Scale norm mode:       {args.scale_norm_mode}")
-print(f"  Canonical norm:        {args.use_canonical_norm}")
 print(f"  Device:                {device}")
 print(f"  Save path:             {save_path}")
-if args.resume_checkpoint:
-    print(f"  Resume from:           {args.resume_checkpoint}")
-if args.scene_semantic_head:
-    print(f"\n  Move 1 ACTIVE: shape_embed -> SceneSemanticHead -> [B,72] softmax")
-    print(f"    Loss: KL(p_s || p_hat), weight={args.scene_semantic_weight}")
-    print(f"    Supervision: ScanNet72 label dist from segment.npy")
-    print(f"    Gradient: independent of MeanColorHead and InfoNCE paths")
 print(f"{'='*70}\n")
 
 # ============================================================================
@@ -343,21 +305,20 @@ print(f"{'='*70}\n")
 # ============================================================================
 
 print("Loading model config...")
-config_path = "./model/configs/aligned_shape_latents/shapevae-256.yaml"
-model_config_perceiver = get_config_from_file(config_path)
-model_config = model_config_perceiver.model
-model_config.params.shape_module_cfg.params.semantic_mode     = effective_semantic_mode
-model_config.params.shape_module_cfg.params.color_residual    = args.color_residual
-model_config.params.shape_module_cfg.params.scene_semantic_head = args.scene_semantic_head  # Move 1
+config_path  = "./model/configs/aligned_shape_latents/shapevae-256.yaml"
+model_config = get_config_from_file(config_path).model
+p = model_config.params.shape_module_cfg.params
+p.semantic_mode       = effective_semantic_mode
+p.color_residual      = args.color_residual
+p.scene_semantic_head = args.scene_semantic_head
+p.position_scaffold   = args.position_scaffold     # NEW: pass scaffold flag to model
 
-cfg_point_feats = model_config.params.shape_module_cfg.params.point_feats
+cfg_point_feats = p.point_feats
 expected_feats  = 12 if args.label_input else 11
 if cfg_point_feats != expected_feats:
     raise ValueError(
         f"point_feats mismatch: yaml={cfg_point_feats}, "
-        f"label_input={args.label_input} requires {expected_feats}. "
-        f"Update shapevae-256.yaml."
-    )
+        f"label_input={args.label_input} requires {expected_feats}.")
 print(f"  point_feats={cfg_point_feats} OK")
 
 gs_autoencoder = instantiate_from_config(model_config)
@@ -374,44 +335,34 @@ best_epoch    = 0
 
 if args.resume_checkpoint:
     print(f"\nResuming from: {args.resume_checkpoint}")
-    if not os.path.exists(args.resume_checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found: {args.resume_checkpoint}")
     ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
 
-    # Verify color_residual compatibility
-    saved_cr = ckpt.get('color_residual', False)
-    if saved_cr != args.color_residual:
-        raise ValueError(
-            f"color_residual mismatch: checkpoint={saved_cr}, current={args.color_residual}. "
-            f"MeanColorHead exists only when color_residual=True — incompatible."
-        )
-    # Verify label_input
-    saved_li = ckpt.get('label_input', False)
-    if saved_li != args.label_input:
-        raise ValueError(
-            f"label_input mismatch: checkpoint={saved_li}, current={args.label_input}. "
-            f"input_proj dimension differs — cannot resume across this boundary."
-        )
-    # Verify scene_semantic_head
-    saved_ssh = ckpt.get('scene_semantic_head', False)
-    if saved_ssh != args.scene_semantic_head:
-        print(f"  scene_semantic_head changed: {saved_ssh} -> {args.scene_semantic_head} "
-              f"(strict=False)")
-        gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=False)
-    else:
-        saved_mode = ckpt.get('semantic_mode', 'none')
-        if saved_mode != effective_semantic_mode:
-            print(f"  Semantic mode changed: {saved_mode} -> {effective_semantic_mode} "
-                  f"(strict=False)")
-            gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=False)
-        else:
-            gs_autoencoder.load_state_dict(ckpt['model_state_dict'])
+    # Verify critical architecture flags match the checkpoint
+    for flag_name, current_val in [
+        ('color_residual',    args.color_residual),
+        ('label_input',       args.label_input),
+        ('position_scaffold', args.position_scaffold),
+    ]:
+        saved_val = ckpt.get(flag_name, False)
+        if saved_val != current_val:
+            raise ValueError(
+                f"{flag_name} mismatch: checkpoint={saved_val}, current={current_val}. "
+                f"These flags change the model architecture — cannot resume across them.")
 
+    saved_ssh = ckpt.get('scene_semantic_head', False)
+    saved_mode = ckpt.get('semantic_mode', 'none')
+    strict = (saved_ssh == args.scene_semantic_head and
+              saved_mode == effective_semantic_mode)
+    if not strict:
+        print(f"  Architecture changed (ssh: {saved_ssh}→{args.scene_semantic_head}, "
+              f"mode: {saved_mode}→{effective_semantic_mode}), loading strict=False")
+    gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=strict)
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    saved_epoch = ckpt.get('epoch', 0)
-    start_epoch = args.resume_epoch if args.resume_epoch is not None else saved_epoch + 1
+    start_epoch   = ckpt.get('epoch', 0) + 1
+    if args.resume_epoch is not None:
+        start_epoch = args.resume_epoch
     best_val_loss = ckpt.get('val_l2_error', ckpt.get('best_val_l2', float('inf')))
-    best_epoch    = saved_epoch
+    best_epoch    = ckpt.get('epoch', 0)
     print(f"  Resumed at epoch {start_epoch} (saved val L2: {best_val_loss:.4f})")
 
 # ============================================================================
@@ -432,11 +383,11 @@ gs_dataset_train = gs_dataset(
     scale_norm_mode=args.scale_norm_mode,
     label_input=args.label_input,
     color_residual=args.color_residual,
+    position_scaffold=args.position_scaffold,   # NEW
 )
 trainDataLoader = Data.DataLoader(
     dataset=gs_dataset_train, batch_size=args.batch_size,
-    shuffle=True, num_workers=9, pin_memory=True, persistent_workers=True,
-)
+    shuffle=True, num_workers=9, pin_memory=True, persistent_workers=True)
 
 print(f"\n--- Validation Dataset ---")
 gs_dataset_val = gs_dataset(
@@ -450,11 +401,11 @@ gs_dataset_val = gs_dataset(
     scale_norm_mode=args.scale_norm_mode,
     label_input=args.label_input,
     color_residual=args.color_residual,
+    position_scaffold=args.position_scaffold,   # NEW
 )
 valDataLoader = Data.DataLoader(
     dataset=gs_dataset_val, batch_size=args.batch_size,
-    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True,
-)
+    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True)
 
 print(f"\n{'='*70}")
 print(f"  Train: {len(gs_dataset_train)} scenes, {len(trainDataLoader)} batches/epoch")
@@ -463,7 +414,7 @@ print(f"  Total steps: {len(trainDataLoader) * args.num_epochs:,}")
 print(f"{'='*70}\n")
 
 # ============================================================================
-# CHECKPOINT METADATA  (written into every saved .pth)
+# CHECKPOINT METADATA
 # ============================================================================
 
 _ckpt_meta = {
@@ -471,9 +422,11 @@ _ckpt_meta = {
     'enable_semantic':      enable_semantic,
     'label_input':          args.label_input,
     'color_residual':       args.color_residual,
-    'scene_semantic_head':  args.scene_semantic_head,   # Move 1
+    'scene_semantic_head':  args.scene_semantic_head,
+    'position_scaffold':    args.position_scaffold,    # NEW
     'mean_color_weight':    args.mean_color_weight,
     'scene_semantic_weight': args.scene_semantic_weight,
+    'anchor_loss_weight':   args.anchor_loss_weight,   # NEW
     'color_loss_weight':    args.color_loss_weight,
     'use_canonical_norm':   args.use_canonical_norm,
     'scale_norm_mode':      args.scale_norm_mode,
@@ -488,14 +441,16 @@ def evaluate_model(model, dataloader, device, epoch=None):
     total_l2 = total_kl = 0.0
     total_color_pred_loss    = 0.0
     total_scene_semantic_kl  = 0.0
+    total_anchor_loss        = 0.0    # NEW: track anchor prediction quality
     per_param = {k: 0.0 for k in PARAM_SLICES}
     n_scenes  = 0
 
-    scene_data_list  = []
     recon_preds_list = []
     recon_means_list = []
+    # When scaffold is on, also store token_ids and anchors for PLY reconstruction
+    recon_tids_list  = []
+    recon_anch_list  = []
 
-    do_pca   = (epoch is not None and epoch % args.pca_vis_freq  == 0 and enable_semantic)
     do_recon = (epoch is not None and epoch % args.recon_ply_freq == 0)
 
     with torch.no_grad():
@@ -504,46 +459,37 @@ def evaluate_model(model, dataloader, device, epoch=None):
             mean_color_gt  = batch_data['mean_color'].float().to(device)
             B = UV_gs_batch.shape[0]
 
-            # # Load segment labels if needed for Move 1 eval metric
-            # segment_labels_cpu = batch_data.get('segment_labels', None)
-            # segment_labels_gpu = None
-            # if need_segment_labels and segment_labels_cpu is not None:
-            #     segment_labels_gpu = segment_labels_cpu.long().to(device)
-            segment_labels_cpu = batch_data.get('segment_labels', None)
-            need_sem = (do_pca and len(scene_data_list) < args.pca_num_scenes
-                        and segment_labels_cpu is not None)
-            was_train = model.training
-            if need_sem:
-                model.train()
-
             (shape_embed, mu, log_var, z,
-             UV_gs_recover, per_gaussian_features) = model(
-                UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3]
-            )
-            mean_color_pred       = model.shape_model.last_mean_color_pred
-            scene_semantic_pred   = model.shape_model.last_scene_semantic_pred
+             UV_gs_recover, _) = model(
+                UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3])
 
-            if need_sem and not was_train:
-                model.eval()
+            mean_color_pred     = model.shape_model.last_mean_color_pred
+            scene_semantic_pred = model.shape_model.last_scene_semantic_pred
+            anchor_pred         = model.shape_model.last_anchor_pred   # [B,512,3] or None
 
-            target     = UV_gs_batch[:, :, GEOMETRIC_INDICES]
+            # Build reconstruction target (absolute or offset based on flag)
+            target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]  # [B, 40000, 14]
+            if args.position_scaffold:
+                position_offsets = batch_data['position_offsets'].float().to(device)
+                target = target_abs.clone()
+                target[:, :, 0:3] = position_offsets   # swap in offset targets
+            else:
+                target = target_abs
+
             pred_3d    = UV_gs_recover.reshape(B, -1, 14)
-            recon_loss = compute_reconstruction_loss(
-                pred_3d, target, B, args.color_loss_weight)
+            recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
+            kl_loss    = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
 
-            kl_loss = -0.5 * torch.sum(
-                1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
-
-            # Step 1: color prediction error
             if mean_color_pred is not None and args.color_residual:
-                cp_loss = F.mse_loss(mean_color_pred, mean_color_gt).item()
-                total_color_pred_loss += cp_loss * B
+                total_color_pred_loss += F.mse_loss(mean_color_pred, mean_color_gt).item() * B
 
-            # Move 1: scene semantic KL error
             if scene_semantic_pred is not None and args.scene_semantic_head:
-                p_s   = batch_data['label_dist'].float().to(device)       # ← precomputed
-                ss_kl = scene_semantic_kl_loss(scene_semantic_pred, p_s).item()
-                total_scene_semantic_kl += ss_kl * B
+                p_s   = batch_data['label_dist'].float().to(device)
+                total_scene_semantic_kl += scene_semantic_kl_loss(scene_semantic_pred, p_s).item() * B
+
+            if anchor_pred is not None and args.position_scaffold:
+                scaffold_anchors = batch_data['scaffold_anchors'].float().to(device)
+                total_anchor_loss += F.mse_loss(anchor_pred, scaffold_anchors).item() * B
 
             total_l2 += recon_loss.item()
             total_kl += kl_loss.sum().item()
@@ -553,70 +499,59 @@ def evaluate_model(model, dataloader, device, epoch=None):
             for k in per_param:
                 per_param[k] += ind[k]
 
-            # Collect for PCA
-            if need_sem and per_gaussian_features is not None:
-                pos = UV_gs_batch[:, :, 4:7].cpu().numpy()
-                col = UV_gs_batch[:, :, 7:10].cpu().numpy()
-                sem = per_gaussian_features.cpu().numpy()
-                for si in range(B):
-                    if len(scene_data_list) >= args.pca_num_scenes:
-                        break
-                    scene_data_list.append({
-                        'semantic_features': sem[si],
-                        'positions': pos[si], 'colors': col[si],
-                        'coords': pos[si], 'scene_id': len(scene_data_list),
-                    })
-
-            # Collect for PLY reconstruction
+            # Collect PLY reconstruction data (limited to recon_ply_num_scenes)
             if do_recon and len(recon_preds_list) < args.recon_ply_num_scenes:
                 preds_np = pred_3d.cpu().numpy()
                 means_np = mean_color_gt.cpu().numpy()
+                tids_np  = batch_data['scaffold_token_ids'].numpy()
+                anch_np  = (anchor_pred.cpu().numpy() if anchor_pred is not None
+                            else batch_data['scaffold_anchors'].numpy())
                 for si in range(B):
                     if len(recon_preds_list) >= args.recon_ply_num_scenes:
                         break
                     recon_preds_list.append(preds_np[si])
                     recon_means_list.append(means_np[si])
+                    recon_tids_list.append(tids_np[si])
+                    recon_anch_list.append(anch_np[si])
 
-    # PCA visualizations
-    if do_pca and scene_data_list and save_path:
-        vis_dir = Path(save_path) / "pca_visualizations" / f"epoch_{epoch:03d}"
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        for si, sd in enumerate(scene_data_list):
-            try:
-                visualize_comparison(
-                    coords=sd['coords'], semantic_features=sd['semantic_features'],
-                    positions=sd['positions'], colors=sd['colors'],
-                    output_dir=vis_dir, scene_name=f"scene_{si:03d}",
-                    brightness=args.pca_brightness,
-                )
-            except Exception as e:
-                print(f"  PCA error scene {si}: {e}")
-
-    # PLY reconstruction — add mean_color back to residuals before saving
+    # ── PLY reconstruction with scaffold-aware absolute position recovery ──────
     if do_recon and recon_preds_list and save_path:
         try:
             all_preds = np.stack(recon_preds_list, axis=0)
+
+            # Step 1: add mean_color back to color residuals
             if args.color_residual:
                 for si in range(len(all_preds)):
                     all_preds[si, :, 3:6] += recon_means_list[si]
                     all_preds[si, :, 3:6]  = np.clip(all_preds[si, :, 3:6], 0, 1)
+
+            # Position scaffold: recover absolute positions from predicted offsets + anchors.
+            # abs_pos_i = predicted_offset_i + anchor_pred[token_id_i]
+            if args.position_scaffold:
+                for si in range(len(all_preds)):
+                    token_ids = recon_tids_list[si]   # [40000]
+                    anchors   = recon_anch_list[si]   # [512, 3]
+                    all_preds[si, :, 0:3] += anchors[token_ids]
+
             recon_dir = Path(save_path) / "reconstructed_gaussians" / f"epoch_{epoch:03d}"
             save_reconstructed_gaussians(
                 predictions=all_preds, output_dir=recon_dir, epoch=epoch,
                 num_scenes=len(all_preds), max_sh_degree=args.recon_ply_max_sh,
-                color_mode="1", prefix="scene",
-            )
+                color_mode="1", prefix="scene")
         except Exception as e:
             print(f"  PLY save error: {e}")
 
     model.train()
+    n = max(n_scenes, 1)
     return {
-        'avg_l2_error':           total_l2,
-        'avg_kl':                 total_kl / max(n_scenes, 1),
-        'color_pred_loss':        total_color_pred_loss / max(n_scenes, 1),
-        'scene_semantic_kl':      total_scene_semantic_kl / max(n_scenes, 1),
-        **{f'{k}_loss': v / max(n_scenes, 1) for k, v in per_param.items()},
+        'avg_l2_error':       total_l2,
+        'avg_kl':             total_kl / n,
+        'color_pred_loss':    total_color_pred_loss / n,
+        'scene_semantic_kl':  total_scene_semantic_kl / n,
+        'anchor_loss':        total_anchor_loss / n,    # NEW
+        **{f'{k}_loss': v / n for k, v in per_param.items()},
     }
+
 
 # ============================================================================
 # TRAINING LOOP
@@ -632,7 +567,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     gs_autoencoder.train()
 
     epoch_loss = epoch_recon = epoch_kl = epoch_sem = 0.0
-    epoch_color_pred = epoch_scene_semantic = 0.0
+    epoch_color_pred = epoch_scene_semantic = epoch_anchor = 0.0
     epoch_pos = epoch_col = epoch_opa = epoch_scl = epoch_rot = 0.0
 
     for i_batch, batch_data in enumerate(trainDataLoader):
@@ -640,7 +575,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         mean_color_gt = batch_data['mean_color'].float().to(device)
         B = UV_gs_batch.shape[0]
 
-        # Load segment labels when needed for InfoNCE or SceneSemanticHead
         segment_labels  = None
         instance_labels = None
         if need_segment_labels:
@@ -648,42 +582,68 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             if enable_semantic:
                 instance_labels = batch_data['instance_labels'].long().to(device)
 
+        # Scaffold batch data
+        if args.position_scaffold:
+            scaffold_anchors   = batch_data['scaffold_anchors'].float().to(device)    # [B,512,3]
+            scaffold_token_ids = batch_data['scaffold_token_ids'].long().to(device)   # [B,40000]
+            position_offsets   = batch_data['position_offsets'].float().to(device)    # [B,40000,3]
+
         optimizer.zero_grad()
 
         # ── Forward ──────────────────────────────────────────────────────────
         (shape_embed, mu, log_var, z,
          UV_gs_recover, per_gaussian_features) = gs_autoencoder(
-            UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3]
-        )
+            UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3])
+
         mean_color_pred     = gs_autoencoder.shape_model.last_mean_color_pred
         scene_semantic_pred = gs_autoencoder.shape_model.last_scene_semantic_pred
+        anchor_pred         = gs_autoencoder.shape_model.last_anchor_pred  # [B,512,3] or None
 
-        # ── Reconstruction loss ───────────────────────────────────────────────
-        target   = UV_gs_batch[:, :, GEOMETRIC_INDICES]
-        pred_3d  = UV_gs_recover.reshape(B, -1, 14)
-        recon_loss = compute_reconstruction_loss(
-            pred_3d, target, B, args.color_loss_weight)
+        # ── Build reconstruction target ───────────────────────────────────────
+        # When position_scaffold=True: replace the position columns (0:3 of the
+        # 14-dim target) with offset targets δp_i from the dataset.
+        # The rest of the target (color, opacity, scale, quat) is unchanged.
+        # This is the key change that implements the scaffold: the decoder learns
+        # to predict small offsets rather than large absolute positions.
+        target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]   # [B, 40000, 14]
+        if args.position_scaffold:
+            target = target_abs.clone()
+            target[:, :, 0:3] = position_offsets   # ← swap abs pos with offsets
+        else:
+            target = target_abs
+
+        pred_3d = UV_gs_recover.reshape(B, -1, 14)
+
+        # ── Reconstruction loss (on offset targets when scaffold enabled) ─────
+        recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
 
         # ── KL loss ───────────────────────────────────────────────────────────
         KL_loss = -0.5 * torch.sum(
             1 + log_var - mu.pow(2) - log_var.exp(), dim=1).mean()
 
         # ── Step 1: mean color prediction loss ───────────────────────────────
-        # Gradient: MSE -> MeanColorHead -> shape_embed -> encoder token 0
         color_pred_loss = torch.tensor(0.0, device=device)
         if mean_color_pred is not None and args.color_residual:
             color_pred_loss = F.mse_loss(mean_color_pred, mean_color_gt)
 
         # ── Move 1: scene semantic distribution loss ──────────────────────────
-        # Gradient: KL -> SceneSemanticHead -> shape_embed -> encoder token 0
-        # Independent of MeanColorHead (different output head, different loss).
-        # Independent of InfoNCE (different network path entirely).
         scene_semantic_loss = torch.tensor(0.0, device=device)
         if scene_semantic_pred is not None and args.scene_semantic_head:
-            p_s = batch_data['label_dist'].float().to(device)   # [B, 72] — precomputed
+            p_s = batch_data['label_dist'].float().to(device)
             scene_semantic_loss = scene_semantic_kl_loss(scene_semantic_pred, p_s)
 
-        # ── Semantic loss (per-Gaussian InfoNCE) ─────────────────────────────
+        # ── Position scaffold: anchor prediction loss ─────────────────────────
+        # MSE between predicted anchor positions and ground truth anchors.
+        # Gradient path: MSE_anchor → AnchorPositionHead → shape_embed → encoder.
+        # This is a 3rd independent gradient path into shape_embed, alongside
+        # MeanColorHead (Step 1) and SceneSemanticHead (Move 1).
+        # The anchor predictions are also used at reconstruction time to recover
+        # absolute positions from decoded offsets.
+        anchor_loss = torch.tensor(0.0, device=device)
+        if anchor_pred is not None and args.position_scaffold:
+            anchor_loss = F.mse_loss(anchor_pred, scaffold_anchors)
+
+        # ── InfoNCE (per-Gaussian) ─────────────────────────────────────────────
         semantic_loss    = torch.tensor(0.0, device=device)
         semantic_metrics = {}
         if enable_semantic and segment_labels is not None and per_gaussian_features is not None:
@@ -691,8 +651,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 semantic_loss, semantic_metrics = compute_distribution_loss(
                     dist_logits=per_gaussian_features,
                     segment_labels=segment_labels,
-                    weight=args.segment_loss_weight,
-                )
+                    weight=args.segment_loss_weight)
             else:
                 semantic_loss, semantic_metrics = compute_semantic_loss(
                     embeddings=per_gaussian_features,
@@ -703,25 +662,26 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                     instance_weight=args.instance_loss_weight,
                     temperature=args.semantic_temperature,
                     subsample=args.semantic_subsample,
-                    sampling_strategy=args.sampling_strategy,
-                )
+                    sampling_strategy=args.sampling_strategy)
 
         # ── Total loss ────────────────────────────────────────────────────────
         loss = (recon_loss
-                + args.kl_weight            * KL_loss
-                + args.mean_color_weight    * color_pred_loss
+                + args.kl_weight             * KL_loss
+                + args.mean_color_weight     * color_pred_loss
                 + args.scene_semantic_weight * scene_semantic_loss
+                + args.anchor_loss_weight    * anchor_loss   # NEW scaffold term
                 + semantic_loss)
         loss.backward()
         optimizer.step()
 
         ind = compute_individual_losses(pred_3d, target)
-        epoch_loss            += loss.item()
-        epoch_recon           += recon_loss.item()
-        epoch_kl              += KL_loss.item()
-        epoch_sem             += semantic_loss.item()
-        epoch_color_pred      += color_pred_loss.item()
-        epoch_scene_semantic  += scene_semantic_loss.item()
+        epoch_loss           += loss.item()
+        epoch_recon          += recon_loss.item()
+        epoch_kl             += KL_loss.item()
+        epoch_sem            += semantic_loss.item()
+        epoch_color_pred     += color_pred_loss.item()
+        epoch_scene_semantic += scene_semantic_loss.item()
+        epoch_anchor         += anchor_loss.item()      # NEW
         epoch_pos += ind['position']
         epoch_col += ind['color']
         epoch_opa += ind['opacity']
@@ -733,37 +693,39 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             print(f"\nEPOCH {epoch} DIAGNOSTIC (batch 0):")
             print(f"  mu range:              [{mu.min().item():.3f}, {mu.max().item():.3f}]")
             print(f"  recon_loss:            {recon_loss.item():.4f}")
-            print(f"  KL_loss:               {KL_loss.item():.4f}")
             if args.color_residual and mean_color_pred is not None:
                 print(f"  color_pred_loss:       {color_pred_loss.item():.6f}")
-                mc_pred = mean_color_pred[0].detach().cpu().numpy()
-                mc_gt   = mean_color_gt[0].cpu().numpy()
-                print(f"  mean_color gt:         {mc_gt.round(3)}")
-                print(f"  mean_color pred:       {mc_pred.round(3)}")
-                color_col = UV_gs_batch[:, :, 7:10].detach().cpu().numpy()
-                print(f"  color col range:       [{color_col.min():.3f}, {color_col.max():.3f}]"
-                      f"  (residuals — should be negative)")
             if args.scene_semantic_head and scene_semantic_pred is not None:
                 print(f"  scene_semantic_loss:   {scene_semantic_loss.item():.4f}")
-                pred_top = scene_semantic_pred[0].detach().cpu()
-                top3_idx = pred_top.topk(3).indices.numpy()
-                top3_val = pred_top.topk(3).values.numpy()
-                print(f"  scene_semantic top3:   labels={top3_idx}, probs={top3_val.round(3)}")
+            if args.position_scaffold and anchor_pred is not None:
+                # Diagnostic: how good is the initial anchor prediction?
+                anchor_np = anchor_pred[0].detach().cpu().numpy()
+                gt_anch   = scaffold_anchors[0].cpu().numpy()
+                init_err  = np.abs(anchor_np - gt_anch).mean()
+                pos_range = position_offsets[0].abs().max().item()
+                print(f"  anchor_loss:           {anchor_loss.item():.4f}")
+                print(f"  anchor mean abs error: {init_err:.3f}m  (expect ~1-2m at init)")
+                print(f"  offset max magnitude:  {pos_range:.3f}m  (expect ~1m)")
+                # Verify offsets are much smaller than absolute positions
+                abs_pos_range = target_abs[0, :, 0:3].abs().max().item()
+                print(f"  absolute pos max:      {abs_pos_range:.3f}m")
+                print(f"  variance reduction:    {abs_pos_range/max(pos_range,1e-3):.1f}×")
             if semantic_loss.item() > 0:
-                print(f"  semantic_loss (InfoNCE):{semantic_loss.item():.4f}")
+                print(f"  InfoNCE loss:          {semantic_loss.item():.4f}")
 
         if wandb_enabled:
             log = {
-                "train/step_loss":            loss.item(),
-                "train/step_recon":           recon_loss.item(),
-                "train/step_kl":              KL_loss.item(),
-                "train/step_color_pred":      color_pred_loss.item(),
-                "train/step_scene_semantic":  scene_semantic_loss.item(),
-                "train/step_position":        ind['position'],
-                "train/step_color":           ind['color'],
-                "train/step_opacity":         ind['opacity'],
-                "train/step_scale":           ind['scale'],
-                "train/step_rotation":        ind['rotation'],
+                "train/step_loss":           loss.item(),
+                "train/step_recon":          recon_loss.item(),
+                "train/step_kl":             KL_loss.item(),
+                "train/step_color_pred":     color_pred_loss.item(),
+                "train/step_scene_semantic": scene_semantic_loss.item(),
+                "train/step_anchor":         anchor_loss.item(),     # NEW
+                "train/step_position":       ind['position'],
+                "train/step_color":          ind['color'],
+                "train/step_opacity":        ind['opacity'],
+                "train/step_scale":          ind['scale'],
+                "train/step_rotation":       ind['rotation'],
             }
             if semantic_metrics:
                 log.update({f"train/step_{k}": v for k, v in semantic_metrics.items()})
@@ -776,11 +738,13 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | "
           f"Recon={epoch_recon/nb:.4f} | KL={epoch_kl/nb:.4f} | "
           f"InfoNCE={epoch_sem/nb:.4f} | ColorPred={epoch_color_pred/nb:.6f} | "
-          f"SceneSem={epoch_scene_semantic/nb:.4f}")
+          f"SceneSem={epoch_scene_semantic/nb:.4f} | "
+          f"Anchor={epoch_anchor/nb:.4f}")    # NEW anchor metric
     print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
           f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | "
           f"Rot={epoch_rot/nb:.3f}")
-    print(f"  mu range: [{mu.min().item():.3f}, {mu.max().item():.3f}]")
+    if args.position_scaffold:
+        print(f"  [Scaffold] Position loss is on OFFSET targets (~10x smaller range)")
 
     # ── Validation ────────────────────────────────────────────────────────────
     val_metrics = None
@@ -788,18 +752,20 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         print(f"\n--- Validation (epoch {epoch}) ---")
         val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=epoch)
         print(f"  L2:                {val_metrics['avg_l2_error']:.4f}")
-        print(f"  Position:          {val_metrics['position_loss']:.4f}")
+        print(f"  Position:          {val_metrics['position_loss']:.4f}"
+              f"  {'(offsets, ~10x easier)' if args.position_scaffold else '(absolute)'}")
         print(f"  Color:             {val_metrics['color_loss']:.4f}"
               f"  {'(residuals)' if args.color_residual else '(absolute)'}")
         print(f"  Opacity:           {val_metrics['opacity_loss']:.4f}")
         print(f"  Scale:             {val_metrics['scale_loss']:.4f}")
         print(f"  Rotation:          {val_metrics['rotation_loss']:.4f}")
         if args.color_residual:
-            print(f"  ColorPredMSE:      {val_metrics['color_pred_loss']:.6f}"
-                  f"  (MeanColorHead: shape_embed -> mean RGB)")
+            print(f"  ColorPredMSE:      {val_metrics['color_pred_loss']:.6f}")
         if args.scene_semantic_head:
-            print(f"  SceneSemanticKL:   {val_metrics['scene_semantic_kl']:.4f}"
-                  f"  (SceneSemanticHead: shape_embed -> label dist)")
+            print(f"  SceneSemanticKL:   {val_metrics['scene_semantic_kl']:.4f}")
+        if args.position_scaffold:
+            print(f"  AnchorMSE:         {val_metrics['anchor_loss']:.4f}"
+                  f"  (anchor prediction quality, target → 0)")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
@@ -815,20 +781,20 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
     if wandb_enabled and val_metrics:
         wandb_run.log({
-            "val/l2_error":             val_metrics['avg_l2_error'],
-            "val/position_loss":        val_metrics['position_loss'],
-            "val/color_loss":           val_metrics['color_loss'],
-            "val/color_pred_mse":       val_metrics['color_pred_loss'],
-            "val/scene_semantic_kl":    val_metrics['scene_semantic_kl'],
-            "val/opacity_loss":         val_metrics['opacity_loss'],
-            "val/scale_loss":           val_metrics['scale_loss'],
-            "val/rotation_loss":        val_metrics['rotation_loss'],
-            "best/val_l2":              best_val_loss,
-            "best/epoch":               best_epoch,
-            "train/epoch":              epoch,
+            "val/l2_error":           val_metrics['avg_l2_error'],
+            "val/position_loss":      val_metrics['position_loss'],
+            "val/color_loss":         val_metrics['color_loss'],
+            "val/color_pred_mse":     val_metrics['color_pred_loss'],
+            "val/scene_semantic_kl":  val_metrics['scene_semantic_kl'],
+            "val/anchor_mse":         val_metrics['anchor_loss'],   # NEW
+            "val/opacity_loss":       val_metrics['opacity_loss'],
+            "val/scale_loss":         val_metrics['scale_loss'],
+            "val/rotation_loss":      val_metrics['rotation_loss'],
+            "best/val_l2":            best_val_loss,
+            "best/epoch":             best_epoch,
+            "train/epoch":            epoch,
         }, step=global_step)
 
-    # ── Periodic checkpoint ───────────────────────────────────────────────────
     if epoch >= 10 and epoch % 50 == 0:
         torch.save({
             'epoch':                epoch,
@@ -844,20 +810,20 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 # ============================================================================
 
 print(f"\n{'='*70}\nTRAINING COMPLETE\n{'='*70}")
-
 final_metrics = evaluate_model(gs_autoencoder, valDataLoader, device,
                                epoch=args.num_epochs - 1)
-
 print(f"\nFinal Results:")
 print(f"  Final L2:   {final_metrics['avg_l2_error']:.4f}")
 print(f"  Best L2:    {best_val_loss:.4f} (epoch {best_epoch})")
-print(f"  Position:   {final_metrics['position_loss']:.4f}")
-print(f"  Color:      {final_metrics['color_loss']:.4f}"
-      f"  {'(residuals)' if args.color_residual else '(absolute)'}")
+print(f"  Position:   {final_metrics['position_loss']:.4f}"
+      f"  {'(offsets)' if args.position_scaffold else '(absolute)'}")
+print(f"  Color:      {final_metrics['color_loss']:.4f}")
 if args.color_residual:
     print(f"  ColorPredMSE:    {final_metrics['color_pred_loss']:.6f}")
 if args.scene_semantic_head:
     print(f"  SceneSemanticKL: {final_metrics['scene_semantic_kl']:.4f}")
+if args.position_scaffold:
+    print(f"  AnchorMSE:       {final_metrics['anchor_loss']:.4f}")
 
 torch.save({
     'epoch':                args.num_epochs - 1,
@@ -871,13 +837,11 @@ torch.save({
 }, os.path.join(save_path, "final.pth"))
 
 print(f"\nSaved: {save_path}final.pth")
-
 if wandb_enabled:
     wandb_run.summary.update({
-        "final_val_l2":   final_metrics['avg_l2_error'],
-        "best_val_l2":    best_val_loss,
-        "best_epoch":     best_epoch,
+        "final_val_l2": final_metrics['avg_l2_error'],
+        "best_val_l2":  best_val_loss,
+        "best_epoch":   best_epoch,
     })
     wandb_run.finish()
-
 print("Done.")

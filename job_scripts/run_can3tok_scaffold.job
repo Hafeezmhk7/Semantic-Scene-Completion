@@ -1,0 +1,336 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_scaffold
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=96:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=128G
+#SBATCH --output=logs/can3tok_scaffold_%j.out
+#SBATCH --error=logs/can3tok_scaffold_%j.err
+
+# ============================================================================
+# CAN3TOK — POSITION SCAFFOLD ABLATION
+# ============================================================================
+#
+# This script controls the scaffold ablation. Set POSITION_SCAFFOLD=True/False
+# and combine with other flags to produce the full ablation table:
+#
+# ABLATION TABLE (edit flags below to reproduce each run):
+#   Run A:  color_residual only                       POSITION_SCAFFOLD=False, SCENE_SEMANTIC_HEAD=False, SEMANTIC_MODE=none
+#   Run C:  color_residual + scene_semantic            POSITION_SCAFFOLD=False, SCENE_SEMANTIC_HEAD=True,  SEMANTIC_MODE=none
+#   Run S:  color_residual + scaffold                  POSITION_SCAFFOLD=True,  SCENE_SEMANTIC_HEAD=False, SEMANTIC_MODE=none
+#   Run SC: color_residual + scene_semantic + scaffold POSITION_SCAFFOLD=True,  SCENE_SEMANTIC_HEAD=True,  SEMANTIC_MODE=none
+#   Run G:  color_residual + InfoNCE                   POSITION_SCAFFOLD=False, SCENE_SEMANTIC_HEAD=False, SEMANTIC_MODE=hidden, SEGMENT_WEIGHT=0.3
+#   Run H:  color_residual + scene_semantic + InfoNCE  POSITION_SCAFFOLD=False, SCENE_SEMANTIC_HEAD=True,  SEMANTIC_MODE=hidden, SEGMENT_WEIGHT=0.3
+#   Run HS: all objectives incl scaffold               POSITION_SCAFFOLD=True,  SCENE_SEMANTIC_HEAD=True,  SEMANTIC_MODE=hidden, SEGMENT_WEIGHT=0.3
+#
+# KEY COMPARISON FOR SCAFFOLD PAPER CLAIM:
+#   Run A vs Run S:  Does scaffold improve position_loss without other additions?
+#   Run C vs Run SC: Same comparison with scene_semantic enabled.
+#   Expected: position_loss (val) should drop by ~20-40% with scaffold.
+#             Total L2 may also improve because the decoder has an easier job.
+#
+# METRICS TO WATCH:
+#   val/position_loss  — primary scaffold metric (on offset targets → lower plateau)
+#   val/anchor_mse     — anchor prediction quality (should converge to ~0.05-0.1m)
+#   val/l2_error       — total reconstruction quality
+# ============================================================================
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# CHECKPOINT RESUMING
+# ============================================================================
+
+RESUME_CHECKPOINT=""     # Path to .pth to resume from; empty = fresh start
+RESUME_EPOCH=""          # Override epoch counter; empty = auto (saved_epoch + 1)
+
+# ============================================================================
+# SCAFFOLD FLAGS  ← MAIN ABLATION CONTROLS
+# ============================================================================
+
+POSITION_SCAFFOLD=True
+# True:  Enable Scaffold-GS inspired position residual.
+#        Dataset returns scaffold_anchors [B,512,3], scaffold_token_ids [B,40000],
+#        position_offsets [B,40000,3].
+#        Model adds AnchorPositionHead: shape_embed -> [B,512,3].
+#        Decoder trained on offset targets δp_i = p_i - anchor_{k(i)}.
+#        Reconstruction: abs_pos = predicted_offset + anchor_pred[token_id].
+# False: Baseline — decoder predicts absolute positions.
+
+ANCHOR_LOSS_WEIGHT=1.0
+# Weight for MSE(anchor_pred, gt_anchors).
+# total_loss += anchor_loss_weight * anchor_loss
+# Start with 1.0. If position_loss doesn't improve, try 2.0 or 5.0.
+# If reconstruction quality degrades, lower to 0.5.
+
+# ============================================================================
+# CORE TRAINING FLAGS
+# ============================================================================
+
+BATCH_SIZE=64
+NUM_EPOCHS=500
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-6
+EVAL_EVERY=50
+FAILURE_THRESHOLD=100
+
+# ============================================================================
+# STEP 1: COLOR RESIDUAL FLAGS
+# ============================================================================
+
+COLOR_RESIDUAL=True
+MEAN_COLOR_WEIGHT=1.0
+COLOR_LOSS_WEIGHT=1.0
+
+# ============================================================================
+# MOVE 1: SCENE SEMANTIC HEAD FLAGS
+# ============================================================================
+
+SCENE_SEMANTIC_HEAD=False
+# Set False for Run S (scaffold only, no semantic head) to isolate scaffold.
+# Set True for Run SC (scaffold + scene_semantic combined).
+
+SCENE_SEMANTIC_WEIGHT=0.3
+
+# ============================================================================
+# SEMANTIC (INFONCE) FLAGS
+# ============================================================================
+
+SEMANTIC_MODE="none"
+# "none"   = Run S or Run SC (no InfoNCE)
+# "hidden" = Run HS (all objectives)
+
+SEGMENT_WEIGHT=0.0
+# Set 0.3 with SEMANTIC_MODE="hidden" for full model runs.
+
+INSTANCE_WEIGHT=0.0
+SEMANTIC_TEMP=0.07
+SEMANTIC_SUBSAMPLE=10000
+SAMPLING_STRATEGY="balanced"
+
+# ============================================================================
+# DATASET FLAGS
+# ============================================================================
+
+TRAIN_SCENES=300
+VAL_SCENES=50
+SAMPLING_METHOD="opacity"
+
+# ============================================================================
+# NORMALIZATION
+# ============================================================================
+
+USE_CANONICAL_NORM=True
+SCALE_NORM_MODE="linear"
+
+# ============================================================================
+# VISUALIZATION
+# ============================================================================
+
+PCA_VIS_FREQ=50
+PCA_NUM_SCENES=3
+PCA_BRIGHTNESS=1.25
+RECON_PLY_FREQ=50
+RECON_PLY_NUM_SCENES=3
+RECON_PLY_MAX_SH=3
+
+# ============================================================================
+# W&B
+# ============================================================================
+
+export WANDB_API_KEY="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"
+USE_WANDB=False
+
+# ============================================================================
+# CONFIGURATION SUMMARY
+# ============================================================================
+
+echo "========================================================================"
+echo "  POSITION SCAFFOLD ABLATION"
+echo "========================================================================"
+echo "  color_residual:        $COLOR_RESIDUAL       (Step 1)"
+echo "  scene_semantic_head:   $SCENE_SEMANTIC_HEAD  (Move 1)"
+echo "  position_scaffold:     $POSITION_SCAFFOLD    (Scaffold-GS inspired)"
+echo "  anchor_loss_weight:    $ANCHOR_LOSS_WEIGHT"
+echo "  semantic_mode:         $SEMANTIC_MODE"
+echo "  segment_weight:        $SEGMENT_WEIGHT"
+echo ""
+echo "  Current ablation run:"
+if [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] && [ "$SEMANTIC_MODE" = "none" ]; then
+    echo "    Run SC: color_residual + scene_semantic + scaffold"
+elif [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "False" ] && [ "$SEMANTIC_MODE" = "none" ]; then
+    echo "    Run S:  color_residual + scaffold  (isolates scaffold)"
+elif [ "$POSITION_SCAFFOLD" = "False" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] && [ "$SEMANTIC_MODE" = "none" ]; then
+    echo "    Run C:  color_residual + scene_semantic"
+elif [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] && [ "$SEMANTIC_MODE" = "hidden" ]; then
+    echo "    Run HS: all objectives (full model + scaffold)"
+else
+    echo "    Custom configuration"
+fi
+echo ""
+echo "  Expected scaffold benefit:"
+echo "    Position offset range ~[-1,+1]m vs absolute ~[-10,+10]m → 10x variance"
+echo "    val/position_loss should be ~20-40% lower than non-scaffold runs"
+echo "    val/anchor_mse should converge toward 0"
+echo ""
+echo "  Prior results for comparison:"
+echo "    Run A (color_residual only):         L2=1.43, pos_loss=?"
+echo "    Run C (+ scene_semantic):            L2=1.80, pos_loss=?"
+echo "    Run H (+ scene_semantic + InfoNCE):  L2=2.39, pos_loss=?"
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# ENVIRONMENT SETUP
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
+site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs checkpoints
+
+if [ "$USE_WANDB" = "True" ]; then
+    wandb login $WANDB_API_KEY --relogin 2>/dev/null
+fi
+
+# ── Pre-flight check: point_feats must be 11 ─────────────────────────────────
+YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+if [ -f "$YAML_PATH" ]; then
+    POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
+    if [ "$POINT_FEATS" != "11" ]; then
+        echo "ERROR: point_feats=$POINT_FEATS in yaml, expected 11"
+        exit 1
+    fi
+    echo "  point_feats=11 confirmed in $YAML_PATH"
+fi
+echo ""
+
+# ============================================================================
+# BUILD TRAINING COMMAND
+# ============================================================================
+
+TRAIN_CMD="python gs_can3tok_2.py"
+
+# Core
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
+TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
+TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
+
+# Dataset
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
+TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
+TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+
+# Step 1: Color residual
+if [ "$COLOR_RESIDUAL" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --color_residual"
+fi
+TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
+
+# Move 1: Scene semantic head
+if [ "$SCENE_SEMANTIC_HEAD" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
+fi
+TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
+
+# Position scaffold (NEW)
+if [ "$POSITION_SCAFFOLD" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --position_scaffold"
+fi
+TRAIN_CMD="$TRAIN_CMD --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
+
+# InfoNCE
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
+TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
+TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
+
+# Normalization
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+if [ "$USE_CANONICAL_NORM" = "False" ]; then
+    TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+fi
+
+# Visualization
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
+TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+
+# W&B
+if [ "$USE_WANDB" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --use_wandb"
+    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-SceenSplat-7K"
+    TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
+fi
+
+# Checkpoint resuming
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
+    [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
+fi
+
+echo "Command: $TRAIN_CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $TRAIN_CMD
+TRAIN_EXIT=$?
+echo ""
+echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+if [ $TRAIN_EXIT -eq 0 ]; then
+    SCAFFOLD_STR=""
+    [ "$POSITION_SCAFFOLD" = "True" ] && SCAFFOLD_STR="_scaffold"
+    CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SEMANTIC_MODE}_colorresidual${SCAFFOLD_STR}"
+    echo ""
+    echo "NEXT STEPS — Scaffold Ablation Analysis:"
+    echo ""
+    echo "  1. Compare position_loss to baseline (Run A):"
+    echo "       grep -E 'Position|Anchor|L2' logs/can3tok_scaffold_${SLURM_JOB_ID}.out | tail -30"
+    echo "       Expected: position_loss(scaffold) < position_loss(Run A)"
+    echo ""
+    echo "  2. Compare val/position_loss across ablation runs:"
+    echo "       Run A (no scaffold):  grep 'Position' logs/can3tok_*none_colorresidual_*.out"
+    echo "       Run S (scaffold):     grep 'Position' logs/can3tok_scaffold_*.out"
+    echo ""
+    echo "  3. Check anchor convergence:"
+    echo "       grep 'AnchorMSE' logs/can3tok_scaffold_${SLURM_JOB_ID}.out"
+    echo "       AnchorMSE should decrease from ~1-2m (init) toward ~0.05-0.1m"
+    echo ""
+    echo "  4. Visualize reconstructed PLYs:"
+    echo "       ls $CKPT_DIR/reconstructed_gaussians/"
+    echo "       Upload to https://supersplat.at to verify absolute positions"
+    echo "       are correctly recovered (offset + anchor = correct room geometry)"
+    echo ""
+    echo "  5. To run complementary ablation (scaffold without scene_semantic):"
+    echo "       Set SCENE_SEMANTIC_HEAD=False and resubmit  → Run S"
+    echo ""
+    echo "  6. Resume if time limit hit:"
+    echo "       RESUME_CHECKPOINT=$CKPT_DIR/best_model.pth"
+    echo "       NOTE: position_scaffold=True in checkpoint must match resume flag"
+else
+    echo ""
+    echo "FAILED. Common fixes:"
+    echo "  point_feats wrong:     grep point_feats $YAML_PATH  (must be 11)"
+    echo "  scaffold_anchors key:  ensure gs_dataset returns 'scaffold_anchors'"
+    echo "  OOM:                   reduce SEMANTIC_SUBSAMPLE to 5000"
+    echo "  Error log:             cat logs/can3tok_scaffold_${SLURM_JOB_ID}.err"
+fi
