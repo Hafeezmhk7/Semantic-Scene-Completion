@@ -1,134 +1,114 @@
 #!/bin/bash
-#SBATCH --job-name=can3tok_scaffold
+#SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 #SBATCH --time=96:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=128G
-#SBATCH --output=logs/can3tok_scaffold_%j.out
-#SBATCH --error=logs/can3tok_scaffold_%j.err
+#SBATCH --output=logs/can3tok_cr_dec_2_ss_scaf_infonce1.5k%j.out
+#SBATCH --error=logs/can3tok_cr_dec_2_ss_scaf_infonce1.5k%j.err
 
 # ============================================================================
-# CAN3TOK — POSITION SCAFFOLD ABLATION
+# CAN3TOK — ABLATION JOB SCRIPT
 # ============================================================================
 #
-# This script controls the scaffold ablation. Set POSITION_SCAFFOLD=True/False
-# and combine with other flags to produce the full ablation table:
+# Controls all ablation dimensions via flags at the top of this file.
+# Edit only the FLAGS section below — everything else is automatic.
 #
-# ABLATION TABLE (edit flags below to reproduce each run):
-#   Run A:  color_residual only                       POSITION_SCAFFOLD=False, SCENE_SEMANTIC_HEAD=False, SEMANTIC_MODE=none
-#   Run C:  color_residual + scene_semantic            POSITION_SCAFFOLD=False, SCENE_SEMANTIC_HEAD=True,  SEMANTIC_MODE=none
-#   Run S:  color_residual + scaffold                  POSITION_SCAFFOLD=True,  SCENE_SEMANTIC_HEAD=False, SEMANTIC_MODE=none
-#   Run SC: color_residual + scene_semantic + scaffold POSITION_SCAFFOLD=True,  SCENE_SEMANTIC_HEAD=True,  SEMANTIC_MODE=none
-#   Run G:  color_residual + InfoNCE                   POSITION_SCAFFOLD=False, SCENE_SEMANTIC_HEAD=False, SEMANTIC_MODE=hidden, SEGMENT_WEIGHT=0.3
-#   Run H:  color_residual + scene_semantic + InfoNCE  POSITION_SCAFFOLD=False, SCENE_SEMANTIC_HEAD=True,  SEMANTIC_MODE=hidden, SEGMENT_WEIGHT=0.3
-#   Run HS: all objectives incl scaffold               POSITION_SCAFFOLD=True,  SCENE_SEMANTIC_HEAD=True,  SEMANTIC_MODE=hidden, SEGMENT_WEIGHT=0.3
+# ── COMPLETE ABLATION TABLE ──────────────────────────────────────────────────
 #
-# KEY COMPARISON FOR SCAFFOLD PAPER CLAIM:
-#   Run A vs Run S:  Does scaffold improve position_loss without other additions?
-#   Run C vs Run SC: Same comparison with scene_semantic enabled.
-#   Expected: position_loss (val) should drop by ~20-40% with scaffold.
-#             Total L2 may also improve because the decoder has an easier job.
+#  Run  | color | semantic | scaffold | Option1 | Option2 | InfoNCE
+#  ─────|───────|──────────|──────────|─────────|─────────|────────
+#  A    |  ✓    |          |          |         |         |
+#  C    |  ✓    |    ✓     |          |         |         |
+#  S    |  ✓    |          |    ✓     |         |         |
+#  SC   |  ✓    |    ✓     |    ✓     |         |         |
+#  P    |  ✓    |          |          |    ✓    |         |   ← Option 1 only
+#  X    |  ✓    |          |          |         |    ✓    |   ← Option 2 only
+#  PX   |  ✓    |          |          |    ✓    |    ✓    |   ← Both options
+#  CP   |  ✓    |    ✓     |          |    ✓    |         |   ← With semantic
+#  CX   |  ✓    |    ✓     |          |         |    ✓    |
+#  G    |  ✓    |          |          |         |         |  InfoNCE
+#  H    |  ✓    |    ✓     |          |         |         |  InfoNCE
+#  PH   |  ✓    |    ✓     |          |    ✓    |         |  InfoNCE + Option 1
+#  XH   |  ✓    |    ✓     |          |         |    ✓    |  InfoNCE + Option 2
 #
-# METRICS TO WATCH:
-#   val/position_loss  — primary scaffold metric (on offset targets → lower plateau)
-#   val/anchor_mse     — anchor prediction quality (should converge to ~0.05-0.1m)
-#   val/l2_error       — total reconstruction quality
+# KEY COMPARISONS FOR DECODER SHAPE CONDITIONING:
+#   A  vs P:  Does Option 1 (prepend) improve reconstruction?
+#   A  vs X:  Does Option 2 (cross-attn) improve reconstruction?
+#   P  vs X:  Which option works better?
+#   P  vs PX: Does combining both help or hurt?
+#   H  vs PH: Does Option 1 help when InfoNCE is also active?
+#
+# EXPECTED OUTCOME IF CONDITIONING WORKS:
+#   val/l2_error should be lower for P and X vs A
+#   val/color_loss and val/rotation_loss should benefit most
+#   (these are hardest attributes without global context)
 # ============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ============================================================================
-# CHECKPOINT RESUMING
+# ── FLAGS — EDIT THIS SECTION ONLY ──────────────────────────────────────────
 # ============================================================================
 
-RESUME_CHECKPOINT=""     # Path to .pth to resume from; empty = fresh start
-RESUME_EPOCH=""          # Override epoch counter; empty = auto (saved_epoch + 1)
+# ── Checkpoint resuming ───────────────────────────────────────────────────────
+RESUME_CHECKPOINT=""   # path to .pth; empty = fresh start
+RESUME_EPOCH=""        # override epoch; empty = auto (saved_epoch + 1)
 
-# ============================================================================
-# SCAFFOLD FLAGS  ← MAIN ABLATION CONTROLS
-# ============================================================================
-
-POSITION_SCAFFOLD=True
-# True:  Enable Scaffold-GS inspired position residual.
-#        Dataset returns scaffold_anchors [B,512,3], scaffold_token_ids [B,40000],
-#        position_offsets [B,40000,3].
-#        Model adds AnchorPositionHead: shape_embed -> [B,512,3].
-#        Decoder trained on offset targets δp_i = p_i - anchor_{k(i)}.
-#        Reconstruction: abs_pos = predicted_offset + anchor_pred[token_id].
-# False: Baseline — decoder predicts absolute positions.
-
-ANCHOR_LOSS_WEIGHT=1.0
-# Weight for MSE(anchor_pred, gt_anchors).
-# total_loss += anchor_loss_weight * anchor_loss
-# Start with 1.0. If position_loss doesn't improve, try 2.0 or 5.0.
-# If reconstruction quality degrades, lower to 0.5.
-
-# ============================================================================
-# CORE TRAINING FLAGS
-# ============================================================================
-
-BATCH_SIZE=64
-NUM_EPOCHS=500
-LEARNING_RATE=1e-4
-KL_WEIGHT=1e-6
-EVAL_EVERY=50
-FAILURE_THRESHOLD=100
-
-# ============================================================================
-# STEP 1: COLOR RESIDUAL FLAGS
-# ============================================================================
-
+# ── Step 1: Color residual ────────────────────────────────────────────────────
 COLOR_RESIDUAL=True
 MEAN_COLOR_WEIGHT=1.0
 COLOR_LOSS_WEIGHT=1.0
 
-# ============================================================================
-# MOVE 1: SCENE SEMANTIC HEAD FLAGS
-# ============================================================================
-
-SCENE_SEMANTIC_HEAD=False
-# Set False for Run S (scaffold only, no semantic head) to isolate scaffold.
-# Set True for Run SC (scaffold + scene_semantic combined).
-
+# ── Move 1: Scene semantic head ───────────────────────────────────────────────
+SCENE_SEMANTIC_HEAD=True
 SCENE_SEMANTIC_WEIGHT=0.3
 
-# ============================================================================
-# SEMANTIC (INFONCE) FLAGS
-# ============================================================================
+# ── Position scaffold ─────────────────────────────────────────────────────────
+POSITION_SCAFFOLD=True
+ANCHOR_LOSS_WEIGHT=0.3
 
-SEMANTIC_MODE="none"
-# "none"   = Run S or Run SC (no InfoNCE)
-# "hidden" = Run HS (all objectives)
+# ── OPTION 1: Decoder shape prepend ──────────────────────────────────────────
+# shape_embed projected and prepended as token 0 in decoder transformer.
+# Geometry tokens attend to global scene context via self-attention.
+# Extra params: ~300K. Checkpoint tag: _shapeprepend
+DECODER_SHAPE_PREPEND=False
 
-SEGMENT_WEIGHT=0.0
-# Set 0.3 with SEMANTIC_MODE="hidden" for full model runs.
+# ── OPTION 2: Decoder shape cross-attention ───────────────────────────────────
+# N cross-attn layers condition geometry tokens on shape_embed BEFORE transformer.
+# All 12 transformer layers process shape-conditioned tokens.
+# Extra params: ~N×1.1M. Checkpoint tag: _shapecrossattn
+DECODER_SHAPE_CROSS_ATTN=True
+DECODER_CROSS_ATTN_LAYERS=6  # number of cross-attn layers (typical: 2, 4, 6)
 
+# ── InfoNCE (per-Gaussian) ────────────────────────────────────────────────────
+SEMANTIC_MODE="none"          # "none" or "hidden"
+SEGMENT_WEIGHT=0.3           # set 0.3 when SEMANTIC_MODE="hidden"
 INSTANCE_WEIGHT=0.0
 SEMANTIC_TEMP=0.07
 SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
 
-# ============================================================================
-# DATASET FLAGS
-# ============================================================================
+# ── Core training ─────────────────────────────────────────────────────────────
+BATCH_SIZE=64
+NUM_EPOCHS=1500
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-6
+EVAL_EVERY=50
+FAILURE_THRESHOLD=100
 
+# ── Dataset ───────────────────────────────────────────────────────────────────
 TRAIN_SCENES=300
 VAL_SCENES=50
 SAMPLING_METHOD="opacity"
 
-# ============================================================================
-# NORMALIZATION
-# ============================================================================
-
+# ── Normalization ─────────────────────────────────────────────────────────────
 USE_CANONICAL_NORM=True
 SCALE_NORM_MODE="linear"
 
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
-
+# ── Visualization ─────────────────────────────────────────────────────────────
 PCA_VIS_FREQ=50
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
@@ -136,54 +116,70 @@ RECON_PLY_FREQ=50
 RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
-# ============================================================================
-# W&B
-# ============================================================================
-
+# ── W&B ───────────────────────────────────────────────────────────────────────
 export WANDB_API_KEY="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"
-USE_WANDB=False
+USE_WANDB=True
 
 # ============================================================================
-# CONFIGURATION SUMMARY
+# CONFIGURATION SUMMARY (auto-derived from flags above)
 # ============================================================================
 
 echo "========================================================================"
-echo "  POSITION SCAFFOLD ABLATION"
+echo "  CAN3TOK ABLATION"
 echo "========================================================================"
-echo "  color_residual:        $COLOR_RESIDUAL       (Step 1)"
-echo "  scene_semantic_head:   $SCENE_SEMANTIC_HEAD  (Move 1)"
-echo "  position_scaffold:     $POSITION_SCAFFOLD    (Scaffold-GS inspired)"
-echo "  anchor_loss_weight:    $ANCHOR_LOSS_WEIGHT"
-echo "  semantic_mode:         $SEMANTIC_MODE"
-echo "  segment_weight:        $SEGMENT_WEIGHT"
-echo ""
-echo "  Current ablation run:"
-if [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] && [ "$SEMANTIC_MODE" = "none" ]; then
-    echo "    Run SC: color_residual + scene_semantic + scaffold"
-elif [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "False" ] && [ "$SEMANTIC_MODE" = "none" ]; then
-    echo "    Run S:  color_residual + scaffold  (isolates scaffold)"
-elif [ "$POSITION_SCAFFOLD" = "False" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] && [ "$SEMANTIC_MODE" = "none" ]; then
-    echo "    Run C:  color_residual + scene_semantic"
-elif [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] && [ "$SEMANTIC_MODE" = "hidden" ]; then
-    echo "    Run HS: all objectives (full model + scaffold)"
-else
-    echo "    Custom configuration"
+echo "  color_residual:            $COLOR_RESIDUAL       (Step 1)"
+echo "  scene_semantic_head:       $SCENE_SEMANTIC_HEAD  (Move 1)"
+echo "  position_scaffold:         $POSITION_SCAFFOLD    (Scaffold)"
+echo "  decoder_shape_prepend:     $DECODER_SHAPE_PREPEND   (Option 1)"
+echo "  decoder_shape_cross_attn:  $DECODER_SHAPE_CROSS_ATTN (Option 2)"
+if [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ]; then
+    echo "  decoder_cross_attn_layers: $DECODER_CROSS_ATTN_LAYERS"
 fi
+echo "  semantic_mode:             $SEMANTIC_MODE"
+echo "  segment_weight:            $SEGMENT_WEIGHT"
 echo ""
-echo "  Expected scaffold benefit:"
-echo "    Position offset range ~[-1,+1]m vs absolute ~[-10,+10]m → 10x variance"
-echo "    val/position_loss should be ~20-40% lower than non-scaffold runs"
-echo "    val/anchor_mse should converge toward 0"
+
+# Identify the run letter for display
+RUN_ID="custom"
+if   [ "$DECODER_SHAPE_PREPEND" = "True"  ] && [ "$DECODER_SHAPE_CROSS_ATTN" = "False" ] \
+  && [ "$SCENE_SEMANTIC_HEAD" = "False" ]  && [ "$SEMANTIC_MODE" = "none"    ] \
+  && [ "$POSITION_SCAFFOLD" = "False"   ]; then RUN_ID="P (Option 1 only)"
+elif [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && [ "$DECODER_SHAPE_PREPEND" = "False" ] \
+  && [ "$SCENE_SEMANTIC_HEAD" = "False" ]  && [ "$SEMANTIC_MODE" = "none"    ] \
+  && [ "$POSITION_SCAFFOLD" = "False"   ]; then RUN_ID="X (Option 2 only)"
+elif [ "$DECODER_SHAPE_PREPEND" = "True" ] && [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] \
+  && [ "$SCENE_SEMANTIC_HEAD" = "False" ] && [ "$SEMANTIC_MODE" = "none"    ]; then
+  RUN_ID="PX (both options)"
+elif [ "$DECODER_SHAPE_PREPEND" = "False" ] && [ "$DECODER_SHAPE_CROSS_ATTN" = "False" ] \
+  && [ "$SCENE_SEMANTIC_HEAD" = "False"  ] && [ "$SEMANTIC_MODE" = "none"    ] \
+  && [ "$POSITION_SCAFFOLD" = "False"    ]; then RUN_ID="A (baseline)"
+elif [ "$DECODER_SHAPE_PREPEND" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] \
+  && [ "$SEMANTIC_MODE" = "none" ]; then RUN_ID="CP (semantic + Option 1)"
+elif [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] \
+  && [ "$SEMANTIC_MODE" = "none" ]; then RUN_ID="CX (semantic + Option 2)"
+fi
+echo "  Identified run: $RUN_ID"
 echo ""
-echo "  Prior results for comparison:"
-echo "    Run A (color_residual only):         L2=1.43, pos_loss=?"
-echo "    Run C (+ scene_semantic):            L2=1.80, pos_loss=?"
-echo "    Run H (+ scene_semantic + InfoNCE):  L2=2.39, pos_loss=?"
+
+echo "  Option 1 (decoder_shape_prepend):"
+echo "    shape_embed projected → prepended as token 0 in decoder transformer"
+echo "    Transformer sees [shape_token | 512 geometry tokens] = 513 tokens"
+echo "    Shape token dropped after transformer"
+echo "    ~300K extra params"
+echo ""
+echo "  Option 2 (decoder_shape_cross_attn):"
+echo "    $DECODER_CROSS_ATTN_LAYERS cross-attn layers BEFORE decoder transformer"
+echo "    geometry tokens attend to shape_embed (single key/value)"
+echo "    all 12 transformer layers then process shape-conditioned tokens"
+echo "    ~$(python3 -c "print(f'{$DECODER_CROSS_ATTN_LAYERS * 1.1:.1f}')") M extra params"
+echo ""
+echo "  Baseline comparison (Run A): L2=1.43 (color_residual only, 1500ep, 2000sc)"
+echo "  Current: ${TRAIN_SCENES} scenes, ${NUM_EPOCHS} epochs"
 echo "========================================================================"
 echo ""
 
 # ============================================================================
-# ENVIRONMENT SETUP
+# ENVIRONMENT
 # ============================================================================
 
 module purge && module load 2023 && module load CUDA/12.1.1
@@ -198,15 +194,14 @@ if [ "$USE_WANDB" = "True" ]; then
     wandb login $WANDB_API_KEY --relogin 2>/dev/null
 fi
 
-# ── Pre-flight check: point_feats must be 11 ─────────────────────────────────
+# Pre-flight check
 YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 if [ -f "$YAML_PATH" ]; then
     POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
     if [ "$POINT_FEATS" != "11" ]; then
-        echo "ERROR: point_feats=$POINT_FEATS in yaml, expected 11"
-        exit 1
+        echo "ERROR: point_feats=$POINT_FEATS in yaml, expected 11"; exit 1
     fi
-    echo "  point_feats=11 confirmed in $YAML_PATH"
+    echo "  point_feats=11 confirmed"
 fi
 echo ""
 
@@ -215,38 +210,35 @@ echo ""
 # ============================================================================
 
 TRAIN_CMD="python gs_can3tok_2.py"
-
-# Core
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
 TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
-
-# Dataset
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
 TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
 
-# Step 1: Color residual
-if [ "$COLOR_RESIDUAL" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --color_residual"
-fi
+# Step 1
+[ "$COLOR_RESIDUAL" = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
 TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
 
-# Move 1: Scene semantic head
-if [ "$SCENE_SEMANTIC_HEAD" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
-fi
+# Move 1
+[ "$SCENE_SEMANTIC_HEAD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
 TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
 
-# Position scaffold (NEW)
-if [ "$POSITION_SCAFFOLD" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --position_scaffold"
-fi
+# Scaffold
+[ "$POSITION_SCAFFOLD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold"
 TRAIN_CMD="$TRAIN_CMD --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
+
+# Option 1: Decoder shape prepend
+[ "$DECODER_SHAPE_PREPEND" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_prepend"
+
+# Option 2: Decoder shape cross-attention
+[ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_cross_attn"
+TRAIN_CMD="$TRAIN_CMD --decoder_cross_attn_layers $DECODER_CROSS_ATTN_LAYERS"
 
 # InfoNCE
 TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
@@ -258,9 +250,7 @@ TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
 # Normalization
 TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
-if [ "$USE_CANONICAL_NORM" = "False" ]; then
-    TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
-fi
+[ "$USE_CANONICAL_NORM" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
 
 # Visualization
 TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
@@ -277,7 +267,7 @@ if [ "$USE_WANDB" = "True" ]; then
     TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
 fi
 
-# Checkpoint resuming
+# Resume
 if [ -n "$RESUME_CHECKPOINT" ]; then
     TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
     [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
@@ -297,40 +287,44 @@ echo ""
 echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
 
 if [ $TRAIN_EXIT -eq 0 ]; then
-    SCAFFOLD_STR=""
-    [ "$POSITION_SCAFFOLD" = "True" ] && SCAFFOLD_STR="_scaffold"
-    CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SEMANTIC_MODE}_colorresidual${SCAFFOLD_STR}"
+    # Reconstruct checkpoint dir name from flags
+    SMODE="none"; [ "$SEGMENT_WEIGHT" != "0.0" ] && SMODE="${SEMANTIC_MODE}"
+    CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SMODE}_colorresidual"
+    [ "$SCENE_SEMANTIC_HEAD" = "True" ]      && CKPT_DIR="${CKPT_DIR}_scenesemantic"
+    [ "$POSITION_SCAFFOLD"   = "True" ]      && CKPT_DIR="${CKPT_DIR}_scaffold"
+    [ "$DECODER_SHAPE_PREPEND"    = "True" ] && CKPT_DIR="${CKPT_DIR}_shapeprepend"
+    [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && CKPT_DIR="${CKPT_DIR}_shapecrossattn"
+
     echo ""
-    echo "NEXT STEPS — Scaffold Ablation Analysis:"
+    echo "COMPLETED. Checkpoint: $CKPT_DIR"
     echo ""
-    echo "  1. Compare position_loss to baseline (Run A):"
-    echo "       grep -E 'Position|Anchor|L2' logs/can3tok_scaffold_${SLURM_JOB_ID}.out | tail -30"
-    echo "       Expected: position_loss(scaffold) < position_loss(Run A)"
+    echo "NEXT STEPS — Decoder Shape Conditioning Analysis:"
     echo ""
-    echo "  2. Compare val/position_loss across ablation runs:"
-    echo "       Run A (no scaffold):  grep 'Position' logs/can3tok_*none_colorresidual_*.out"
-    echo "       Run S (scaffold):     grep 'Position' logs/can3tok_scaffold_*.out"
+    echo "  1. Compare L2 to baseline (Run A):"
+    echo "       grep 'L2\|NEW BEST' logs/can3tok_${SLURM_JOB_ID}.out | tail -20"
+    echo "       If Option 1/2 works: val/l2_error should be lower than Run A (1.43)"
     echo ""
-    echo "  3. Check anchor convergence:"
-    echo "       grep 'AnchorMSE' logs/can3tok_scaffold_${SLURM_JOB_ID}.out"
-    echo "       AnchorMSE should decrease from ~1-2m (init) toward ~0.05-0.1m"
+    echo "  2. Check per-attribute breakdown:"
+    echo "       grep -E 'Position|Color|Rotation' logs/can3tok_${SLURM_JOB_ID}.out | tail -20"
+    echo "       Color and rotation should benefit most from global context"
     echo ""
-    echo "  4. Visualize reconstructed PLYs:"
-    echo "       ls $CKPT_DIR/reconstructed_gaussians/"
-    echo "       Upload to https://supersplat.at to verify absolute positions"
-    echo "       are correctly recovered (offset + anchor = correct room geometry)"
+    echo "  3. Run complementary ablation for comparison:"
+    echo "       Set DECODER_SHAPE_PREPEND=False, DECODER_SHAPE_CROSS_ATTN=False → Run A"
+    echo "       Set DECODER_SHAPE_PREPEND=False, DECODER_SHAPE_CROSS_ATTN=True  → Run X"
+    echo "       Set DECODER_SHAPE_PREPEND=True,  DECODER_SHAPE_CROSS_ATTN=True  → Run PX"
     echo ""
-    echo "  5. To run complementary ablation (scaffold without scene_semantic):"
-    echo "       Set SCENE_SEMANTIC_HEAD=False and resubmit  → Run S"
+    echo "  4. Check posterior collapse (shape_embed over-reliance):"
+    echo "       Monitor val/l2_error: if it stops improving while recon loss still high,"
+    echo "       the decoder may be over-relying on shape_embed. Try lower kl_weight"
+    echo "       or reduce decoder_cross_attn_layers."
     echo ""
-    echo "  6. Resume if time limit hit:"
+    echo "  5. Resume if time limit hit:"
     echo "       RESUME_CHECKPOINT=$CKPT_DIR/best_model.pth"
-    echo "       NOTE: position_scaffold=True in checkpoint must match resume flag"
+    echo "       (decoder_shape_prepend and decoder_shape_cross_attn flags must match)"
 else
     echo ""
-    echo "FAILED. Common fixes:"
-    echo "  point_feats wrong:     grep point_feats $YAML_PATH  (must be 11)"
-    echo "  scaffold_anchors key:  ensure gs_dataset returns 'scaffold_anchors'"
-    echo "  OOM:                   reduce SEMANTIC_SUBSAMPLE to 5000"
-    echo "  Error log:             cat logs/can3tok_scaffold_${SLURM_JOB_ID}.err"
+    echo "FAILED."
+    echo "  point_feats check: grep point_feats $YAML_PATH  (must be 11)"
+    echo "  Error log: cat logs/can3tok_${SLURM_JOB_ID}.err"
+    echo "  If OOM: reduce decoder_cross_attn_layers or batch_size"
 fi
