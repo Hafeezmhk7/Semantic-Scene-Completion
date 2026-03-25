@@ -6,45 +6,46 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=128G
-#SBATCH --output=logs/can3tok_cr_dec_2_ss_scaf_infonce1.5k%j.out
-#SBATCH --error=logs/can3tok_cr_dec_2_ss_scaf_infonce1.5k%j.err
+#SBATCH --output=logs/can3tok_%j.out
+#SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
-# CAN3TOK — ABLATION JOB SCRIPT
+# CAN3TOK — COMPLETE ABLATION JOB SCRIPT
 # ============================================================================
 #
-# Controls all ablation dimensions via flags at the top of this file.
-# Edit only the FLAGS section below — everything else is automatic.
+# Edit only the FLAGS section. Everything else (command building, summary,
+# checkpoint naming) is automatic.
 #
-# ── COMPLETE ABLATION TABLE ──────────────────────────────────────────────────
+# ── ABLATION TABLE ────────────────────────────────────────────────────────────
 #
-#  Run  | color | semantic | scaffold | Option1 | Option2 | InfoNCE
-#  ─────|───────|──────────|──────────|─────────|─────────|────────
-#  A    |  ✓    |          |          |         |         |
-#  C    |  ✓    |    ✓     |          |         |         |
-#  S    |  ✓    |          |    ✓     |         |         |
-#  SC   |  ✓    |    ✓     |    ✓     |         |         |
-#  P    |  ✓    |          |          |    ✓    |         |   ← Option 1 only
-#  X    |  ✓    |          |          |         |    ✓    |   ← Option 2 only
-#  PX   |  ✓    |          |          |    ✓    |    ✓    |   ← Both options
-#  CP   |  ✓    |    ✓     |          |    ✓    |         |   ← With semantic
-#  CX   |  ✓    |    ✓     |          |         |    ✓    |
-#  G    |  ✓    |          |          |         |         |  InfoNCE
-#  H    |  ✓    |    ✓     |          |         |         |  InfoNCE
-#  PH   |  ✓    |    ✓     |          |    ✓    |         |  InfoNCE + Option 1
-#  XH   |  ✓    |    ✓     |          |         |    ✓    |  InfoNCE + Option 2
+#  Run  | color | sem  | scaffold | Opt1 | Opt2 | InfoNCE | disentangle | layout | jepa1
+#  -----|-------|------|----------|------|------|---------|-------------|--------|------
+#  A    |  ✓    |      |          |      |      |         |             |        |
+#  C    |  ✓    |  ✓   |          |      |      |         |             |        |
+#  B    |  ✓    |      |          |      |      |    ✓    |             |        |
+#  H    |  ✓    |  ✓   |          |      |      |    ✓    |             |        |
+#  S    |  ✓    |      |    ✓     |      |      |         |             |        |
+#  X    |  ✓    |      |          |      |  ✓   |         |             |        |
+#  CX   |  ✓    |  ✓   |          |      |  ✓   |         |             |        |
+#  F    |  ✓    |      |          |      |      |         |      ✓      |        |    ← disentangle, no cross_recon
+#  G    |  ✓    |      |          |      |      |         |   ✓+cr      |        |    ← disentangle + cross_recon
+#  I    |  ✓    |      |          |      |      |         |             |   ✓    |    ← layout head (position DC)
+#  E    |  ✓    |  ✓   |    ✓     |      |      |         |             |        |  ✓ ← jepa idea 1
+#  Full |  ✓    |  ✓   |    ✓     |      |  ✓   |    ✓    |   ✓+cr+orth |   ✓    |  ✓ ← everything
 #
-# KEY COMPARISONS FOR DECODER SHAPE CONDITIONING:
-#   A  vs P:  Does Option 1 (prepend) improve reconstruction?
-#   A  vs X:  Does Option 2 (cross-attn) improve reconstruction?
-#   P  vs X:  Which option works better?
-#   P  vs PX: Does combining both help or hurt?
-#   H  vs PH: Does Option 1 help when InfoNCE is also active?
+# ── KEY COMPARISONS ───────────────────────────────────────────────────────────
+#   A  vs F:  Does disentangle alone hurt reconstruction? (should be neutral)
+#   A  vs G:  Does cross_recon improve position loss?
+#   A  vs I:  Does layout head (position DC) help position?
+#   C  vs E:  Does JEPA Idea 1 improve over Move 1 alone?
+#   G  vs Full: Does combining everything help?
 #
-# EXPECTED OUTCOME IF CONDITIONING WORKS:
-#   val/l2_error should be lower for P and X vs A
-#   val/color_loss and val/rotation_loss should benefit most
-#   (these are hardest attributes without global context)
+# ── COMPUTE COST ─────────────────────────────────────────────────────────────
+#   Disentangle alone (+F):     ~same as baseline (no extra forward pass)
+#   Cross-recon (+G):           ~1.5x per step (one extra decoder forward)
+#   Layout head (+I):           ~same (cheap MLP, CPU precompute)
+#   JEPA Idea 1 (+E):           ~same (CPU precompute, small MLP)
+#   Full:                       ~1.5x per step
 # ============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
@@ -55,7 +56,7 @@ echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ── Checkpoint resuming ───────────────────────────────────────────────────────
 RESUME_CHECKPOINT=""   # path to .pth; empty = fresh start
-RESUME_EPOCH=""        # override epoch; empty = auto (saved_epoch + 1)
+RESUME_EPOCH=""        # override epoch counter; empty = auto (saved_epoch + 1)
 
 # ── Step 1: Color residual ────────────────────────────────────────────────────
 COLOR_RESIDUAL=True
@@ -70,26 +71,62 @@ SCENE_SEMANTIC_WEIGHT=0.3
 POSITION_SCAFFOLD=True
 ANCHOR_LOSS_WEIGHT=0.3
 
-# ── OPTION 1: Decoder shape prepend ──────────────────────────────────────────
-# shape_embed projected and prepended as token 0 in decoder transformer.
-# Geometry tokens attend to global scene context via self-attention.
-# Extra params: ~300K. Checkpoint tag: _shapeprepend
+# ── Option 1: Decoder shape prepend ──────────────────────────────────────────
 DECODER_SHAPE_PREPEND=False
 
-# ── OPTION 2: Decoder shape cross-attention ───────────────────────────────────
-# N cross-attn layers condition geometry tokens on shape_embed BEFORE transformer.
-# All 12 transformer layers process shape-conditioned tokens.
-# Extra params: ~N×1.1M. Checkpoint tag: _shapecrossattn
-DECODER_SHAPE_CROSS_ATTN=True
-DECODER_CROSS_ATTN_LAYERS=6  # number of cross-attn layers (typical: 2, 4, 6)
+# ── Option 2: Decoder shape cross-attention ───────────────────────────────────
+DECODER_SHAPE_CROSS_ATTN=False
+DECODER_CROSS_ATTN_LAYERS=6
 
 # ── InfoNCE (per-Gaussian) ────────────────────────────────────────────────────
-SEMANTIC_MODE="none"          # "none" or "hidden"
-SEGMENT_WEIGHT=0.3           # set 0.3 when SEMANTIC_MODE="hidden"
+SEMANTIC_MODE="none"       # "none" or "hidden"
+SEGMENT_WEIGHT=0.3         # used when SEMANTIC_MODE="hidden"
 INSTANCE_WEIGHT=0.0
 SEMANTIC_TEMP=0.07
 SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
+
+# ── NEW: Latent disentanglement ───────────────────────────────────────────────
+# Splits mu into mu_s (from shape_embed, semantic) | mu_g (from tokens, geometric).
+# Total mu = 16384 unchanged. Decoder reshape unchanged.
+# Enables cross_recon and ortho losses below.
+LATENT_DISENTANGLE=True
+
+# Dimensionality of semantic subspace mu_s.
+# Must be divisible by 32. Geometric: 16384 - SEMANTIC_DIMS.
+# Default 512 = 16 semantic tokens. Try 1024 = 32 tokens for richer semantic.
+SEMANTIC_DIMS=512
+
+# Cross-reconstruction loss weight.
+# Swaps mu_s between consecutive batch pairs (torch.roll shift-1).
+# Loss: geometry-only L2 (position+opacity+scale+rotation). Color excluded.
+# Gradient: mu_g must reconstruct geometry regardless of semantic context.
+# Requires LATENT_DISENTANGLE=True. Set 0 to disable (Run F).
+CROSS_RECON_WEIGHT=0.5
+
+# Orthogonality regularisation weight.
+# Penalises linear correlation between mu_s and mu_g subspaces.
+# Uses random projection to 64 dims (essentially free computation).
+# Requires LATENT_DISENTANGLE=True. Set 0 to disable.
+ORTHO_WEIGHT=0.1
+
+# ── NEW: Scene layout head ────────────────────────────────────────────────────
+# shape_embed -> [B,72,3] per-category spatial centroids.
+# DC/AC decomposition for position (mirrors Step 1 color residual for xyz).
+# Loss: weighted MSE over present ScanNet72 categories.
+# Independent gradient path: MSE_layout -> SceneLayoutHead -> shape_embed.
+# Dataset: precomputes category_centroids[72,3] + category_valid[72] per scene.
+SCENE_LAYOUT_HEAD=True
+LAYOUT_LOSS_WEIGHT=0.3
+
+# ── NEW: JEPA Idea 1 — Spatial semantic head ──────────────────────────────────
+# (shape_embed + voxel_center) -> [B,512,72] per-voxel label distributions.
+# Teaches shape_embed WHERE each category is, not just WHAT categories exist.
+# Loss: masked KL over occupied super-voxels.
+# Requires POSITION_SCAFFOLD=True (reuses scaffold_anchors, no extra IO).
+# Dataset: precomputes voxel_label_dists[512,72] + voxel_valid[512] per scene.
+JEPA_IDEA1=False
+JEPA_IDEA1_WEIGHT=1.0
 
 # ── Core training ─────────────────────────────────────────────────────────────
 BATCH_SIZE=64
@@ -121,12 +158,13 @@ export WANDB_API_KEY="wandb_v1_D9IJNMrJPieCvMbrazxUsefC4bi_d2yePUnKgyoY3qwn5IPhE
 USE_WANDB=True
 
 # ============================================================================
-# CONFIGURATION SUMMARY (auto-derived from flags above)
+# CONFIGURATION SUMMARY
 # ============================================================================
 
 echo "========================================================================"
 echo "  CAN3TOK ABLATION"
 echo "========================================================================"
+echo "  ── Existing contributions ──────────────────────────────────────────"
 echo "  color_residual:            $COLOR_RESIDUAL       (Step 1)"
 echo "  scene_semantic_head:       $SCENE_SEMANTIC_HEAD  (Move 1)"
 echo "  position_scaffold:         $POSITION_SCAFFOLD    (Scaffold)"
@@ -136,44 +174,53 @@ if [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ]; then
     echo "  decoder_cross_attn_layers: $DECODER_CROSS_ATTN_LAYERS"
 fi
 echo "  semantic_mode:             $SEMANTIC_MODE"
-echo "  segment_weight:            $SEGMENT_WEIGHT"
+if [ "$SEMANTIC_MODE" != "none" ]; then
+    echo "  segment_weight:            $SEGMENT_WEIGHT"
+fi
+echo ""
+echo "  ── NEW: Disentanglement suite ──────────────────────────────────────"
+echo "  latent_disentangle:        $LATENT_DISENTANGLE  (mu_s | mu_g split)"
+echo "  semantic_dims:             $SEMANTIC_DIMS        (mu_s subspace size)"
+echo "  cross_recon_weight:        $CROSS_RECON_WEIGHT   (swap mu_s, geometry loss)"
+echo "  ortho_weight:              $ORTHO_WEIGHT          (||P_s^T P_g||_F^2)"
+echo "  scene_layout_head:         $SCENE_LAYOUT_HEAD    (position DC)"
+echo "  layout_loss_weight:        $LAYOUT_LOSS_WEIGHT"
+echo "  jepa_idea1:                $JEPA_IDEA1           (spatial semantic)"
+echo "  jepa_idea1_weight:         $JEPA_IDEA1_WEIGHT"
 echo ""
 
-# Identify the run letter for display
+# Identify run letter
 RUN_ID="custom"
-if   [ "$DECODER_SHAPE_PREPEND" = "True"  ] && [ "$DECODER_SHAPE_CROSS_ATTN" = "False" ] \
-  && [ "$SCENE_SEMANTIC_HEAD" = "False" ]  && [ "$SEMANTIC_MODE" = "none"    ] \
-  && [ "$POSITION_SCAFFOLD" = "False"   ]; then RUN_ID="P (Option 1 only)"
-elif [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && [ "$DECODER_SHAPE_PREPEND" = "False" ] \
-  && [ "$SCENE_SEMANTIC_HEAD" = "False" ]  && [ "$SEMANTIC_MODE" = "none"    ] \
-  && [ "$POSITION_SCAFFOLD" = "False"   ]; then RUN_ID="X (Option 2 only)"
-elif [ "$DECODER_SHAPE_PREPEND" = "True" ] && [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] \
-  && [ "$SCENE_SEMANTIC_HEAD" = "False" ] && [ "$SEMANTIC_MODE" = "none"    ]; then
-  RUN_ID="PX (both options)"
-elif [ "$DECODER_SHAPE_PREPEND" = "False" ] && [ "$DECODER_SHAPE_CROSS_ATTN" = "False" ] \
-  && [ "$SCENE_SEMANTIC_HEAD" = "False"  ] && [ "$SEMANTIC_MODE" = "none"    ] \
-  && [ "$POSITION_SCAFFOLD" = "False"    ]; then RUN_ID="A (baseline)"
-elif [ "$DECODER_SHAPE_PREPEND" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] \
-  && [ "$SEMANTIC_MODE" = "none" ]; then RUN_ID="CP (semantic + Option 1)"
-elif [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] \
-  && [ "$SEMANTIC_MODE" = "none" ]; then RUN_ID="CX (semantic + Option 2)"
+if [ "$LATENT_DISENTANGLE" = "True" ] && [ "$CROSS_RECON_WEIGHT" = "0.0" ] \
+   && [ "$SCENE_LAYOUT_HEAD" = "False" ] && [ "$JEPA_IDEA1" = "False" ] \
+   && [ "$SCENE_SEMANTIC_HEAD" = "False" ]; then
+    RUN_ID="F (disentangle only, no cross_recon)"
+elif [ "$LATENT_DISENTANGLE" = "True" ] && [ "$CROSS_RECON_WEIGHT" != "0.0" ] \
+   && [ "$SCENE_LAYOUT_HEAD" = "False" ] && [ "$JEPA_IDEA1" = "False" ] \
+   && [ "$SCENE_SEMANTIC_HEAD" = "False" ]; then
+    RUN_ID="G (disentangle + cross_recon)"
+elif [ "$SCENE_LAYOUT_HEAD" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ] \
+   && [ "$JEPA_IDEA1" = "False" ] && [ "$SCENE_SEMANTIC_HEAD" = "False" ]; then
+    RUN_ID="I (layout head / position DC)"
+elif [ "$JEPA_IDEA1" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] \
+   && [ "$LATENT_DISENTANGLE" = "False" ]; then
+    RUN_ID="E (scene_semantic + jepa_idea1)"
+elif [ "$LATENT_DISENTANGLE" = "False" ] && [ "$SCENE_LAYOUT_HEAD" = "False" ] \
+   && [ "$JEPA_IDEA1" = "False" ] && [ "$SCENE_SEMANTIC_HEAD" = "False" ] \
+   && [ "$SEMANTIC_MODE" = "none" ] && [ "$DECODER_SHAPE_PREPEND" = "False" ] \
+   && [ "$DECODER_SHAPE_CROSS_ATTN" = "False" ] && [ "$POSITION_SCAFFOLD" = "False" ]; then
+    RUN_ID="A (baseline: color_residual only)"
+elif [ "$LATENT_DISENTANGLE" = "False" ] && [ "$SCENE_LAYOUT_HEAD" = "False" ] \
+   && [ "$JEPA_IDEA1" = "False" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] \
+   && [ "$SEMANTIC_MODE" = "none" ]; then
+    RUN_ID="C (color_residual + scene_semantic)"
 fi
 echo "  Identified run: $RUN_ID"
 echo ""
-
-echo "  Option 1 (decoder_shape_prepend):"
-echo "    shape_embed projected → prepended as token 0 in decoder transformer"
-echo "    Transformer sees [shape_token | 512 geometry tokens] = 513 tokens"
-echo "    Shape token dropped after transformer"
-echo "    ~300K extra params"
-echo ""
-echo "  Option 2 (decoder_shape_cross_attn):"
-echo "    $DECODER_CROSS_ATTN_LAYERS cross-attn layers BEFORE decoder transformer"
-echo "    geometry tokens attend to shape_embed (single key/value)"
-echo "    all 12 transformer layers then process shape-conditioned tokens"
-echo "    ~$(python3 -c "print(f'{$DECODER_CROSS_ATTN_LAYERS * 1.1:.1f}')") M extra params"
-echo ""
-echo "  Baseline comparison (Run A): L2=1.43 (color_residual only, 1500ep, 2000sc)"
+echo "  Prior results for comparison:"
+echo "    Run A (color_residual only):             L2=1.43  (2780 epochs)"
+echo "    Run B (color_residual + InfoNCE):        L2=1.99  (1360 epochs)"
+echo "    Run C (color_residual + scene_semantic): L2=1.80  (1450 epochs)"
 echo "  Current: ${TRAIN_SCENES} scenes, ${NUM_EPOCHS} epochs"
 echo "========================================================================"
 echo ""
@@ -194,14 +241,16 @@ if [ "$USE_WANDB" = "True" ]; then
     wandb login $WANDB_API_KEY --relogin 2>/dev/null
 fi
 
-# Pre-flight check
+# Pre-flight: point_feats must be 11 (label_input=False)
 YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 if [ -f "$YAML_PATH" ]; then
     POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
     if [ "$POINT_FEATS" != "11" ]; then
-        echo "ERROR: point_feats=$POINT_FEATS in yaml, expected 11"; exit 1
+        echo "ERROR: point_feats=$POINT_FEATS in yaml, expected 11 (label_input=False)"
+        echo "       Fix: set point_feats: 11 in $YAML_PATH"
+        exit 1
     fi
-    echo "  point_feats=11 confirmed"
+    echo "  point_feats=11 confirmed in $YAML_PATH"
 fi
 echo ""
 
@@ -210,6 +259,8 @@ echo ""
 # ============================================================================
 
 TRAIN_CMD="python gs_can3tok_2.py"
+
+# Core
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
@@ -233,10 +284,10 @@ TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
 [ "$POSITION_SCAFFOLD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold"
 TRAIN_CMD="$TRAIN_CMD --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
 
-# Option 1: Decoder shape prepend
+# Option 1
 [ "$DECODER_SHAPE_PREPEND" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_prepend"
 
-# Option 2: Decoder shape cross-attention
+# Option 2
 [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_cross_attn"
 TRAIN_CMD="$TRAIN_CMD --decoder_cross_attn_layers $DECODER_CROSS_ATTN_LAYERS"
 
@@ -247,6 +298,20 @@ TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
+
+# NEW: Latent disentanglement
+[ "$LATENT_DISENTANGLE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
+TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
+TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --ortho_weight $ORTHO_WEIGHT"
+
+# NEW: Scene layout head
+[ "$SCENE_LAYOUT_HEAD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
+TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
+
+# NEW: JEPA Idea 1
+[ "$JEPA_IDEA1" = "True" ] && TRAIN_CMD="$TRAIN_CMD --jepa_idea1"
+TRAIN_CMD="$TRAIN_CMD --jepa_idea1_weight $JEPA_IDEA1_WEIGHT"
 
 # Normalization
 TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
@@ -286,45 +351,81 @@ TRAIN_EXIT=$?
 echo ""
 echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
 
-if [ $TRAIN_EXIT -eq 0 ]; then
-    # Reconstruct checkpoint dir name from flags
-    SMODE="none"; [ "$SEGMENT_WEIGHT" != "0.0" ] && SMODE="${SEMANTIC_MODE}"
-    CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SMODE}_colorresidual"
-    [ "$SCENE_SEMANTIC_HEAD" = "True" ]      && CKPT_DIR="${CKPT_DIR}_scenesemantic"
-    [ "$POSITION_SCAFFOLD"   = "True" ]      && CKPT_DIR="${CKPT_DIR}_scaffold"
-    [ "$DECODER_SHAPE_PREPEND"    = "True" ] && CKPT_DIR="${CKPT_DIR}_shapeprepend"
-    [ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && CKPT_DIR="${CKPT_DIR}_shapecrossattn"
+# ── Reconstruct checkpoint dir name (mirrors tag logic in gs_can3tok_2.py) ──
+SMODE="${SEMANTIC_MODE}"
+[ "$SEGMENT_WEIGHT" = "0.0" ] && SMODE="none"
+CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SMODE}"
+[ "$COLOR_RESIDUAL"           = "True" ] && CKPT_DIR="${CKPT_DIR}_colorresidual"
+[ "$SCENE_SEMANTIC_HEAD"      = "True" ] && CKPT_DIR="${CKPT_DIR}_scenesemantic"
+[ "$POSITION_SCAFFOLD"        = "True" ] && CKPT_DIR="${CKPT_DIR}_scaffold"
+[ "$DECODER_SHAPE_PREPEND"    = "True" ] && CKPT_DIR="${CKPT_DIR}_shapeprepend"
+[ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && CKPT_DIR="${CKPT_DIR}_shapecrossattn"
+[ "$LATENT_DISENTANGLE"       = "True" ] && CKPT_DIR="${CKPT_DIR}_disentangle${SEMANTIC_DIMS}"
+[ "$SCENE_LAYOUT_HEAD"        = "True" ] && CKPT_DIR="${CKPT_DIR}_layout"
+[ "$JEPA_IDEA1"               = "True" ] && CKPT_DIR="${CKPT_DIR}_jepa1"
+[ "$SEMANTIC_MODE"            != "none" ] && [ "$SEGMENT_WEIGHT" != "0.0" ] && \
+    CKPT_DIR="${CKPT_DIR}_beta${SEGMENT_WEIGHT}"
 
+if [ $TRAIN_EXIT -eq 0 ]; then
     echo ""
     echo "COMPLETED. Checkpoint: $CKPT_DIR"
     echo ""
-    echo "NEXT STEPS — Decoder Shape Conditioning Analysis:"
+    echo "NEXT STEPS:"
     echo ""
-    echo "  1. Compare L2 to baseline (Run A):"
-    echo "       grep 'L2\|NEW BEST' logs/can3tok_${SLURM_JOB_ID}.out | tail -20"
-    echo "       If Option 1/2 works: val/l2_error should be lower than Run A (1.43)"
+    echo "  1. Check key metrics:"
+    echo "       grep -E 'L2|NEW BEST|Position|Layout|SpatialKL|CrossRecon' \\"
+    echo "         logs/can3tok_${SLURM_JOB_ID}.out | tail -30"
     echo ""
-    echo "  2. Check per-attribute breakdown:"
-    echo "       grep -E 'Position|Color|Rotation' logs/can3tok_${SLURM_JOB_ID}.out | tail -20"
-    echo "       Color and rotation should benefit most from global context"
+    echo "  2. Compare per-attribute vs baseline Run A (L2=1.43):"
+    echo "       grep -E 'Position|Color|Rotation|Scale' \\"
+    echo "         logs/can3tok_${SLURM_JOB_ID}.out | tail -20"
+    echo "       Position loss:  target <0.8 (Run A baseline)"
+    echo "       Rotation loss:  should improve if layout/disentangle helps"
     echo ""
-    echo "  3. Run complementary ablation for comparison:"
-    echo "       Set DECODER_SHAPE_PREPEND=False, DECODER_SHAPE_CROSS_ATTN=False → Run A"
-    echo "       Set DECODER_SHAPE_PREPEND=False, DECODER_SHAPE_CROSS_ATTN=True  → Run X"
-    echo "       Set DECODER_SHAPE_PREPEND=True,  DECODER_SHAPE_CROSS_ATTN=True  → Run PX"
+    echo "  3. Re-run t-SNE on new checkpoint to check latent structure:"
+    echo "       Edit LATENT_MODE='full' in can3tok_tsne.py"
+    echo "       Add new checkpoint to MODEL_CHECKPOINTS dict"
+    echo "       sbatch run_tsne.job"
+    echo "       Target: positive silhouette (Run C = +0.166, want to beat)"
     echo ""
-    echo "  4. Check posterior collapse (shape_embed over-reliance):"
-    echo "       Monitor val/l2_error: if it stops improving while recon loss still high,"
-    echo "       the decoder may be over-relying on shape_embed. Try lower kl_weight"
-    echo "       or reduce decoder_cross_attn_layers."
+    if [ "$LATENT_DISENTANGLE" = "True" ]; then
+        echo "  4. Disentanglement diagnostics:"
+        echo "       grep -E 'CrossRecon|Ortho|mu_s|mu_g' \\"
+        echo "         logs/can3tok_${SLURM_JOB_ID}.out | head -20"
+        echo "       CrossRecon should decrease steadily (mu_g learning geometry)"
+        echo "       Ortho should stay small (subspaces staying independent)"
+        echo ""
+    fi
+    if [ "$SCENE_LAYOUT_HEAD" = "True" ]; then
+        echo "  5. Layout head diagnostics:"
+        echo "       grep 'LayoutMSE' logs/can3tok_${SLURM_JOB_ID}.out | tail -10"
+        echo "       LayoutMSE should decrease (shape_embed learning spatial centroids)"
+        echo "       Compare val/position_loss vs Run A to confirm DC/AC benefit"
+        echo ""
+    fi
+    if [ "$JEPA_IDEA1" = "True" ]; then
+        echo "  6. JEPA Idea 1 diagnostics:"
+        echo "       grep 'SpatialKL' logs/can3tok_${SLURM_JOB_ID}.out | tail -10"
+        echo "       SpatialKL should decrease (shape_embed learning WHERE categories are)"
+        echo ""
+    fi
+    echo "  7. Test set generalization:"
+    echo "       python can3tok_test_eval.py \\"
+    echo "         --checkpoint $CKPT_DIR/best_model.pth \\"
+    echo "         --n_scenes 20"
     echo ""
-    echo "  5. Resume if time limit hit:"
+    echo "  8. Resume if time limit hit:"
     echo "       RESUME_CHECKPOINT=$CKPT_DIR/best_model.pth"
-    echo "       (decoder_shape_prepend and decoder_shape_cross_attn flags must match)"
+    echo "       (all flags must match checkpoint metadata)"
 else
     echo ""
-    echo "FAILED."
-    echo "  point_feats check: grep point_feats $YAML_PATH  (must be 11)"
-    echo "  Error log: cat logs/can3tok_${SLURM_JOB_ID}.err"
-    echo "  If OOM: reduce decoder_cross_attn_layers or batch_size"
+    echo "FAILED (exit $TRAIN_EXIT)"
+    echo ""
+    echo "Common fixes:"
+    echo "  point_feats wrong:   grep point_feats $YAML_PATH  (must be 11)"
+    echo "  semantic_dims:       must be divisible by 32"
+    echo "  jepa without scaf:   JEPA_IDEA1=True requires POSITION_SCAFFOLD=True"
+    echo "  cross_recon no dis:  CROSS_RECON_WEIGHT>0 requires LATENT_DISENTANGLE=True"
+    echo "  OOM:                 reduce BATCH_SIZE to 32 or DECODER_CROSS_ATTN_LAYERS to 4"
+    echo "  Error log:           cat logs/can3tok_${SLURM_JOB_ID}.err"
 fi

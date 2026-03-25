@@ -4,46 +4,35 @@ Can3Tok Training
 Step 1:    Color Residual             (--color_residual)
 Move 1:    Scene Semantic Head        (--scene_semantic_head)
 Scaffold:  Position Scaffold          (--position_scaffold)
-Option 1:  Decoder Shape Prepend      (--decoder_shape_prepend)    ← NEW
-Option 2:  Decoder Shape Cross-Attn   (--decoder_shape_cross_attn) ← NEW
+Option 1:  Decoder Shape Prepend      (--decoder_shape_prepend)
+Option 2:  Decoder Shape Cross-Attn   (--decoder_shape_cross_attn)
 InfoNCE:   Per-Gaussian contrastive   (--semantic_mode hidden)
 
-══════════════════════════════════════════════════════════════════
-DECODER SHAPE CONDITIONING
-══════════════════════════════════════════════════════════════════
+DISENTANGLEMENT SUITE (NEW):
+  --latent_disentangle        split mu into mu_s (semantic) | mu_g (geometric)
+  --semantic_dims             size of mu_s subspace (default 512)
+  --cross_recon_weight        enforce geometry survives semantic swap
+  --ortho_weight              penalise linear correlation mu_s vs mu_g
+  --scene_layout_head         shape_embed -> [B,72,3] per-category centroids
+  --layout_loss_weight        weight for layout MSE loss
+  --jepa_idea1                (shape_embed + voxel_xyz) -> [B,512,72]
+  --jepa_idea1_weight         weight for spatial KL loss
 
-OPTION 1  --decoder_shape_prepend
-  shape_embed [B,384] is projected and prepended as token 0 to the
-  512 geometry tokens before the decoder transformer. All 12 self-attn
-  layers can directly attend to the global scene token.
-  n_ctx in the transformer is already 513 — exact match.
-  Extra parameters: ~300K (one Linear + LayerNorm).
-
-OPTION 2  --decoder_shape_cross_attn  --decoder_cross_attn_layers N
-  N cross-attention blocks are applied BEFORE the decoder transformer,
-  conditioning the 512 geometry tokens on shape_embed. Each geometry token
-  independently attends to shape_embed. The transformer then propagates
-  this global context through all 12 self-attn layers.
-  Extra parameters: ~N × 1.1M (each ResidualCrossAttentionBlock).
-  Default N=4 (~4.4M extra params).
-
-Both options pass shape_embed into decode() as a conditioning signal.
-shape_embed is the pre-KL encoder output [B, 384], cached in encode().
-
-STAGE 2 NOTE:
-  At generation time, shape_embed must be approximated from the generated z
-  tokens. A lightweight ShapeEmbedPredictor MLP (z.mean(-2) → shape_embed)
-  can be trained separately. The diffusion model can also generate shape_embed
-  jointly as part of the latent.
-
-ABLATION NAMING CONVENTION:
-  _shapeprepend      Option 1 only
-  _shapecrossattn    Option 2 only
-  _shapeprepend_shapecrossattn  both options combined
+ABLATION TABLE:
+  Run A: color_residual                                         (done, L2=1.43)
+  Run B: color_residual + InfoNCE                               (done, L2=1.99)
+  Run C: color_residual + scene_semantic                        (done, L2=1.80)
+  Run F: color_residual + latent_disentangle (no cross_recon)   NEW baseline
+  Run G: color_residual + latent_disentangle + cross_recon      NEW
+  Run H: color_residual + scene_semantic + disentangle + cross_recon + ortho  NEW
+  Run I: color_residual + scene_layout_head                     NEW (position DC)
+  Run E: color_residual + scene_semantic + jepa_idea1           NEW
+  Full:  all combined                                           NEW
 """
 
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 import os
 import numpy as np
 from tqdm import tqdm
@@ -78,15 +67,20 @@ PARAM_SLICES = {
 }
 
 GEOMETRIC_INDICES = (
-    list(range(4, 7))
-  + list(range(7, 10))
-  + [10]
-  + list(range(11, 14))
-  + list(range(14, 18))
+    list(range(4, 7)) + list(range(7, 10)) + [10] + list(range(11, 14)) + list(range(14, 18))
 )
 
+# Geometry-only slices for cross-reconstruction loss
+# Color deliberately EXCLUDED: expected to change under semantic swap
+GEO_ONLY_SLICES = {
+    'position': slice(0, 3),
+    'opacity':  slice(6, 7),
+    'scale':    slice(7, 10),
+    'rotation': slice(10, 14),
+}
+
 # ============================================================================
-# LOSS HELPERS
+# EXISTING LOSS HELPERS
 # ============================================================================
 
 def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0):
@@ -109,6 +103,86 @@ def scene_semantic_kl_loss(p_hat, p_s, eps=1e-8):
     p_hat_clamped = torch.clamp(p_hat, min=eps)
     return (p_s * (torch.log(p_s + eps) - torch.log(p_hat_clamped))).sum(dim=-1).mean()
 
+
+# ============================================================================
+# NEW LOSS HELPERS — DISENTANGLEMENT SUITE
+# ============================================================================
+
+def compute_cross_recon_loss(pred_cross_3d, target, batch_size):
+    """
+    Geometry-only cross-reconstruction loss.
+    Applied to output reconstructed with SWAPPED mu_s (shifted by 1 in batch).
+    Color excluded: legitimately changes when semantic codes are swapped.
+
+    Gradient enforces mu_g to encode geometry, NOT semantic information,
+    because geometry must be reconstructable regardless of semantic context.
+
+    pred_cross_3d: [B, 40000, 14] — from decoder(z_s_shifted, z_g_original)
+    target:        [B, 40000, 14] — original geometry target
+    """
+    loss = torch.tensor(0.0, device=pred_cross_3d.device)
+    for sl in GEO_ONLY_SLICES.values():
+        loss = loss + torch.norm(pred_cross_3d[:, :, sl] - target[:, :, sl], p=2) / batch_size
+    return loss
+
+
+def compute_orthogonality_loss(mu_s, mu_g, proj_dim=64):
+    """
+    Penalise linear correlation between semantic and geometric subspaces.
+    ||P_s^T P_g||_F^2 where P_s, P_g are random projections.
+
+    Uses random projection to reduce O(D_s * D_g) to O(B * proj_dim).
+    mu_s: [B, D_s]
+    mu_g: [B, D_g]
+    """
+    B = mu_s.shape[0]
+    if B < 2:
+        return torch.tensor(0.0, device=mu_s.device)
+
+    with torch.no_grad():
+        p_dim = min(proj_dim, B - 1, mu_s.shape[1], mu_g.shape[1])
+        idx_s = torch.randperm(mu_s.shape[1], device=mu_s.device)[:p_dim]
+        idx_g = torch.randperm(mu_g.shape[1], device=mu_g.device)[:p_dim]
+
+    p_s = mu_s[:, idx_s]
+    p_g = mu_g[:, idx_g]
+    p_s = p_s - p_s.mean(dim=0, keepdim=True)
+    p_g = p_g - p_g.mean(dim=0, keepdim=True)
+    p_s = F.normalize(p_s, p=2, dim=0)
+    p_g = F.normalize(p_g, p=2, dim=0)
+    cross_corr = p_s.T @ p_g   # [p_dim, p_dim]
+    return (cross_corr ** 2).mean()
+
+
+def compute_layout_loss(pred_centroids, gt_centroids, gt_valid):
+    """
+    Weighted MSE for SceneLayoutHead.
+    pred_centroids: [B, 72, 3]
+    gt_centroids:   [B, 72, 3]
+    gt_valid:       [B, 72]   — 1.0 if category present, else 0.0
+    """
+    diff    = (pred_centroids - gt_centroids) ** 2   # [B, 72, 3]
+    per_cat = diff.mean(dim=-1)                       # [B, 72]
+    masked  = per_cat * gt_valid
+    denom   = gt_valid.sum() + 1e-8
+    return masked.sum() / denom
+
+
+def compute_spatial_semantic_loss(pred_voxel, gt_voxel, voxel_valid, eps=1e-8):
+    """
+    Masked KL for SpatialSemanticHead (JEPA Idea 1).
+    pred_voxel:  [B, 512, 72]
+    gt_voxel:    [B, 512, 72]
+    voxel_valid: [B, 512]
+    """
+    p_hat        = torch.clamp(pred_voxel, min=eps)
+    p_s          = gt_voxel
+    kl_per_voxel = (p_s * (torch.log(p_s + eps) - torch.log(p_hat))).sum(dim=-1)
+    masked       = kl_per_voxel * voxel_valid
+    denom        = voxel_valid.sum() + 1e-8
+    return masked.sum() / denom
+
+
 # ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
@@ -129,7 +203,7 @@ parser.add_argument('--val_scenes',           type=int,   default=None)
 parser.add_argument('--sampling_method',      type=str,   default='opacity',
                     choices=['random', 'opacity', 'hybrid'])
 
-# Semantic InfoNCE
+# InfoNCE
 parser.add_argument('--semantic_mode',        type=str,   default='none',
                     choices=['none', 'hidden', 'geometric', 'attention', 'dist'])
 parser.add_argument('--segment_loss_weight',  type=float, default=0.0)
@@ -151,25 +225,51 @@ parser.add_argument('--scene_semantic_weight', type=float, default=0.3)
 parser.add_argument('--position_scaffold',     action='store_true', default=False)
 parser.add_argument('--anchor_loss_weight',    type=float, default=1.0)
 
-# ── Option 1: Decoder shape prepend ──────────────────────────────────────────
-parser.add_argument('--decoder_shape_prepend', action='store_true', default=False,
-    help='Option 1: Project shape_embed [B,384] and prepend as token 0 to the '
-         '512 geometry tokens before the decoder transformer. '
-         'Transformer sees 513 tokens (n_ctx=513, exact match). '
-         'Shape token dropped after transformer. '
-         'Geometry tokens can directly attend to global scene context via self-attn. '
-         '~300K extra params.')
+# Decoder conditioning
+parser.add_argument('--decoder_shape_prepend',     action='store_true', default=False)
+parser.add_argument('--decoder_shape_cross_attn',  action='store_true', default=False)
+parser.add_argument('--decoder_cross_attn_layers', type=int, default=4)
 
-# ── Option 2: Decoder shape cross-attention ───────────────────────────────────
-parser.add_argument('--decoder_shape_cross_attn', action='store_true', default=False,
-    help='Option 2: Apply N cross-attention blocks BEFORE the decoder transformer. '
-         'Geometry tokens attend to shape_embed as a single key/value token. '
-         'All 12 transformer self-attn layers then process shape-conditioned tokens. '
-         'N controlled by --decoder_cross_attn_layers. ~N×1.1M extra params.')
-parser.add_argument('--decoder_cross_attn_layers', type=int, default=4,
-    help='Number of cross-attention layers for Option 2 (default 4). '
-         'Each adds ~1.1M params. Typical range: 2-6. '
-         'Higher = richer conditioning but more memory and compute.')
+# ── NEW: Latent disentanglement ───────────────────────────────────────────────
+parser.add_argument('--latent_disentangle',   action='store_true', default=False,
+    help='Split mu into mu_s (from shape_embed, semantic) and mu_g (from tokens, geometric). '
+         'Total mu = 16384 unchanged. Enables cross_recon and ortho losses.')
+
+parser.add_argument('--semantic_dims',        type=int, default=512,
+    help='Size of semantic subspace mu_s (default 512 = 16 tokens of 32-dim). '
+         'Must be divisible by embed_dim=32. Geometric: 16384-semantic_dims.')
+
+parser.add_argument('--cross_recon_weight',   type=float, default=0.5,
+    help='Weight for cross-reconstruction loss. '
+         'Swaps mu_s between batch pairs (torch.roll shift-1). '
+         'Loss: geometry-only L2 (position+opacity+scale+rotation). '
+         'Color excluded — expected to change under semantic swap. '
+         'Gradient: mu_g must reconstruct geometry with ANY semantic context. '
+         'Requires --latent_disentangle.')
+
+parser.add_argument('--ortho_weight',         type=float, default=0.1,
+    help='Weight for orthogonality regularisation ||P_s^T P_g||_F^2. '
+         'Uses random projection to 64 dims (essentially free). '
+         'Penalises linear correlation between semantic and geometric subspaces. '
+         'Requires --latent_disentangle.')
+
+# ── NEW: Scene layout head ───────────────────────────────────────────────────
+parser.add_argument('--scene_layout_head',    action='store_true', default=False,
+    help='SceneLayoutHead: shape_embed -> [B,72,3] per-category spatial centroids. '
+         'DC/AC decomposition for position (mirrors Step 1 for color). '
+         'Loss: weighted MSE over present categories.')
+
+parser.add_argument('--layout_loss_weight',   type=float, default=0.3,
+    help='Weight for SceneLayoutHead MSE loss (default 0.3).')
+
+# ── NEW: JEPA Idea 1 ─────────────────────────────────────────────────────────
+parser.add_argument('--jepa_idea1',           action='store_true', default=False,
+    help='SpatialSemanticHead: (shape_embed + voxel_center) -> [B,512,72]. '
+         'Spatially-resolved semantic — WHERE categories are, not just WHAT. '
+         'Requires --position_scaffold (reuses scaffold_anchors).')
+
+parser.add_argument('--jepa_idea1_weight',    type=float, default=1.0,
+    help='Weight for SpatialSemanticHead KL loss (default 1.0).')
 
 # Label input
 parser.add_argument('--label_input',          action='store_true', default=False)
@@ -203,17 +303,31 @@ parser.add_argument('--use_wandb',            action='store_true', default=False
 parser.add_argument('--wandb_project',        type=str, default='Can3Tok-SceenSplat-7K')
 parser.add_argument('--wandb_entity',         type=str, default='3D-SSC')
 
-# Resuming
+# Resume
 parser.add_argument('--resume_checkpoint',    type=str, default=None)
 parser.add_argument('--resume_epoch',         type=int, default=None)
 
 args = parser.parse_args()
 
-semantic_requested      = (args.semantic_mode != 'none')
-semantic_loss_enabled   = (args.segment_loss_weight > 0 or args.instance_loss_weight > 0)
-enable_semantic         = semantic_requested and semantic_loss_enabled
+# Validate flag combinations
+if args.cross_recon_weight > 0 and not args.latent_disentangle:
+    print("[WARNING] --cross_recon_weight > 0 requires --latent_disentangle. Setting to 0.")
+    args.cross_recon_weight = 0.0
+if args.ortho_weight > 0 and not args.latent_disentangle:
+    print("[WARNING] --ortho_weight > 0 requires --latent_disentangle. Setting to 0.")
+    args.ortho_weight = 0.0
+if args.jepa_idea1 and not args.position_scaffold:
+    print("[INFO] --jepa_idea1 requires --position_scaffold. Enabling.")
+    args.position_scaffold = True
+if args.semantic_dims % 32 != 0:
+    raise ValueError(f"--semantic_dims ({args.semantic_dims}) must be divisible by 32.")
+
+semantic_requested    = (args.semantic_mode != 'none')
+semantic_loss_enabled = (args.segment_loss_weight > 0 or args.instance_loss_weight > 0)
+enable_semantic       = semantic_requested and semantic_loss_enabled
 effective_semantic_mode = args.semantic_mode if enable_semantic else 'none'
-need_segment_labels     = enable_semantic or args.scene_semantic_head
+
+need_segment_labels = enable_semantic or args.scene_semantic_head or args.jepa_idea1
 
 # ============================================================================
 # W&B
@@ -225,17 +339,21 @@ if args.use_wandb:
         import wandb
         job_id   = os.environ.get('SLURM_JOB_ID', 'local')
         run_name = f"can3tok_job_{job_id}_{effective_semantic_mode}"
-        if args.color_residual:             run_name += "_colorresidual"
-        if args.scene_semantic_head:        run_name += "_scenesemantic"
-        if args.position_scaffold:          run_name += "_scaffold"
-        if args.decoder_shape_prepend:      run_name += "_shapeprepend"
-        if args.decoder_shape_cross_attn:   run_name += "_shapecrossattn"
-        if args.label_input:                run_name += "_labelinput"
-        if enable_semantic:                 run_name += f"_beta{args.segment_loss_weight}"
+        if args.color_residual:            run_name += "_colorresidual"
+        if args.scene_semantic_head:       run_name += "_scenesemantic"
+        if args.position_scaffold:         run_name += "_scaffold"
+        if args.decoder_shape_prepend:     run_name += "_shapeprepend"
+        if args.decoder_shape_cross_attn:  run_name += "_shapecrossattn"
+        if args.latent_disentangle:        run_name += f"_disentangle{args.semantic_dims}"
+        if args.scene_layout_head:         run_name += "_layout"
+        if args.jepa_idea1:                run_name += "_jepa1"
+        if enable_semantic:                run_name += f"_beta{args.segment_loss_weight}"
+        if args.resume_checkpoint:         run_name += "_resumed"
         wandb_run = wandb.init(
             entity=args.wandb_entity, project=args.wandb_project,
             name=run_name, config=vars(args))
         wandb_enabled = True
+        print("W&B enabled")
     except Exception as e:
         print(f"W&B failed: {e}")
 
@@ -250,14 +368,16 @@ data_path = "/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs
 job_id = os.environ.get('SLURM_JOB_ID', None)
 tag    = (f"RGB_job_{job_id}_{effective_semantic_mode}" if job_id
           else f"RGB_local_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{effective_semantic_mode}")
-if args.color_residual:             tag += "_colorresidual"
-if args.scene_semantic_head:        tag += "_scenesemantic"
-if args.position_scaffold:          tag += "_scaffold"
-if args.decoder_shape_prepend:      tag += "_shapeprepend"
-if args.decoder_shape_cross_attn:   tag += "_shapecrossattn"
-if args.label_input:                tag += "_labelinput"
-if enable_semantic:                 tag += f"_beta{args.segment_loss_weight}"
-if not args.use_canonical_norm:     tag += "_raw"
+if args.color_residual:            tag += "_colorresidual"
+if args.scene_semantic_head:       tag += "_scenesemantic"
+if args.position_scaffold:         tag += "_scaffold"
+if args.decoder_shape_prepend:     tag += "_shapeprepend"
+if args.decoder_shape_cross_attn:  tag += "_shapecrossattn"
+if args.latent_disentangle:        tag += f"_disentangle{args.semantic_dims}"
+if args.scene_layout_head:         tag += "_layout"
+if args.jepa_idea1:                tag += "_jepa1"
+if enable_semantic:                tag += f"_beta{args.segment_loss_weight}"
+if not args.use_canonical_norm:    tag += "_raw"
 
 save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{tag}/"
 os.makedirs(save_path, exist_ok=True)
@@ -269,25 +389,18 @@ os.makedirs(save_path, exist_ok=True)
 print(f"\n{'='*70}")
 print(f"CAN3TOK TRAINING")
 print(f"{'='*70}")
-print(f"  Semantic mode:              {effective_semantic_mode}")
-print(f"  Color residual:             {args.color_residual}  (Step 1 — MeanColorHead)")
-print(f"  Scene semantic head:        {args.scene_semantic_head}  (Move 1)")
-print(f"  Position scaffold:          {args.position_scaffold}  (Scaffold-GS)")
-print(f"  Decoder shape prepend:      {args.decoder_shape_prepend}  (Option 1)")
-print(f"  Decoder shape cross-attn:   {args.decoder_shape_cross_attn}  (Option 2)")
-if args.decoder_shape_cross_attn:
-    print(f"  Cross-attn layers:          {args.decoder_cross_attn_layers}")
-if args.decoder_shape_prepend:
-    print(f"\n  OPTION 1 ACTIVE:")
-    print(f"    shape_embed → project → prepend as token 0 in decoder transformer")
-    print(f"    Transformer: [shape_token | 512 geometry tokens] = 513 tokens (n_ctx=513 ✓)")
-    print(f"    shape token dropped after transformer")
-if args.decoder_shape_cross_attn:
-    print(f"\n  OPTION 2 ACTIVE:")
-    print(f"    {args.decoder_cross_attn_layers} cross-attn layers BEFORE decoder transformer")
-    print(f"    geometry tokens attend to shape_embed (single key/value)")
-    print(f"    all 12 transformer layers process shape-conditioned tokens")
-print(f"  Save path: {save_path}")
+print(f"  color_residual:            {args.color_residual}")
+print(f"  scene_semantic_head:       {args.scene_semantic_head}")
+print(f"  position_scaffold:         {args.position_scaffold}")
+print(f"  decoder_shape_prepend:     {args.decoder_shape_prepend}")
+print(f"  decoder_shape_cross_attn:  {args.decoder_shape_cross_attn}")
+print(f"  latent_disentangle:        {args.latent_disentangle}  (semantic_dims={args.semantic_dims})")
+print(f"  cross_recon_weight:        {args.cross_recon_weight}")
+print(f"  ortho_weight:              {args.ortho_weight}")
+print(f"  scene_layout_head:         {args.scene_layout_head}  (weight={args.layout_loss_weight})")
+print(f"  jepa_idea1:                {args.jepa_idea1}  (weight={args.jepa_idea1_weight})")
+print(f"  semantic_mode:             {effective_semantic_mode}")
+print(f"  Save: {save_path}")
 print(f"{'='*70}\n")
 
 # ============================================================================
@@ -302,9 +415,14 @@ p.semantic_mode              = effective_semantic_mode
 p.color_residual             = args.color_residual
 p.scene_semantic_head        = args.scene_semantic_head
 p.position_scaffold          = args.position_scaffold
-p.decoder_shape_prepend      = args.decoder_shape_prepend      # Option 1
-p.decoder_shape_cross_attn   = args.decoder_shape_cross_attn   # Option 2
-p.decoder_cross_attn_layers  = args.decoder_cross_attn_layers  # Option 2 depth
+p.decoder_shape_prepend      = args.decoder_shape_prepend
+p.decoder_shape_cross_attn   = args.decoder_shape_cross_attn
+p.decoder_cross_attn_layers  = args.decoder_cross_attn_layers
+# NEW
+p.latent_disentangle         = args.latent_disentangle
+p.semantic_dims              = args.semantic_dims
+p.scene_layout_head          = args.scene_layout_head
+p.jepa_idea1                 = args.jepa_idea1
 
 cfg_point_feats = p.point_feats
 expected_feats  = 12 if args.label_input else 11
@@ -329,27 +447,33 @@ if args.resume_checkpoint:
     print(f"\nResuming from: {args.resume_checkpoint}")
     ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
 
-    # Architecture flags that change model structure — must match exactly
-    for flag_name, current_val in [
-        ('color_residual',            args.color_residual),
-        ('label_input',               args.label_input),
-        ('position_scaffold',         args.position_scaffold),
-        ('decoder_shape_prepend',     args.decoder_shape_prepend),
-        ('decoder_shape_cross_attn',  args.decoder_shape_cross_attn),
-        ('decoder_cross_attn_layers', args.decoder_cross_attn_layers),
+    # Hard architectural mismatches that break weight loading
+    for flag_name, current_val, default_val in [
+        ('color_residual',            args.color_residual,           False),
+        ('label_input',               args.label_input,              False),
+        ('position_scaffold',         args.position_scaffold,        False),
+        ('decoder_shape_prepend',     args.decoder_shape_prepend,    False),
+        ('decoder_shape_cross_attn',  args.decoder_shape_cross_attn, False),
+        ('decoder_cross_attn_layers', args.decoder_cross_attn_layers, 4),
+        ('latent_disentangle',        args.latent_disentangle,       False),
+        ('semantic_dims',             args.semantic_dims,             512),
     ]:
-        saved_val = ckpt.get(flag_name, False if flag_name != 'decoder_cross_attn_layers' else 4)
+        saved_val = ckpt.get(flag_name, default_val)
         if saved_val != current_val:
             raise ValueError(
                 f"{flag_name} mismatch: checkpoint={saved_val}, current={current_val}. "
-                f"This flag changes model architecture — cannot resume across it.")
+                f"Cannot resume across this architectural boundary.")
 
     saved_ssh  = ckpt.get('scene_semantic_head', False)
     saved_mode = ckpt.get('semantic_mode', 'none')
-    strict = (saved_ssh == args.scene_semantic_head and
-              saved_mode == effective_semantic_mode)
+    saved_slh  = ckpt.get('scene_layout_head', False)
+    saved_ji   = ckpt.get('jepa_idea1', False)
+    strict = (saved_ssh  == args.scene_semantic_head and
+              saved_mode == effective_semantic_mode and
+              saved_slh  == args.scene_layout_head and
+              saved_ji   == args.jepa_idea1)
     if not strict:
-        print(f"  Architecture changed, loading strict=False")
+        print(f"  Architecture changed — loading strict=False")
     gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=strict)
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     start_epoch   = ckpt.get('epoch', 0) + 1
@@ -357,7 +481,7 @@ if args.resume_checkpoint:
         start_epoch = args.resume_epoch
     best_val_loss = ckpt.get('val_l2_error', ckpt.get('best_val_l2', float('inf')))
     best_epoch    = ckpt.get('epoch', 0)
-    print(f"  Resumed at epoch {start_epoch} (saved val L2: {best_val_loss:.4f})")
+    print(f"  Resumed epoch {start_epoch} (saved val L2: {best_val_loss:.4f})")
 
 # ============================================================================
 # DATASETS
@@ -373,7 +497,9 @@ gs_dataset_train = gs_dataset(
     normalize=args.use_canonical_norm, normalize_colors=args.normalize_colors,
     target_radius=10.0, scale_norm_mode=args.scale_norm_mode,
     label_input=args.label_input, color_residual=args.color_residual,
-    position_scaffold=args.position_scaffold)
+    position_scaffold=args.position_scaffold,
+    scene_layout_head=args.scene_layout_head,
+    jepa_idea1=args.jepa_idea1)
 trainDataLoader = Data.DataLoader(
     dataset=gs_dataset_train, batch_size=args.batch_size,
     shuffle=True, num_workers=9, pin_memory=True, persistent_workers=True)
@@ -386,7 +512,9 @@ gs_dataset_val = gs_dataset(
     normalize=args.use_canonical_norm, normalize_colors=args.normalize_colors,
     target_radius=10.0, scale_norm_mode=args.scale_norm_mode,
     label_input=args.label_input, color_residual=args.color_residual,
-    position_scaffold=args.position_scaffold)
+    position_scaffold=args.position_scaffold,
+    scene_layout_head=args.scene_layout_head,
+    jepa_idea1=args.jepa_idea1)
 valDataLoader = Data.DataLoader(
     dataset=gs_dataset_val, batch_size=args.batch_size,
     shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True)
@@ -408,12 +536,21 @@ _ckpt_meta = {
     'color_residual':            args.color_residual,
     'scene_semantic_head':       args.scene_semantic_head,
     'position_scaffold':         args.position_scaffold,
-    'decoder_shape_prepend':     args.decoder_shape_prepend,      # Option 1
-    'decoder_shape_cross_attn':  args.decoder_shape_cross_attn,   # Option 2
-    'decoder_cross_attn_layers': args.decoder_cross_attn_layers,  # Option 2 depth
+    'decoder_shape_prepend':     args.decoder_shape_prepend,
+    'decoder_shape_cross_attn':  args.decoder_shape_cross_attn,
+    'decoder_cross_attn_layers': args.decoder_cross_attn_layers,
+    # NEW
+    'latent_disentangle':        args.latent_disentangle,
+    'semantic_dims':             args.semantic_dims,
+    'scene_layout_head':         args.scene_layout_head,
+    'jepa_idea1':                args.jepa_idea1,
     'mean_color_weight':         args.mean_color_weight,
     'scene_semantic_weight':     args.scene_semantic_weight,
     'anchor_loss_weight':        args.anchor_loss_weight,
+    'cross_recon_weight':        args.cross_recon_weight,
+    'ortho_weight':              args.ortho_weight,
+    'layout_loss_weight':        args.layout_loss_weight,
+    'jepa_idea1_weight':         args.jepa_idea1_weight,
     'color_loss_weight':         args.color_loss_weight,
     'use_canonical_norm':        args.use_canonical_norm,
     'scale_norm_mode':           args.scale_norm_mode,
@@ -425,10 +562,13 @@ _ckpt_meta = {
 
 def evaluate_model(model, dataloader, device, epoch=None):
     model.eval()
-    total_l2 = total_kl = 0.0
-    total_color_pred_loss   = 0.0
-    total_scene_semantic_kl = 0.0
-    total_anchor_loss       = 0.0
+    total_l2              = 0.0
+    total_kl              = 0.0
+    total_color_pred      = 0.0
+    total_scene_sem_kl    = 0.0
+    total_anchor_loss     = 0.0
+    total_layout_loss     = 0.0
+    total_spatial_kl      = 0.0
     per_param  = {k: 0.0 for k in PARAM_SLICES}
     n_scenes   = 0
     recon_preds_list = []
@@ -450,6 +590,7 @@ def evaluate_model(model, dataloader, device, epoch=None):
             mean_color_pred     = model.shape_model.last_mean_color_pred
             scene_semantic_pred = model.shape_model.last_scene_semantic_pred
             anchor_pred         = model.shape_model.last_anchor_pred
+            scene_layout_pred   = model.shape_model.last_scene_layout_pred
 
             target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]
             if args.position_scaffold:
@@ -464,14 +605,28 @@ def evaluate_model(model, dataloader, device, epoch=None):
             kl_loss    = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
 
             if mean_color_pred is not None and args.color_residual:
-                total_color_pred_loss += F.mse_loss(mean_color_pred, mean_color_gt).item() * B
+                total_color_pred += F.mse_loss(mean_color_pred, mean_color_gt).item() * B
             if scene_semantic_pred is not None and args.scene_semantic_head:
                 p_s = batch_data['label_dist'].float().to(device)
-                total_scene_semantic_kl += scene_semantic_kl_loss(
+                total_scene_sem_kl += scene_semantic_kl_loss(
                     scene_semantic_pred, p_s).item() * B
             if anchor_pred is not None and args.position_scaffold:
                 scaffold_anchors = batch_data['scaffold_anchors'].float().to(device)
                 total_anchor_loss += F.mse_loss(anchor_pred, scaffold_anchors).item() * B
+            if scene_layout_pred is not None and args.scene_layout_head:
+                gt_centroids = batch_data['category_centroids'].float().to(device)
+                gt_valid     = batch_data['category_valid'].float().to(device)
+                total_layout_loss += compute_layout_loss(
+                    scene_layout_pred, gt_centroids, gt_valid).item() * B
+            # JEPA Idea 1 eval
+            if args.jepa_idea1 and model.shape_model.spatial_semantic_module is not None:
+                scaffold_anchors_gpu = batch_data['scaffold_anchors'].float().to(device)
+                spatial_pred = model.shape_model.spatial_semantic_module(
+                    model.shape_model._shape_embed_cache, scaffold_anchors_gpu)
+                gt_voxel    = batch_data['voxel_label_dists'].float().to(device)
+                voxel_valid = batch_data['voxel_valid'].float().to(device)
+                total_spatial_kl += compute_spatial_semantic_loss(
+                    spatial_pred, gt_voxel, voxel_valid).item() * B
 
             total_l2 += recon_loss.item()
             total_kl += kl_loss.sum().item()
@@ -517,9 +672,11 @@ def evaluate_model(model, dataloader, device, epoch=None):
     return {
         'avg_l2_error':      total_l2,
         'avg_kl':            total_kl / n,
-        'color_pred_loss':   total_color_pred_loss / n,
-        'scene_semantic_kl': total_scene_semantic_kl / n,
+        'color_pred_loss':   total_color_pred / n,
+        'scene_semantic_kl': total_scene_sem_kl / n,
         'anchor_loss':       total_anchor_loss / n,
+        'layout_loss':       total_layout_loss / n,
+        'spatial_kl':        total_spatial_kl / n,
         **{f'{k}_loss': v / n for k, v in per_param.items()},
     }
 
@@ -539,6 +696,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
     epoch_loss = epoch_recon = epoch_kl = epoch_sem = 0.0
     epoch_color_pred = epoch_scene_semantic = epoch_anchor = 0.0
+    epoch_layout = epoch_spatial = epoch_cross_recon = epoch_ortho = 0.0
     epoch_pos = epoch_col = epoch_opa = epoch_scl = epoch_rot = 0.0
 
     for i_batch, batch_data in enumerate(trainDataLoader):
@@ -561,9 +719,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         optimizer.zero_grad()
 
         # ── Forward ──────────────────────────────────────────────────────────
-        # shape_embed is now used inside the decoder (Options 1/2) via
-        # self._shape_embed_cache which is set in encode() and accessed in
-        # the overridden decode() in AlignedShapeLatentPerceiver.
         (shape_embed, mu, log_var, z,
          UV_gs_recover, per_gaussian_features) = gs_autoencoder(
             UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3])
@@ -571,6 +726,17 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         mean_color_pred     = gs_autoencoder.shape_model.last_mean_color_pred
         scene_semantic_pred = gs_autoencoder.shape_model.last_scene_semantic_pred
         anchor_pred         = gs_autoencoder.shape_model.last_anchor_pred
+        scene_layout_pred   = gs_autoencoder.shape_model.last_scene_layout_pred
+        _mu_s               = gs_autoencoder.shape_model._mu_s_cache
+        _mu_g               = gs_autoencoder.shape_model._mu_g_cache
+
+        # ── JEPA Idea 1: call spatial semantic head externally ────────────────
+        spatial_semantic_pred = None
+        if (args.jepa_idea1 and
+                gs_autoencoder.shape_model.spatial_semantic_module is not None):
+            scaffold_anchors_jepa = batch_data['scaffold_anchors'].float().to(device)
+            spatial_semantic_pred = gs_autoencoder.shape_model.spatial_semantic_module(
+                gs_autoencoder.shape_model._shape_embed_cache, scaffold_anchors_jepa)
 
         # ── Reconstruction target ─────────────────────────────────────────────
         target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]
@@ -583,7 +749,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         pred_3d    = UV_gs_recover.reshape(B, -1, 14)
         recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
 
-        # ── KL loss ───────────────────────────────────────────────────────────
+        # ── KL ────────────────────────────────────────────────────────────────
         KL_loss = -0.5 * torch.sum(
             1 + log_var - mu.pow(2) - log_var.exp(), dim=1).mean()
 
@@ -600,6 +766,21 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         anchor_loss = torch.tensor(0.0, device=device)
         if anchor_pred is not None and args.position_scaffold:
             anchor_loss = F.mse_loss(anchor_pred, scaffold_anchors)
+
+        # NEW: layout loss
+        layout_loss = torch.tensor(0.0, device=device)
+        if scene_layout_pred is not None and args.scene_layout_head:
+            gt_centroids = batch_data['category_centroids'].float().to(device)
+            gt_valid     = batch_data['category_valid'].float().to(device)
+            layout_loss  = compute_layout_loss(scene_layout_pred, gt_centroids, gt_valid)
+
+        # NEW: spatial semantic loss (JEPA Idea 1)
+        spatial_loss = torch.tensor(0.0, device=device)
+        if spatial_semantic_pred is not None and args.jepa_idea1:
+            gt_voxel    = batch_data['voxel_label_dists'].float().to(device)
+            voxel_valid = batch_data['voxel_valid'].float().to(device)
+            spatial_loss = compute_spatial_semantic_loss(
+                spatial_semantic_pred, gt_voxel, voxel_valid)
 
         # ── InfoNCE ────────────────────────────────────────────────────────────
         semantic_loss    = torch.tensor(0.0, device=device)
@@ -622,12 +803,63 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                     subsample=args.semantic_subsample,
                     sampling_strategy=args.sampling_strategy)
 
+        # ── NEW: Cross-reconstruction loss ─────────────────────────────────────
+        # Swap mu_s between consecutive scenes via torch.roll (shift by 1).
+        # Decode with: z_s from scene i+1, z_g from scene i.
+        # Loss: geometry-only L2 on output vs scene i geometry.
+        #
+        # Why this works:
+        #   mu_g_i must reconstruct scene i geometry even when paired with
+        #   scene i+1's semantic code -> mu_g encodes geometry, NOT semantics.
+        #   mu_s is forced to be geometry-compatible across scenes.
+        #
+        # Color excluded because scene i+1's color palette is legitimately
+        # different from scene i's when mu_s_i+1 is used.
+        cross_recon_loss = torch.tensor(0.0, device=device)
+        if (args.latent_disentangle and args.cross_recon_weight > 0
+                and _mu_s is not None and _mu_g is not None and B > 1):
+            D_s = args.semantic_dims
+
+            # Shift semantic subspace by 1 in batch dimension
+            mu_s_shifted   = torch.roll(_mu_s, shifts=1, dims=0)
+            lv_s_shifted   = torch.roll(log_var[:, :D_s], shifts=1, dims=0)
+            z_s_swapped    = mu_s_shifted + torch.exp(0.5 * lv_s_shifted) * torch.randn_like(mu_s_shifted)
+
+            # Keep geometric subspace from current scene
+            z_g_current    = _mu_g + torch.exp(0.5 * log_var[:, D_s:]) * torch.randn_like(_mu_g)
+
+            z_cross  = torch.cat([z_s_swapped, z_g_current], dim=-1)  # [B, 16384]
+            lat_cross = z_cross.reshape(B, 512, 32)
+
+            # Shift shape_embed for decoder conditioning (Options 1/2)
+            se_shifted = torch.roll(
+                gs_autoencoder.shape_model._shape_embed_cache, shifts=1, dims=0)
+
+            UV_cross, _ = gs_autoencoder.shape_model.decode(
+                lat_cross,
+                volume_queries=None,
+                return_semantic_features=False,
+                shape_embed=se_shifted)
+
+            pred_cross_3d = UV_cross.reshape(B, -1, 14)
+            cross_recon_loss = compute_cross_recon_loss(pred_cross_3d, target, B)
+
+        # ── NEW: Orthogonality loss ─────────────────────────────────────────────
+        ortho_loss = torch.tensor(0.0, device=device)
+        if (args.latent_disentangle and args.ortho_weight > 0
+                and _mu_s is not None and _mu_g is not None and B > 1):
+            ortho_loss = compute_orthogonality_loss(_mu_s, _mu_g)
+
         # ── Total loss ────────────────────────────────────────────────────────
         loss = (recon_loss
                 + args.kl_weight             * KL_loss
                 + args.mean_color_weight     * color_pred_loss
                 + args.scene_semantic_weight * scene_semantic_loss
                 + args.anchor_loss_weight    * anchor_loss
+                + args.layout_loss_weight    * layout_loss
+                + args.jepa_idea1_weight     * spatial_loss
+                + args.cross_recon_weight    * cross_recon_loss
+                + args.ortho_weight          * ortho_loss
                 + semantic_loss)
         loss.backward()
         optimizer.step()
@@ -640,30 +872,32 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         epoch_color_pred     += color_pred_loss.item()
         epoch_scene_semantic += scene_semantic_loss.item()
         epoch_anchor         += anchor_loss.item()
+        epoch_layout         += layout_loss.item()
+        epoch_spatial        += spatial_loss.item()
+        epoch_cross_recon    += cross_recon_loss.item()
+        epoch_ortho          += ortho_loss.item()
         epoch_pos += ind['position']
         epoch_col += ind['color']
         epoch_opa += ind['opacity']
         epoch_scl += ind['scale']
         epoch_rot += ind['rotation']
 
-        # Epoch 0 first-batch diagnostic
+        # First batch diagnostic
         if epoch == start_epoch and i_batch == 0:
             print(f"\nEPOCH {epoch} DIAGNOSTIC (batch 0):")
-            print(f"  mu range:    [{mu.min().item():.3f}, {mu.max().item():.3f}]")
-            print(f"  recon_loss:  {recon_loss.item():.4f}")
+            print(f"  mu range:       [{mu.min().item():.3f}, {mu.max().item():.3f}]")
+            print(f"  recon_loss:     {recon_loss.item():.4f}")
+            if args.latent_disentangle and _mu_s is not None:
+                print(f"  mu_s range:     [{_mu_s.min().item():.3f}, {_mu_s.max().item():.3f}]")
+                print(f"  mu_g range:     [{_mu_g.min().item():.3f}, {_mu_g.max().item():.3f}]")
+                print(f"  cross_recon:    {cross_recon_loss.item():.4f}")
+                print(f"  ortho:          {ortho_loss.item():.6f}")
+            if args.scene_layout_head and scene_layout_pred is not None:
+                print(f"  layout_loss:    {layout_loss.item():.4f}")
+            if args.jepa_idea1 and spatial_semantic_pred is not None:
+                print(f"  spatial_kl:     {spatial_loss.item():.4f}")
             if args.color_residual and mean_color_pred is not None:
-                print(f"  color_pred:  {color_pred_loss.item():.6f}")
-            if args.position_scaffold and anchor_pred is not None:
-                print(f"  anchor_loss: {anchor_loss.item():.4f}")
-            # Shape conditioning diagnostic: verify decode sees shape_embed
-            if args.decoder_shape_prepend or args.decoder_shape_cross_attn:
-                print(f"  shape_embed range: [{shape_embed.min().item():.3f}, "
-                      f"{shape_embed.max().item():.3f}]  (conditioning decoder)")
-                # A quick sanity check: reconstruction loss with shape conditioning
-                # should not be worse than without at epoch 0 (they're both random)
-                print(f"  decoder conditioning: "
-                      f"{'prepend+' if args.decoder_shape_prepend else ''}"
-                      f"{'cross-attn' if args.decoder_shape_cross_attn else ''} active")
+                print(f"  color_pred:     {color_pred_loss.item():.6f}")
 
         if wandb_enabled:
             log = {
@@ -673,6 +907,10 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 "train/step_color_pred":     color_pred_loss.item(),
                 "train/step_scene_semantic": scene_semantic_loss.item(),
                 "train/step_anchor":         anchor_loss.item(),
+                "train/step_layout":         layout_loss.item(),
+                "train/step_spatial_kl":     spatial_loss.item(),
+                "train/step_cross_recon":    cross_recon_loss.item(),
+                "train/step_ortho":          ortho_loss.item(),
                 "train/step_position":       ind['position'],
                 "train/step_color":          ind['color'],
                 "train/step_opacity":        ind['opacity'],
@@ -690,7 +928,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | Recon={epoch_recon/nb:.4f} | "
           f"KL={epoch_kl/nb:.4f} | InfoNCE={epoch_sem/nb:.4f} | "
           f"ColorPred={epoch_color_pred/nb:.6f} | SceneSem={epoch_scene_semantic/nb:.4f} | "
-          f"Anchor={epoch_anchor/nb:.4f}")
+          f"Layout={epoch_layout/nb:.4f} | SpatialKL={epoch_spatial/nb:.4f} | "
+          f"CrossRecon={epoch_cross_recon/nb:.4f} | Ortho={epoch_ortho/nb:.6f}")
     print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
           f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | Rot={epoch_rot/nb:.3f}")
 
@@ -701,9 +940,9 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=epoch)
         print(f"  L2:              {val_metrics['avg_l2_error']:.4f}")
         print(f"  Position:        {val_metrics['position_loss']:.4f}"
-              f"  {'(offsets)' if args.position_scaffold else '(absolute)'}")
+              f"{'  (offsets)' if args.position_scaffold else '  (absolute)'}")
         print(f"  Color:           {val_metrics['color_loss']:.4f}"
-              f"  {'(residuals)' if args.color_residual else '(absolute)'}")
+              f"{'  (residuals)' if args.color_residual else '  (absolute)'}")
         print(f"  Opacity:         {val_metrics['opacity_loss']:.4f}")
         print(f"  Scale:           {val_metrics['scale_loss']:.4f}")
         print(f"  Rotation:        {val_metrics['rotation_loss']:.4f}")
@@ -713,6 +952,10 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             print(f"  SceneSemanticKL: {val_metrics['scene_semantic_kl']:.4f}")
         if args.position_scaffold:
             print(f"  AnchorMSE:       {val_metrics['anchor_loss']:.4f}")
+        if args.scene_layout_head:
+            print(f"  LayoutMSE:       {val_metrics['layout_loss']:.4f}")
+        if args.jepa_idea1:
+            print(f"  SpatialKL:       {val_metrics['spatial_kl']:.4f}")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
@@ -734,6 +977,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             "val/color_pred_mse":    val_metrics['color_pred_loss'],
             "val/scene_semantic_kl": val_metrics['scene_semantic_kl'],
             "val/anchor_mse":        val_metrics['anchor_loss'],
+            "val/layout_mse":        val_metrics['layout_loss'],
+            "val/spatial_kl":        val_metrics['spatial_kl'],
             "val/opacity_loss":      val_metrics['opacity_loss'],
             "val/scale_loss":        val_metrics['scale_loss'],
             "val/rotation_loss":     val_metrics['rotation_loss'],
@@ -742,7 +987,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             "train/epoch":           epoch,
         }, step=global_step)
 
-    if epoch >= 10 and epoch % 50 == 0:
+    if epoch >= 10 and epoch % 500 == 0:
         torch.save({
             'epoch':      epoch,
             'model_state_dict':     gs_autoencoder.state_dict(),
