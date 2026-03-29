@@ -1,12 +1,13 @@
 # Can3Tok VAE — Semantic-Aware 3D Scene Tokenizer
 
-A Perceiver-based Variational Autoencoder that encodes full indoor 3DGS scenes into a structured latent space, with DC/AC color decomposition, scene-level semantic supervision, and per-Gaussian InfoNCE contrastive learning. Built on SceneSplat-7K as the foundation for generative scene completion.
+A Perceiver-based Variational Autoencoder that encodes full indoor 3DGS scenes into a structured latent space. The architecture combines DC/AC color and position decomposition, latent space disentanglement, scene-level semantic supervision, and spatial inductive bias in the decoder. Built on SceneSplat-7K as the foundation for generative scene completion.
 
 ---
 
 ## Architecture Overview
 
 ### Input Representation
+
 Each scene is represented as **40,000 Gaussians** (sampled by opacity), each with 14 parameters:
 
 ```
@@ -53,7 +54,7 @@ The 512 latent tokens are split into two parts:
 Output: [B, 512, 32]
 ```
 
-**`shape_embed`** is the global scene token — a single vector meant to carry the overall scene identity. It is the most important token in the representation, and also the hardest to train (see Color Residual section below).
+**`shape_embed`** is the global scene token carrying overall scene identity. With standard training it collapses (no gradient), which motivated the DC/AC decomposition described below.
 
 ---
 
@@ -78,345 +79,468 @@ Output: [B, 40000, 14]
 
 ---
 
-### Semantic Head — `SemanticProjectionHead`
+## Ablation Results Summary
 
-Extracts per-Gaussian semantic features for contrastive supervision. Three modes:
-
-| Mode | Input | Path | Output |
-|------|-------|------|--------|
-| `geometric` | GS params `[B, 40k, 14]` | 3-layer MLP | `[B, 40k, 32]` |
-| `hidden` | Decoder hidden state `[B, 1024]` | MLP → reshape | `[B, 40k, 32]` |
-| `attention` | Positions + transformer tokens | Cross-attention | `[B, 40k, 32]` |
-
-All outputs are L2-normalized to a unit hypersphere. `hidden` mode gave the best L2 reconstruction. `geometric` mode gave the cleanest scale distribution.
+| Run | Config | Val L2 |
+|-----|--------|--------|
+| A | color_residual only | 1.43 |
+| C | + scene_semantic_head | 1.80 |
+| H | + disentangle + layout | 1.565 |
+| K | + position_layout_residual | ~1.0–1.2 |
+| P | + decoder_pos_enc | 1.38 |
+| Q | + predict_seg_labels | 1.54 (no benefit) |
+| R | + token_cond approach A | **0.589** |
+| S | + token_cond approach B | unstable (KL explosion) |
+| T | + token_cond approach AB | best visual quality |
+| T2 | T + trilinear anchor smoothing | 0.606 (no seam artifacts) |
 
 ---
 
 ## Concept 1 — DC/AC Color Residual Decomposition
 
-This is the primary architectural contribution. It solves a fundamental gradient starvation problem in the original design.
-
 ### The Problem: `shape_embed` Gradient Starvation
 
-In the original Can3Tok encoder, the 512 latent tokens are split into:
-- `shape_embed`: 1 token → `[B, 1, 384]` → compressed to `[B, 1, 32]`
-- `latent_tokens`: 511 tokens → `[B, 511, 384]` → compressed to `[B, 511, 32]`
+`shape_embed` is intended as a global scene descriptor but receives almost no gradient during training because the 511 `latent_tokens` have sufficient capacity to explain all per-Gaussian variation without it. The result: `shape_embed` collapses to near-zero and encodes nothing.
 
-`shape_embed` is intended to be a **global scene descriptor** — it should encode the overall room identity. However, during training it receives almost no gradient signal because:
+### Solution: Two-Level Color Decomposition
 
-1. The decoder reconstructs 40,000 Gaussians from 512 tokens combined
-2. The 511 `latent_tokens` have sufficient capacity to explain the per-Gaussian variation
-3. `shape_embed` has no dedicated supervision path — it can be nearly zero with no penalty
-4. Without a gradient, `shape_embed` collapses to carrying no meaningful information
+Inspired by VQ-VAE-2's hierarchical latent structure:
 
-The result: the encoder bottleneck is broken. `mu` tries to encode both local geometry *and* global scene color, causing reconstruction collapse.
+- **Level 1 (DC — Global Color):** `shape_embed` → `MeanColorHead` → predicts the scene mean color `[B, 3]`
+- **Level 2 (AC — Local Residuals):** `latent_tokens` / `mu` → encode per-Gaussian color deviations from the mean
 
----
+### Implementation
 
-### The Solution: Two-Level Color Decomposition
-
-Inspired by VQ-VAE-2's hierarchical latent structure, we split color encoding into two levels:
-
-**Level 1 (DC — Global Color):** `shape_embed` → `MeanColorHead` → predicts the scene mean color
-
-**Level 2 (AC — Local Residuals):** `latent_tokens` / `mu` → encode per-Gaussian color *deviations* from the mean
-
-This gives `shape_embed` a concrete, measurable task with direct gradient flow.
-
----
-
-### Implementation: Dataset Side
-
-**`gs_dataset_scenesplat.py`** — preprocessing step during data loading:
-
+**Dataset side (`gs_dataset_scenesplat.py`):**
 ```python
-# Per-scene, applied to color.npy [N, 3] where N ~ millions of Gaussians
-scene_mean_color = color.mean(axis=0)          # [3]  — the DC component
+scene_mean_color = color.mean(axis=0)          # [3]  — DC component
 color_residuals  = color - scene_mean_color    # [N, 3]  range ~ [-0.3, +0.3]
-
-# Store both
-scene['color']            = color_residuals    # replaces absolute RGB [0,1]
-scene['mean_color_label'] = scene_mean_color   # supervision target for shape_embed
 ```
 
-The assembled feature tensor now contains residuals in the color channels:
-
-```
-Before: [voxel_center(3), voxel_id(1), xyz(3),  color_absolute(3),  opacity(1), scale(3), quat(4)]
-After:  [voxel_center(3), voxel_id(1), xyz(3),  color_residual(3),  opacity(1), scale(3), quat(4)]
-```
-
-Shape is unchanged: **`[B, 40000, 18]`**. The difference is that the 3 color channels now range over `[-0.3, +0.3]` (zero-centered residuals) instead of `[0, 1]` (absolute RGB).
-
----
-
-### Implementation: Model Side
-
-**`sal_perceiver_dist_changes.py`** — `MeanColorHead` is a small MLP attached to `shape_embed`:
-
+**Model side — `MeanColorHead`:**
 ```python
 class MeanColorHead(nn.Module):
-    def __init__(self, embed_dim=32):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3),
-            nn.Sigmoid()          # output in [0, 1] — matches original RGB range
-        )
+    def __init__(self, width=384):
+        self.head = nn.Sequential(
+            nn.Linear(width, 64), nn.ReLU(),
+            nn.Linear(64, 3), nn.Sigmoid())    # output in [0, 1]
 
-    def forward(self, shape_embed_z):
-        # shape_embed_z: [B, 32]  (the post-KL compressed shape token)
-        return self.net(shape_embed_z)   # -> [B, 3]
+    def forward(self, shape_embed):
+        return self.head(shape_embed)          # -> [B, 3]
 ```
 
-During forward pass:
-
-```
-shape_embed_z [B, 32]  ->  MeanColorHead  ->  mean_color_pred [B, 3]
-```
-
-The prediction is stored as `self.last_mean_color_pred` on the model instance — this avoids changing the return signature of the encoder and keeps `asl_pl_module.py` untouched.
-
----
-
-### Implementation: Loss Side
-
-**`gs_can3tok_2.py`** — additional MSE loss on mean color prediction:
-
+**Loss side:**
 ```python
-# mean_color_pred: [B, 3]  — from MeanColorHead(shape_embed_z)
-# mean_color_label: [B, 3] — from dataset preprocessing
-color_pred_loss = F.mse_loss(mean_color_pred, mean_color_label)
-
-# Total loss
-L_total = L_recon + kl_weight * L_KL + beta * L_semantic + lambda_color * color_pred_loss
+color_pred_loss = F.mse_loss(mean_color_pred, mean_color_gt)
+L_total += lambda_color * color_pred_loss
 ```
 
-This loss creates a **direct gradient path** from the color prediction error back through `MeanColorHead` into `shape_embed_z`, and from there back through the KL bottleneck into the encoder's `shape_embed` token.
+This creates a direct gradient path: `MSE → MeanColorHead → shape_embed → encoder`.
 
 ---
 
-### Information Flow Summary
+## Concept 2 — Scene-Level Label Distribution Prediction
 
-```
-ENCODER
-  40k Gaussians (residual colors) -> CrossAttentionEncoder
-    -> shape_embed [B, 1, 384]   <- now has a real job
-    -> latent_tokens [B, 511, 384]
+Gives `shape_embed` a second richer task beyond mean color: predict the **semantic composition** of the scene as a probability distribution over 72 ScanNet categories. A bedroom and a kitchen may have similar mean colors but very different semantic fingerprints.
 
-VAE BOTTLENECK
-  shape_embed -> mu_shape [B, 1, 32] -> z_shape [B, 32]
-                                             |
-                                     MeanColorHead
-                                             |
-                                   mean_color_pred [B, 3]
-                                             |
-                              MSE loss vs mean_color_label [B, 3]  ← gradient flows back here
+### Ground Truth
 
-  latent_tokens -> mu [B, 511, 32] -> z [B, 511*32]
-                                             |
-                              Decoder reconstructs color_residuals [B, 40k, 3]
-                              (fine AC detail — not the mean)
-
-RECONSTRUCTION
-  final_color [B, 40k, 3] = mean_color_pred [B, 1, 3] + color_residual_pred [B, 40k, 3]
-```
-
----
-
-## Concept 2 — Scene-Level Label Distribution Prediction (Move 1)
-
-While Concept 1 gives `shape_embed` a color prediction task (3 numbers), Move 1 gives it a second, richer task: predict the **semantic composition** of the entire scene as a probability distribution over ScanNet72 categories.
-
-### Motivation
-
-After Concept 1, `shape_embed` is forced to encode 3 numbers (mean RGB). But a bedroom and a kitchen may have similar mean colors yet completely different semantic content — one is dominated by bed, pillow, and nightstand; the other by countertop, cabinet, and appliance. This scene-level semantic character is a global property that belongs in `shape_embed`, not in the per-Gaussian latents.
-
-Move 1 gives `shape_embed` a second explicit task: predict **what fraction of the scene belongs to each of the 72 ScanNet categories**. This is the semantic fingerprint of the room.
-
----
-
-### The Ground Truth: Scene Label Distribution
-
-For each scene $b$, every Gaussian carries a ScanNet72 category label $y_i \in \{0, \ldots, 71\}$. The ground truth is the **empirical label distribution** — what fraction of Gaussians belong to each category:
+For each scene, the empirical label distribution:
 
 $$p_s^{(b)}[k] = \frac{\sum_{i=1}^{N} \mathbf{1}[y_i^{(b)} = k]}{N_{\text{valid}}^{(b)}}$$
 
-This is a proper probability distribution summing to 1. For a typical bedroom scene this might be:
+### Implementation
 
-| Label | Category | $p_s[k]$ |
-|-------|----------|----------|
-| 12    | floor    | 0.28     |
-| 16    | wall     | 0.24     |
-| 21    | ceiling  | 0.18     |
-| 35    | bed      | 0.09     |
-| ...   | ...      | ...      |
+**Dataset side:** a `[72]` histogram computed per scene, passed as `label_dist`.
 
-Two bedrooms will have similar $p_s$. A bedroom and a kitchen will have very different $p_s$. This distribution is the **semantic fingerprint** of the scene.
-
----
-
-### Implementation: Dataset Side
-
-**`gs_dataset_scenesplat.py`** — precomputed as a simple histogram in `__getitem__`, on CPU inside DataLoader workers:
-
-```python
-# Precompute ScanNet72 label distribution — zero GPU cost at training time
-label_dist = np.zeros(72, dtype=np.float32)
-valid_seg = segment[segment >= 0]
-if len(valid_seg) > 0:
-    for k in range(72):
-        label_dist[k] = (valid_seg == k).sum()
-    label_dist /= label_dist.sum()   # normalize to a probability distribution
-
-return {
-    ...
-    'label_dist': label_dist,   # [72] float32, sums to 1
-}
-```
-
-
-The label distribution is a fixed property of each scene that never changes between epochs. Computing it as a simple CPU histogram in a DataLoader worker and passing `[B, 72]` to the GPU (a trivial host-to-device copy) reduces the per-batch cost to essentially zero. The DataLoader workers run concurrently with GPU compute, so the cost is fully hidden.
-
-| Implementation | Tensor allocated | Memory/batch | Epoch time |
-|----------------|-----------------|-------------|------------|
-| one_hot in training loop | `[64, 40000, 72]` float32 | 737 MB | ~400s |
-| Histogram in dataset | `[64, 72]` float32 | 18 KB | ~65s |
-
----
-
-### Implementation: Model Side
-
-**`sal_perceiver_II_initialization.py`** — `SceneSemanticHead` is a 3-layer MLP with LayerNorm, attached to `shape_embed` independently of `MeanColorHead`:
-
+**Model side — `SceneSemanticHead`:**
 ```python
 class SceneSemanticHead(nn.Module):
-    def __init__(self, embed_dim=32, num_classes=72):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Linear(128, num_classes),
-        )
+    def __init__(self, width=384):
+        self.head = nn.Sequential(
+            nn.Linear(width, 128), nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, 128),   nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, 72))
 
-    def forward(self, shape_embed_z):
-        # shape_embed_z: [B, 32]
-        logits = self.net(shape_embed_z)          # [B, 72]
-        return F.softmax(logits, dim=-1)           # [B, 72]  — valid probability distribution
+    def forward(self, shape_embed):
+        return F.softmax(self.head(shape_embed), dim=-1)    # [B, 72]
 ```
 
-The softmax ensures $\hat{p}_s$ sums to 1 and all values are positive, matching the structure of the ground truth $p_s$. Parameters: ~108K (vs MeanColorHead's 8K).
-
----
-
-### Implementation: Loss Side
-
-**`gs_can3tok_2.py`** — KL divergence between predicted and ground truth distributions:
-
+**Loss side — KL divergence:**
 ```python
 def scene_semantic_kl_loss(p_hat, p_s, eps=1e-8):
     """D_KL(p_s || p_hat) = Σ p_s * log(p_s / p_hat)"""
     p_hat_clamped = torch.clamp(p_hat, min=eps)
-    kl_per_scene  = (p_s * (torch.log(p_s + eps) - torch.log(p_hat_clamped))).sum(dim=-1)
-    return kl_per_scene.mean()
-
-# In training loop — p_s already precomputed in dataset:
-p_s   = batch_data['label_dist'].float().to(device)               # [B, 72]
-p_hat = gs_autoencoder.shape_model.last_scene_semantic_pred        # [B, 72]
-scene_semantic_loss = scene_semantic_kl_loss(p_hat, p_s)
-
-# Full loss:
-L_total = L_recon
-        + kl_weight          * L_KL
-        + lambda_color        * L_color_pred         # Concept 1: MeanColorHead
-        + lambda_scene_sem    * L_scene_semantic      # Concept 2: SceneSemanticHead
-        + beta                * L_infonce             # Concept 3: InfoNCE (optional)
-```
-
-
-**Properties:**
-- $D_{\text{KL}} \geq 0$ always; $D_{\text{KL}} = 0$ iff $\hat{p}_s = p_s$ exactly
-- Predicting near-zero for a dominant category causes a very large penalty (log term blows up)
-- Predicting anything for a truly absent category has zero penalty ($p_s[k] \cdot \log(\cdot) = 0$)
-
----
-
-### All Four Gradient Paths: Full Picture
-
-After Concepts 1 and 2, the full model has **four independent gradient paths**:
-
-```
-PATH 1 — Reconstruction
-  L_recon  ->  GS_decoder  ->  post_kl  ->  transformer  ->  mu / latent_tokens
-
-PATH 2 — KL Regularisation
-  L_KL  ->  mu, log_var  ->  encoder
-
-PATH 3 — Mean Color (Concept 1)
-  L_color_mse  ->  MeanColorHead  ->  shape_embed  ->  encoder token 0
-
-PATH 4 — Scene Semantic Distribution (Concept 2)
-  L_scene_kl  ->  SceneSemanticHead  ->  shape_embed  ->  encoder token 0
-```
-
-Paths 3 and 4 both target `shape_embed` but through separate heads, separate losses, and separate output spaces. They are fully independent — the network learns to use different dimensions of `shape_embed` for colour information and semantic information.
-
----
-
-### What `shape_embed` Is Encoding
-
-| Supervision source | Signal dimensionality | What shape_embed learns |
-|-------------------|-----------------------|------------------------|
-| Concept 1: MeanColorHead | 3 numbers (mean RGB) | Scene colour palette |
-| Concept 2: SceneSemanticHead | 72 numbers (label distribution) | Dominant object categories, room type |
-| Paths 1+2 (indirect) | Reconstruction quality | Residual global geometry |
-
-After training with both heads, `shape_embed [B, 32]` encodes a structured global scene descriptor — colour palette, dominant category mix, and room type identity — all in 32 dimensions. This rich conditioning signal is what the downstream latent diffusion completion model will use to answer: *"What kind of scene am I completing?"*
-
----
-
-### Information Flow: Concepts 1 + 2 Combined
-
-```
-ENCODER
-  40k Gaussians -> CrossAttentionEncoder
-    -> shape_embed [B, 384] -> compressed -> z_shape [B, 32]
-                                                  |
-                               ┌──────────────────┴──────────────────┐
-                               ↓                                     ↓
-                         MeanColorHead                    SceneSemanticHead
-                               ↓                                     ↓
-                    mean_color_pred [B, 3]          scene_dist_pred [B, 72]
-                               ↓                                     ↓
-                     MSE vs mean_color_gt              KL vs label_dist [B, 72]
-                     (from dataset batch)              (precomputed histogram)
+    return (p_s * (torch.log(p_s + eps) - torch.log(p_hat_clamped))).sum(dim=-1).mean()
 ```
 
 ---
 
 ## Concept 3 — Per-Gaussian Semantic InfoNCE Supervision
 
-Per-Gaussian contrastive learning using ScanNet72 category labels as supervision signal. Operates on the **decoder hidden state** — a completely separate gradient path from Concepts 1 and 2 which both target `shape_embed`.
-
-**`semantic_losses.py`** — `ScanNet72SemanticLoss`:
+Per-Gaussian contrastive learning using ScanNet72 category labels. Operates on the **decoder hidden state** — a completely separate gradient path from Concepts 1 and 2.
 
 ```
-For each scene in batch:
-  1. Extract per-Gaussian features from SemanticProjectionHead [40k, 32]
-  2. Subsample 10k Gaussians (balanced across categories — prevents wall/floor dominance)
+For each batch:
+  1. Extract per-Gaussian features from SemanticProjectionHead [B, 40k, 32]
+  2. Subsample 10k Gaussians (balanced across categories)
   3. Compute category prototypes: mean feature per ScanNet72 class
   4. InfoNCE loss (temperature=0.1):
-       L = -log[ exp(sim(f_i, proto_c) / τ) / Σ_j exp(sim(f_i, proto_j) / τ) ]
+     L = -log[ exp(sim(f_i, proto_c) / τ) / Σ_j exp(sim(f_i, proto_j) / τ) ]
 ```
 
-Effect: Gaussians from the same semantic category are pulled together in the 32-dim feature space; Gaussians from different categories are pushed apart. PCA visualization at epoch 1200 confirms this — ceiling Gaussians cluster in blue/cyan, furniture in red/pink, with clean category separation emerging without instance-level supervision.
+Effect: Gaussians from the same category cluster together in the 32-dim feature space; Gaussians from different categories are pushed apart.
 
-**Key distinction from Concept 2:** InfoNCE operates on per-Gaussian features `[B, 40k, 32]` from the decoder hidden state. Concept 2 operates on the global scene token `shape_embed [B, 32]`. They supervise completely different parts of the network and are fully complementary.
+---
+
+## Concept 4 — Latent Disentanglement (mu_s / mu_g Split)
+
+### The Problem
+
+With standard training, `mu [B, 16384]` entangles semantic (what type of scene) and geometric (where things are) information. The decoder cannot separately access these two types of information, limiting its ability to generalise across scenes with the same layout but different semantic content.
+
+### Solution: Split Latent into Semantic and Geometric Subspaces
+
+```
+mu [B, 16384]
+  = concat(mu_s [B, D_s], mu_g [B, D_g])
+    where D_s = 512 (semantic), D_g = 15872 (geometric)
+
+mu_s  <- mu_s_proj_mean(shape_embed)    # from the global scene token
+mu_g  <- kl_emb_proj_mean_g(kl_flat)   # from the 511 geometry tokens
+```
+
+### Three Complementary Losses
+
+**1. Reconstruction loss** (standard): decoder sees the full `z = concat(z_s, z_g)`.
+
+**2. Cross-reconstruction loss** enforces geometry-sufficiency of `mu_g`:
+```python
+# Swap semantic subspace between two scenes in the batch
+z_s_swapped = mu_s_shifted + noise     # mu_s from scene B
+z_g_current = mu_g + noise             # mu_g from scene A
+z_cross = concat(z_s_swapped, z_g_current)
+
+# Decode and compute reconstruction loss on geometric attributes only
+UV_cross = decoder(z_cross)
+L_cross_recon = ||pos_pred - pos_gt||² + ||opacity_pred - opacity_gt||² + ...
+```
+
+This forces `mu_g` to contain all geometry independently of which semantic context it is paired with. If the decoder can correctly place walls, floors, and furniture using `mu_g` from scene A even when paired with the semantic token from scene B, then `mu_g` is truly geometry-sufficient.
+
+**3. Orthogonality loss** penalises linear correlation between `mu_s` and `mu_g`:
+```python
+def compute_orthogonality_loss(mu_s, mu_g, proj_dim=64):
+    # Random projections for efficiency
+    p_s = F.normalize(mu_s[:, idx_s], p=2, dim=0)
+    p_g = F.normalize(mu_g[:, idx_g], p=2, dim=0)
+    return ((p_s.T @ p_g) ** 2).mean()    # zero when mu_s ⊥ mu_g
+```
+
+### Total Disentanglement Loss
+
+```
+L_total += cross_recon_weight * L_cross_recon    # default 0.5
+         + ortho_weight       * L_ortho           # default 0.1
+```
+
+---
+
+## Concept 5 — Position DC/AC Decomposition
+
+### The Problem: Position Has 20× Dynamic Range
+
+The encoder compresses 40,000 positions spanning ±10m into the latent. The decoder must then reconstruct all positions from a single flat MLP output. Position loss converges slowly because the regression target has enormous dynamic range (±10m = 20m total span), while color converges easily because color residuals after Concept 1 span only ±0.3.
+
+### Solution: Scene Layout Head + Category Centroids as DC
+
+Inspired directly by Concept 1 (color residual), we decompose position into:
+
+- **DC = per-category centroid** — the mean position of all Gaussians belonging to that ScanNet category in this scene (predicted by `SceneLayoutHead`)
+- **AC = position residual** — the offset from the category centroid (~±0.5m)
+
+```
+absolute_pos[i] = category_centroid[label[i]] + position_residual[i]
+```
+
+The decoder only needs to predict offsets of ±0.5m instead of absolute positions of ±10m — a 20× reduction in dynamic range.
+
+### SceneLayoutHead
+
+```python
+class SceneLayoutHead(nn.Module):
+    """
+    shape_embed -> [B, 72, 3] per-category spatial centroids.
+    DC/AC for position — analogue of MeanColorHead for xyz.
+    """
+    def __init__(self, width=384):
+        self.head = nn.Sequential(
+            nn.Linear(width, 512), nn.LayerNorm(512), nn.ReLU(),
+            nn.Linear(512, 256),   nn.LayerNorm(256), nn.ReLU(),
+            nn.Linear(256, 72 * 3))
+
+    def forward(self, shape_embed):
+        return self.head(shape_embed).reshape(B, 72, 3)    # [B, 72, 3]
+```
+
+**Loss:**
+```python
+def compute_layout_loss(pred_centroids, gt_centroids, gt_valid):
+    diff = (pred_centroids - gt_centroids) ** 2
+    return (diff.mean(dim=-1) * gt_valid).sum() / (gt_valid.sum() + 1e-8)
+```
+
+**Dataset side:** the reconstruction target is swapped from absolute position to the residual:
+```python
+target[:, :, 0:3] = position_residuals    # coord - category_centroid, range ~±0.5m
+```
+
+**PLY save:** adds the centroid back to recover absolute position:
+```python
+absolute_pos = decoder_output_pos + dc_position    # dc_position[i] = centroid[label[i]]
+```
+
+---
+
+## Concept 6 — Position Scaffold (8×8×8 Voxel Grid)
+
+While Concept 5 uses semantic category centroids as the DC term, the scaffold approach uses a **spatial voxel grid** as the DC term. This is complementary and more stable at early training because it is purely geometric (no predicted centroids needed).
+
+### Architecture
+
+The 16m × 16m × 16m scene is divided into an **8×8×8 = 512 voxel grid**. Each voxel gets an anchor position = mean of all Gaussian positions within it. Each Gaussian is assigned to one voxel (hard assignment).
+
+```python
+scaffold_anchors:   [512, 3]    — voxel centroid positions
+scaffold_token_ids: [40000]     — which voxel each Gaussian belongs to
+position_offsets:   [40000, 3]  — coord - anchor  (the AC term)
+```
+
+The decoder predicts `position_offsets` (range ~±1m per voxel) instead of absolute positions (range ±10m).
+
+### Trilinear Anchor Smoothing (Critical Fix)
+
+The naive hard assignment creates **seam artifacts** at voxel boundaries. Two Gaussians 0.08m apart but on opposite sides of a voxel boundary have offset targets that differ by ~2m (the voxel width). The decoder must produce a discontinuous jump at every boundary — visible as grid-aligned artifacts in the output.
+
+**Fix:** replace the hard voxel centroid lookup with trilinear interpolation over the 8 surrounding voxels:
+
+```python
+def trilinear_interpolate_anchors(coord, scaffold_anchors, scaffold_dims=8, domain_size=16.0):
+    """
+    For each Gaussian at position coord[i], compute a smoothly interpolated
+    anchor from the 8 surrounding scaffold voxel centroids.
+
+    smooth_anchor[i] = Σ_{corners} w_corner * anchor_corner
+    where w_corner are trilinear weights (volume fractions, sum to 1).
+
+    This makes the anchor a continuous function of position.
+    Two Gaussians 0.08m apart get anchors that differ by only ~0.08m.
+    """
+    grid_coord = (coord + half_domain) / cell_size      # [N, 3] in [0, 8]
+    i0 = np.floor(grid_coord).astype(np.int32)          # lower corner
+    i1 = i0 + 1
+    t  = (grid_coord - i0).astype(np.float32)           # fraction [0,1]
+
+    tx = t[:, 0:1]; ty = t[:, 1:2]; tz = t[:, 2:3]
+
+    smooth_anchor = (
+        (1-tx)*(1-ty)*(1-tz) * a000 +
+        (1-tx)*(1-ty)*   tz  * a001 +
+        ...
+        tx * ty * tz         * a111
+    )
+    return smooth_anchor    # [N, 3] — varies continuously across boundaries
+```
+
+This is the same fix used by Instant-NGP (Müller et al., SIGGRAPH 2022): without interpolation, grid-aligned discontinuities cause visible artifacts. With trilinear interpolation, the encoding is C0-continuous everywhere.
+
+**Result:** voxel boundary seams eliminated. The 9× dynamic range reduction (absolute ±9m → smooth offset ±2.7m) makes position regression significantly easier.
+
+**PLY save with smooth anchor:**
+```python
+# OLD (hard — seam artifacts):
+all_preds[si, :, 0:3] += scaffold_anchors[scaffold_token_ids[si]]
+
+# NEW (smooth — no seams):
+all_preds[si, :, 0:3] += smooth_anchor[si]    # per-Gaussian, already interpolated
+```
+
+---
+
+## Concept 7 — Spatial Inductive Bias in the Decoder
+
+### The Root Problem
+
+The decoder transformer treats 512 tokens as an **unordered set** with no spatial identity. Token 0 and token 400 look identical to self-attention unless their values differ. The subsequent flat MLP maps the flattened token sequence `[196608]` to 40,000 Gaussians using the same weights for all Gaussians — no spatial organisation, no permutation structure.
+
+This is a fundamental architectural limitation: the decoder has no inductive bias to place Gaussians at spatially coherent locations.
+
+The following ideas address this at three levels:
+
+---
+
+### Idea 0 — Decoder Positional Encoding
+
+The cheapest fix. A learnable embedding `PE[512, width]` is added to the 512 decoder tokens **before** the self-attention transformer:
+
+```python
+self.decoder_pos_emb = nn.Parameter(torch.zeros(512, width))
+nn.init.trunc_normal_(self.decoder_pos_emb, std=0.02)   # initialised near zero
+
+# In decode():
+latents = latents + self.decoder_pos_emb.unsqueeze(0)   # [B, 512, width]
+```
+
+Initialising near zero ensures this does not perturb existing weights when resuming from a checkpoint.
+
+**Effect:** the transformer can now distinguish "token 0 is always the semantic region" from "token 400 is always a geometric region near the floor". Self-attention can learn structure-aware communication patterns.
+
+**Ablation result (Run P vs K):** L2 improved from 1.0-1.2 to 1.38 when used alone, confirming tokens benefit from positional identity.
+
+---
+
+### Idea 1 — Segment Label Prediction (SegPredHead)
+
+A lightweight per-Gaussian MLP that takes the decoder's 14-parameter Gaussian output and predicts which ScanNet category it belongs to:
+
+```python
+class SegPredHead(nn.Module):
+    def __init__(self, in_dim=14, num_cats=72):
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, 128), nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, 128),    nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, num_cats))    # [B, 40000, 72] raw logits
+
+    def forward(self, gaussian_params):
+        # gaussian_params: [B, 40000, 14]
+        return self.head(gaussian_params.reshape(B*N, 14)).reshape(B, N, 72)
+```
+
+**Why this works:** the only way `SegPredHead` can correctly predict "this is a floor Gaussian" from the 14 Gaussian params is if the decoder has actually placed it at a floor-like position (low y-coordinate). The cross-entropy loss creates a backpropagation path that forces the decoder to produce **spatially discriminative** positions.
+
+**Loss:**
+```python
+def compute_seg_pred_loss(seg_logits, segment_labels):
+    # seg_logits:     [B, 40000, 72]  raw logits
+    # segment_labels: [B, 40000]      gt labels (>= 0 valid, -1 unlabelled)
+    valid = flat_labels >= 0
+    return F.cross_entropy(flat_logits[valid], flat_labels[valid])
+```
+
+**At inference (no labels needed):** the predicted logits can soft-lookup the DC centroid:
+```python
+dc_i = Σ_k  softmax(seg_logits_i)[k] × pred_centroids[k]    # predicted DC position
+absolute_pos_i = decoder_pos_i + dc_i
+```
+
+**Ablation result (Run Q):** no L2 improvement over baseline. The CE loss (SegPredCE dropped from 4.32 to 1.14, confirming learning), but the primary reconstruction loss did not benefit. The categorical supervision alone is insufficient without fixing the decoder's ability to produce spatially-resolved outputs per-Gaussian.
+
+---
+
+### Idea 2 — Token Centroid Conditioning
+
+Injects spatial identity into each of the 512 decoder transformer tokens **before** self-attention by adding a Fourier-encoded spatial reference vector. After conditioning, the transformer can learn to exploit spatial structure in its self-attention patterns.
+
+Applied before the transformer so the spatial context propagates through all 12 attention layers.
+
+#### Approach A — Scaffold Anchor Conditioning
+
+Each token receives the Fourier encoding of its corresponding voxel centroid:
+
+```python
+# scaffold_anchors: [B, 512, 3]
+fourier_A  = self.fourier_embedder(scaffold_anchors)    # [B, 512, fourier_dim]
+spatial_A  = self.token_cond_mlp_A(fourier_A)           # [B, 512, width]
+latents    = latents + spatial_A
+```
+
+- Deterministic DC term, available from epoch 0
+- Purely spatial (no semantic information)
+- Requires `position_scaffold=True`
+
+#### Approach B — Category Centroid Conditioning
+
+A learnable soft assignment matrix `W [512, 72]` maps each token to a weighted combination of the 72 category centroids predicted by `SceneLayoutHead`:
+
+```python
+W = F.softmax(self.token_cat_assign, dim=-1)        # [512, 72] — learned
+token_centroids = torch.einsum('tk,bkd->btd', W, pred_c)   # [B, 512, 3]
+fourier_B  = self.fourier_embedder(token_centroids)
+spatial_B  = self.token_cond_mlp_B(fourier_B)      # [B, 512, width]
+latents    = latents + spatial_B
+```
+
+- Semantically grounded — tokens know which categories they represent
+- `W` is scene-agnostic but adapts as `SceneLayoutHead` learns
+- Requires `scene_layout_head=True`
+- Unstable when used alone (Run S): KL explosion after epoch 1200
+
+#### Approach AB — Both Additively
+
+```python
+latents = latents + spatial_A + spatial_B
+```
+
+**Best result**: visually cleanest reconstruction. Approach A provides stable geometric grounding from epoch 0; Approach B adds semantic organisation as `SceneLayoutHead` learns. Combined they give both geometric and semantic spatial identity to each token.
+
+**Ablation results:** Run R (A only) L2=0.589; Run T (AB) best visual quality with comparable L2.
+
+---
+
+### Idea 3 — Spatial-Aware Per-Gaussian Decoder (Query Decoder)
+
+Replaces the flat GS_decoder MLP with a per-Gaussian decoder that gives each Gaussian its own spatial context:
+
+```python
+class SpatialAwareDecoder(nn.Module):
+    def forward(self, transformer_tokens, scaffold_anchors, scaffold_token_ids):
+        # For each Gaussian i:
+        # 1. Gather its token's features
+        idx = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, D)
+        token_feats = torch.gather(transformer_tokens, 1, idx)    # [B, N, D]
+
+        # 2. Fourier-encode its voxel anchor
+        anchor_i    = torch.gather(scaffold_anchors, 1, idx_3d)   # [B, N, 3]
+        spatial_enc = self.fourier_embedder(anchor_i)              # [B, N, fourier_dim]
+
+        # 3. Combine and decode
+        combined = torch.cat([token_feats, spatial_enc], dim=-1)  # [B, N, D+fourier_dim]
+        raw      = self.mlp(combined.reshape(B*N, -1))             # [B, N, 14]
+```
+
+Each Gaussian now knows (a) which spatial region it belongs to (from Fourier anchor encoding) and (b) what the transformer learned about that region (from the gathered token features). The MLP is ~350K parameters versus ~800M for the flat GS_decoder.
+
+**Ablation result (Run U):** no L2 improvement even after 1500 epochs. The hard token assignment (`scaffold_token_ids` is non-differentiable) and information bottleneck (78 Gaussians share the same token features) prevent learning. The trilinear anchor smoothing fixed the position target discontinuity but not the feature discontinuity — adjacent Gaussians across a voxel boundary still receive completely different token features, making the MLP's task impossible.
+
+**DeepSeek analysis** (agreed): Fix B (residual query decoder) is the correct next step — keep GS_decoder output as the base and add the query decoder as a small learned refinement. This ensures the model never regresses from baseline performance.
+
+---
+
+## Full Gradient Path Summary
+
+After all concepts, the model has six independent gradient paths:
+
+```
+PATH 1 — Reconstruction (primary)
+  L_recon -> GS_decoder -> post_kl -> transformer -> mu / latent_tokens
+
+PATH 2 — KL Regularisation
+  L_KL -> mu, log_var -> encoder
+
+PATH 3 — Mean Color (Concept 1)
+  L_color_mse -> MeanColorHead -> shape_embed -> encoder token 0
+
+PATH 4 — Scene Semantic Distribution (Concept 2)
+  L_scene_kl -> SceneSemanticHead -> shape_embed -> encoder token 0
+
+PATH 5 — Layout Centroids (Concept 5)
+  L_layout_mse -> SceneLayoutHead -> shape_embed -> encoder token 0
+
+PATH 6 — Per-Gaussian InfoNCE (Concept 3, optional)
+  L_infonce -> SemanticProjectionHead -> decoder hidden state
+```
+
+Paths 3, 4, 5 all converge on `shape_embed` through separate heads with separate output spaces. They force `shape_embed` to encode: (3) scene colour palette, (4) dominant category mix, (5) spatial layout of each category.
 
 ---
 
@@ -430,28 +554,51 @@ width             = 384
 encoder_layers    = 6
 decoder_layers    = 12
 
-# Optimization
+# Optimisation
 learning_rate     = 1e-4
 batch_size        = 64
 kl_weight         = 1e-6    # 1e-5 causes KL to dominate at late epochs
 
 # Concept 1: Color residual
 color_residual          = True
-lambda_color            = 1.0     # MSE weight on mean color prediction
+mean_color_weight       = 1.0
 
-# Concept 2: Scene semantic head (Move 1)
+# Concept 2: Scene semantic head
 scene_semantic_head     = True
-scene_semantic_weight   = 0.3     # KL weight on label distribution prediction
+scene_semantic_weight   = 0.3
 
-# Concept 3: Per-Gaussian InfoNCE (optional, adds ~50s/epoch)
+# Concept 3: Per-Gaussian InfoNCE (optional)
 semantic_mode           = 'hidden'
 segment_loss_weight     = 0.3
-semantic_temperature    = 0.1
+semantic_temperature    = 0.07
 semantic_subsample      = 10000
+
+# Concept 4: Latent disentanglement
+latent_disentangle      = True
+semantic_dims           = 512     # D_s; D_g = 16384 - 512 = 15872
+cross_recon_weight      = 0.5
+ortho_weight            = 0.1
+
+# Concept 5: Position DC/AC (layout residual)
+scene_layout_head       = True
+layout_loss_weight      = 0.3
+position_layout_residual = True   # mutually exclusive with position_scaffold
+
+# Concept 6: Position scaffold + trilinear smoothing
+position_scaffold       = True
+anchor_loss_weight      = 0.3
+# Trilinear smoothing: always active when position_scaffold=True
+# No flag needed — gs_dataset_scenesplat.py computes smooth_anchor automatically
+
+# Concept 7: Spatial inductive bias
+decoder_pos_enc         = True    # Idea 0
+predict_seg_labels      = False   # Idea 1 — no benefit in ablation
+token_cond              = True
+token_cond_approach     = 'AB'    # Idea 2 — best visual result
+query_decoder           = False   # Idea 3 — pending residual fix
 ```
 
 ---
-
 
 ## Dataset: SceneSplat-7K with Labels
 
@@ -469,9 +616,40 @@ scene_dir/
 └── instance.npy   [N]      Instance IDs (−1 = background)
 ```
 
-**Normalization:** positions and scales normalized to fit a 10m radius sphere (linear scale multiplication, not log-space). Log-space scale loss was tested and abandoned — it causes scale collapse to <1cm due to domain mismatch.
+**Normalization:** positions and scales normalized to fit a 10m radius sphere (linear scale, not log-space — log-space causes scale collapse to <1cm due to domain mismatch).
 
-**Sampling:** top 40k Gaussians by opacity, deterministic argsort (same selection every epoch).
+**Sampling:** top 40,000 Gaussians by opacity, deterministic argsort (same selection every epoch).
+
+---
+
+## Batch Dictionary Keys
+
+```python
+{
+    # Core features
+    'features':           [B, 40000, 18],   # full feature tensor (abs xyz in cols 4:7)
+    'segment_labels':     [B, 40000],        # ScanNet72 per-Gaussian labels
+    'instance_labels':    [B, 40000],        # instance ids
+    'mean_color':         [B, 3],            # scene mean color (for MeanColorHead supervision)
+    'label_dist':         [B, 72],           # scene label distribution (for SceneSemanticHead)
+
+    # Position scaffold (position_scaffold=True)
+    'scaffold_anchors':   [B, 512, 3],       # voxel centroid positions (8x8x8 grid)
+    'scaffold_token_ids': [B, 40000],        # hard voxel assignment per Gaussian
+    'position_offsets':   [B, 40000, 3],     # coord - smooth_anchor  (TRILINEAR, the AC term)
+    'smooth_anchor':      [B, 40000, 3],     # per-Gaussian trilinear anchor (for PLY save)
+
+    # Position layout residual (position_layout_residual=True)
+    'category_centroids': [B, 72, 3],        # per-category mean positions
+    'category_valid':     [B, 72],           # which categories are present
+    'dc_position':        [B, 40000, 3],     # category centroid per Gaussian
+    'position_residuals': [B, 40000, 3],     # coord - dc_position  (the AC term)
+
+    # JEPA Idea 1 (jepa_idea1=True)
+    'voxel_label_dists':  [B, 512, 72],      # per-voxel label distribution
+    'voxel_valid':        [B, 512],          # which voxels are occupied
+}
+```
 
 ---
 
@@ -481,20 +659,25 @@ scene_dir/
 .
 ├── gs_can3tok_2.py                                      # Training loop, all losses
 ├── gs_dataset_scenesplat.py                             # Dataset, DC/AC preprocessing,
+│                                                        #   trilinear anchor smoothing,
 │                                                        #   label_dist precomputation
 ├── semantic_losses.py                                   # ScanNet72SemanticLoss (InfoNCE)
 ├── gs_ply_reconstructor.py                              # Output to .ply (SuperSplat/CloudCompare)
 ├── pca_feature_visualization.py                         # PCA coloring of semantic features
-├── visualize_input_pca.py                               # Input scene PCA (no forward pass)
-├── run_can3tok_move1.sh                                 # SLURM job script (Run C / Run D)
-├── upload_logs_to_wandb.py                              # W&B log uploader
-└── model/
-    ├── configs/aligned_shape_latents/shapevae-256.yaml  # Architecture config
-    └── michelangelo/models/tsal/
-        ├── sal_perceiver_II_initialization.py           # Full model: Encoder, Decoder,
-        │                                                #   MeanColorHead, SceneSemanticHead,
-        │                                                #   SemanticProjectionHead
-        └── asl_pl_module.py                             # PyTorch Lightning wrapper
+├── model/
+│   ├── configs/aligned_shape_latents/shapevae-256.yaml  # Architecture config
+│   └── michelangelo/models/tsal/
+│       ├── sal_perceiver_dist_changes.py                # Full model: Encoder, Decoder,
+│       │                                                #   MeanColorHead, SceneSemanticHead,
+│       │                                                #   SceneLayoutHead, AnchorPositionHead,
+│       │                                                #   SegPredHead, TokenCondMLP,
+│       │                                                #   SpatialAwareDecoder,
+│       │                                                #   decoder_pos_emb (PE),
+│       │                                                #   latent disentanglement
+│       └── asl_pl_module.py                             # PyTorch Lightning wrapper
+│                                                        #   (updated to pass scaffold data)
+└── job_scripts/
+    └── run_can3tok_scaffold.job                         # SLURM job script (all ablations)
 ```
 
 ---
@@ -502,16 +685,36 @@ scene_dir/
 ## Quick Start
 
 ```bash
-# Run C: colour residual + SceneSemanticHead only (isolates Move 1)
-sbatch run_can3tok_move1.sh        # default — SEMANTIC_MODE=none, SCENE_SEMANTIC_HEAD=True
+# Run T2: full best config (token_cond AB + trilinear smoothing)
+sbatch job_scripts/run_can3tok_scaffold.job
+# Set in job script: TOKEN_COND=True, TOKEN_COND_APPROACH=AB, DECODER_POS_ENC=True
+# Trilinear smoothing is always active when POSITION_SCAFFOLD=True
 
-# Run D: colour residual + SceneSemanticHead + InfoNCE (full model)
-# Edit run_can3tok_move1.sh: SEMANTIC_MODE=hidden, SEGMENT_WEIGHT=0.3
-sbatch run_can3tok_move1.sh
+# Run R: scaffold + token_cond A only (best L2 = 0.589)
+# Set: TOKEN_COND=True, TOKEN_COND_APPROACH=A
 
-# Run A: colour residual only (baseline for ablation)
+# Run K: position layout residual baseline (no scaffold)
+# Set: POSITION_LAYOUT_RESIDUAL=True, POSITION_SCAFFOLD=False
+
+# Run A: color residual only (baseline L2 = 1.43)
 python gs_can3tok_2.py \
     --color_residual --semantic_mode none \
     --batch_size 64 --num_epochs 1500 --lr 1e-4 --kl_weight 1e-6 \
     --train_scenes 2000 --eval_every 50
+```
 
+---
+
+## Key Design Decisions and
+
+**Color DC/AC (Concept 1) was essential.** Without it, `shape_embed` receives no gradient and collapses. Every subsequent improvement builds on this foundation.
+
+**Scaffold beats category residual for position.** Position layout residual (Concept 5) reduces dynamic range by 20× but requires accurate category centroids from `SceneLayoutHead`. The scaffold (Concept 6) with trilinear smoothing achieves a 9× reduction with no semantic dependency and no seam artifacts. Scaffold L2 (0.589) significantly beats layout residual L2 (~1.0).
+
+**Token conditioning (Idea 2, Approach A) is the largest single improvement.** Injecting scaffold anchor Fourier encodings into decoder tokens before self-attention gives the transformer spatial structure to organise, reducing L2 from ~1.38 (PE only) to 0.589. This is the key architectural finding.
+
+**Trilinear smoothing is necessary for visual quality.** Hard voxel assignment creates 2m jumps in position targets at boundaries, producing visible grid-aligned seams. Trilinear blending of 8 surrounding anchors makes the target continuous (C0-continuous), eliminating seams without any model change.
+
+**Query decoder (Idea 3) did not learn.** The hard `gather` operation is non-differentiable across voxel boundaries and the information bottleneck (78 Gaussians per token) prevents the small MLP from producing diverse outputs. The residual query decoder (GS_decoder + small learned refinement) is the correct next step.
+
+**Approach B (category centroid conditioning) is unstable alone** but beneficial when combined with Approach A. Alone, the dependency on predicted centroids creates a circular optimization problem that leads to KL explosion after ~1200 epochs.

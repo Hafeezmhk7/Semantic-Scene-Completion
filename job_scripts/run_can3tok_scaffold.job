@@ -69,7 +69,7 @@ SCENE_SEMANTIC_WEIGHT=0.3
 
 # ── Position scaffold ─────────────────────────────────────────────────────────
 # Set True for: token_cond approach A or AB, query_decoder
-POSITION_SCAFFOLD=False
+POSITION_SCAFFOLD=True
 ANCHOR_LOSS_WEIGHT=0.3
 
 # ── Decoder conditioning (existing) ──────────────────────────────────────────
@@ -94,7 +94,7 @@ ORTHO_WEIGHT=0.1
 # ── Scene layout head + Position residual ────────────────────────────────────
 SCENE_LAYOUT_HEAD=True
 LAYOUT_LOSS_WEIGHT=0.3
-POSITION_LAYOUT_RESIDUAL=True  # set False if using token_cond A or query_decoder
+POSITION_LAYOUT_RESIDUAL=False  # set False if using token_cond A or query_decoder
 
 # ── JEPA Idea 1 (old) ────────────────────────────────────────────────────────
 JEPA_IDEA1=False
@@ -124,13 +124,13 @@ SEG_PRED_WEIGHT=0.3
 # Approach B requires SCENE_LAYOUT_HEAD=True (already True above)
 # If using A or AB: set POSITION_SCAFFOLD=True, POSITION_LAYOUT_RESIDUAL=False
 TOKEN_COND=True
-TOKEN_COND_APPROACH="AB"   # A, B, or AB
+TOKEN_COND_APPROACH="A"   # A, B, or AB
 
 # ── Idea 3: Query-Based Spatial Decoder ──────────────────────────────────────
 # Replaces flat GS_decoder MLP with per-Gaussian spatial MLP.
 # Requires POSITION_SCAFFOLD=True, POSITION_LAYOUT_RESIDUAL=False
 # NOTE: use BATCH_SIZE=32 due to higher memory
-QUERY_DECODER=True
+QUERY_DECODER=False
 
 # ── Core training ─────────────────────────────────────────────────────────────
 BATCH_SIZE=64   # reduce to 32 if QUERY_DECODER=True
