@@ -13,34 +13,41 @@
 # CAN3TOK — COMPLETE ABLATION JOB SCRIPT
 # ============================================================================
 #
-# Edit only the FLAGS section. Everything else is automatic.
+# ABLATION TABLE (complete):
 #
-# ── ABLATION TABLE ─────────────────────────────────────────────────────────
-#
-#  Run | color | sem | scaf | Opt2 | InfoNCE | disentangle | layout | posresid | jepa1
-#  ----|-------|-----|------|------|---------|-------------|--------|----------|------
-#  A   |  ✓    |     |      |      |         |             |        |          |
-#  C   |  ✓    | ✓   |      |      |         |             |        |          |
-#  B   |  ✓    |     |      |      |   ✓     |             |        |          |
-#  F   |  ✓    |     |      |      |         |    ✓        |        |          | ← disentangle only
-#  G   |  ✓    |     |      |      |         |   ✓+cr      |        |          | ← + cross_recon
-#  J   |  ✓    |     |      |      |         |             |  ✓     |          | ← layout DC only
-#  K   |  ✓    |     |      |      |         |             |  ✓     |    ✓     | ← full pos DC/AC
-#  H   |  ✓    | ✓   |      |      |         |   ✓+cr+orth |  ✓     |          | ← current run 21107084
-#  L   |  ✓    | ✓   |      |      |         |   ✓+cr+orth |  ✓     |    ✓     | ← H + posresid
-#  E   |  ✓    | ✓   |  ✓   |      |         |             |        |          | ✓ ← jepa idea 1
-#  X   |  ✓    |     |      |  ✓   |         |             |        |          | ← decoder cross-attn
+#  Run | color | sem | scaf | disent | layout | posresid | PE | seg | tc  | qd
+#  ----|-------|-----|------|--------|--------|----------|----|-----|-----|----
+#  A   |  ✓    |     |      |        |        |          |    |     |     |     baseline
+#  H   |  ✓    | ✓   |      |   ✓    |   ✓    |          |    |     |     |     disentangle+layout
+#  K   |  ✓    | ✓   |      |   ✓    |   ✓    |    ✓     |    |     |     |     + posresid (current best)
+#  P   |  ✓    | ✓   |      |   ✓    |   ✓    |    ✓     | ✓  |     |     |     + PE only
+#  Q   |  ✓    | ✓   |      |   ✓    |   ✓    |    ✓     | ✓  | ✓   |     |     + Idea 1 (seg pred)
+#  R   |  ✓    | ✓   | ✓    |   ✓    |   ✓    |          | ✓  |     | A   |     + Idea 2A (scaffold cond)
+#  S   |  ✓    | ✓   |      |   ✓    |   ✓    |    ✓     | ✓  |     | B   |     + Idea 2B (cat centroid)
+#  T   |  ✓    | ✓   | ✓    |   ✓    |   ✓    |          | ✓  |     | AB  |     + Idea 2AB (both)
+#  U   |  ✓    | ✓   | ✓    |   ✓    |   ✓    |          | ✓  |     |     | ✓   + Idea 3 (query dec)
+#  V   |  ✓    | ✓   | ✓    |   ✓    |   ✓    |          | ✓  | ✓   | AB  | ✓   all ideas
 #
 # ── KEY COMPARISONS ──────────────────────────────────────────────────────────
-#   A  vs J:   Does layout head (supervision only) affect position?
-#   J  vs K:   Does closing the arithmetic loop (posresid) improve position?
-#   A  vs K:   Full position DC/AC vs baseline
-#   H  vs L:   Does posresid improve on top of disentanglement?
+#   K  vs P:  Does PE alone help? (cheapest experiment, do first)
+#   P  vs Q:  Does Idea 1 (seg pred) improve position convergence?
+#   P  vs R:  Does Idea 2A (scaffold cond) improve over PE baseline?
+#   P  vs S:  Does Idea 2B (category cond) improve over PE baseline?
+#   R  vs T:  Is AB better than A alone?
+#   P  vs U:  Does Idea 3 (query decoder) improve position most?
+#   U  vs V:  Does combining all ideas give further improvement?
+#
+# ── RECOMMENDED FIRST EXPERIMENT: Run P ──────────────────────────────────────
+#   Start with just --decoder_pos_enc added to Run K baseline.
+#   Takes no extra compute, zero risk. Answers: does PE help?
+#   If yes → proceed with Ideas 1-3. If not → PE is not the bottleneck.
 #
 # ── COMPUTE COST ─────────────────────────────────────────────────────────────
-#   position_layout_residual: ~same (CPU precompute, no extra forward pass)
-#   cross_recon:              ~1.5x per step (one extra decoder forward)
-#   Full (Run L):             ~1.5x per step
+#   PE (Idea 0):             ~same (512*384 params, no forward pass change)
+#   Idea 1 (seg pred):       ~same (small per-Gaussian MLP, no extra forward)
+#   Idea 2 (token cond):     ~same (tiny MLP on scaffold anchors/centroids)
+#   Idea 3 (query decoder):  ~same forward, BUT higher memory (reduce BS to 32)
+#   cross_recon:             ~1.5x per step (one extra decoder forward)
 # ============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
@@ -50,26 +57,23 @@ echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 # ============================================================================
 
 # ── Checkpoint resuming ───────────────────────────────────────────────────────
-RESUME_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21111509_none_colorresidual_scenesemantic_disentangle512_layout_posresid/final.pth"
-RESUME_EPOCH="1500"
+RESUME_CHECKPOINT=""
+RESUME_EPOCH=""
 
-# ── Step 1: Color residual ────────────────────────────────────────────────────
+# ── Step 1 + Move 1 (keep always True) ───────────────────────────────────────
 COLOR_RESIDUAL=True
 MEAN_COLOR_WEIGHT=1.0
 COLOR_LOSS_WEIGHT=1.0
-
-# ── Move 1: Scene semantic head ───────────────────────────────────────────────
 SCENE_SEMANTIC_HEAD=True
 SCENE_SEMANTIC_WEIGHT=0.3
 
 # ── Position scaffold ─────────────────────────────────────────────────────────
+# Set True for: token_cond approach A or AB, query_decoder
 POSITION_SCAFFOLD=False
 ANCHOR_LOSS_WEIGHT=0.3
 
-# ── Option 1: Decoder shape prepend ──────────────────────────────────────────
+# ── Decoder conditioning (existing) ──────────────────────────────────────────
 DECODER_SHAPE_PREPEND=False
-
-# ── Option 2: Decoder shape cross-attention ───────────────────────────────────
 DECODER_SHAPE_CROSS_ATTN=False
 DECODER_CROSS_ATTN_LAYERS=6
 
@@ -87,31 +91,50 @@ SEMANTIC_DIMS=512
 CROSS_RECON_WEIGHT=0.5
 ORTHO_WEIGHT=0.1
 
-# ── Scene layout head ─────────────────────────────────────────────────────────
-# Gradient supervision: shape_embed -> [B,72,3] per-category centroids.
-# Does NOT change reconstruction target by itself.
+# ── Scene layout head + Position residual ────────────────────────────────────
 SCENE_LAYOUT_HEAD=True
 LAYOUT_LOSS_WEIGHT=0.3
+POSITION_LAYOUT_RESIDUAL=True  # set False if using token_cond A or query_decoder
 
-# ── NEW: Position layout residual ────────────────────────────────────────────
-# Closes the DC/AC arithmetic loop for position.
-# Requires SCENE_LAYOUT_HEAD=True.
-# Changes reconstruction target from absolute xyz to per-Gaussian residuals.
-# PLY save adds dc_position back to produce correct absolute coordinates.
-# CANNOT be combined with POSITION_SCAFFOLD=True.
-#
-# Run J:  SCENE_LAYOUT_HEAD=True,  POSITION_LAYOUT_RESIDUAL=False  (supervision only)
-# Run K:  SCENE_LAYOUT_HEAD=True,  POSITION_LAYOUT_RESIDUAL=True   (full DC/AC)
-# Compare J vs K to isolate the arithmetic loop benefit.
-POSITION_LAYOUT_RESIDUAL=True
-
-# ── JEPA Idea 1 ───────────────────────────────────────────────────────────────
+# ── JEPA Idea 1 (old) ────────────────────────────────────────────────────────
 JEPA_IDEA1=False
 JEPA_IDEA1_WEIGHT=1.0
 
+# ── ═══════════════════════════════════════════════════════════════════════════
+# ── NEW IDEAS — SET THESE TO RUN DIFFERENT ABLATIONS
+# ── ═══════════════════════════════════════════════════════════════════════════
+
+# ── Idea 0: Decoder Positional Encoding ──────────────────────────────────────
+# Learnable PE[512, width] added to decoder tokens before transformer.
+# RECOMMENDED: add to every run as a baseline companion.
+# No extra compute, safe to combine with everything else.
+DECODER_POS_ENC=True
+
+# ── Idea 1: Segment Label Prediction ─────────────────────────────────────────
+# SegPredHead: Gaussian params [B,40000,14] -> seg logits [B,40000,72].
+# CE loss; forces position to be categorically discriminative.
+# At inference: soft centroid lookup removes gt label dependency.
+# Can combine with posresid or scaffold.
+PREDICT_SEG_LABELS=False
+SEG_PRED_WEIGHT=0.3
+
+# ── Idea 2: Token Centroid Conditioning ──────────────────────────────────────
+# Spatial conditioning injected into decoder tokens before transformer.
+# Approach A requires POSITION_SCAFFOLD=True
+# Approach B requires SCENE_LAYOUT_HEAD=True (already True above)
+# If using A or AB: set POSITION_SCAFFOLD=True, POSITION_LAYOUT_RESIDUAL=False
+TOKEN_COND=True
+TOKEN_COND_APPROACH="AB"   # A, B, or AB
+
+# ── Idea 3: Query-Based Spatial Decoder ──────────────────────────────────────
+# Replaces flat GS_decoder MLP with per-Gaussian spatial MLP.
+# Requires POSITION_SCAFFOLD=True, POSITION_LAYOUT_RESIDUAL=False
+# NOTE: use BATCH_SIZE=32 due to higher memory
+QUERY_DECODER=True
+
 # ── Core training ─────────────────────────────────────────────────────────────
-BATCH_SIZE=64
-NUM_EPOCHS=2500
+BATCH_SIZE=64   # reduce to 32 if QUERY_DECODER=True
+NUM_EPOCHS=1500
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-6
 EVAL_EVERY=50
@@ -139,61 +162,79 @@ export WANDB_API_KEY="wandb_v1_D9IJNMrJPieCvMbrazxUsefC4bi_d2yePUnKgyoY3qwn5IPhE
 USE_WANDB=True
 
 # ============================================================================
-# CONFIGURATION SUMMARY
+# VALIDATION
 # ============================================================================
 
-echo "========================================================================"
-echo "  CAN3TOK ABLATION"
-echo "========================================================================"
-echo "  color_residual:            $COLOR_RESIDUAL"
-echo "  scene_semantic_head:       $SCENE_SEMANTIC_HEAD"
-echo "  position_scaffold:         $POSITION_SCAFFOLD"
-echo "  decoder_shape_prepend:     $DECODER_SHAPE_PREPEND"
-echo "  decoder_shape_cross_attn:  $DECODER_SHAPE_CROSS_ATTN"
-echo "  semantic_mode:             $SEMANTIC_MODE"
-echo "  latent_disentangle:        $LATENT_DISENTANGLE  (dims=$SEMANTIC_DIMS)"
-echo "  cross_recon_weight:        $CROSS_RECON_WEIGHT"
-echo "  ortho_weight:              $ORTHO_WEIGHT"
-echo "  scene_layout_head:         $SCENE_LAYOUT_HEAD  (supervision gradient)"
-echo "  position_layout_residual:  $POSITION_LAYOUT_RESIDUAL  (arithmetic loop)"
-echo "  jepa_idea1:                $JEPA_IDEA1"
-echo ""
-
-# Validate: posresid requires layout head
-if [ "$POSITION_LAYOUT_RESIDUAL" = "True" ] && [ "$SCENE_LAYOUT_HEAD" = "False" ]; then
-    echo "  [INFO] POSITION_LAYOUT_RESIDUAL=True requires SCENE_LAYOUT_HEAD=True. Enabling."
-    SCENE_LAYOUT_HEAD=True
-fi
-# Validate: posresid incompatible with scaffold
-if [ "$POSITION_LAYOUT_RESIDUAL" = "True" ] && [ "$POSITION_SCAFFOLD" = "True" ]; then
-    echo "ERROR: POSITION_LAYOUT_RESIDUAL and POSITION_SCAFFOLD cannot both be True."
-    echo "       They use different DC terms and are mutually exclusive."
-    exit 1
+# Validate flag compatibility
+if [ "$TOKEN_COND" = "True" ] && echo "$TOKEN_COND_APPROACH" | grep -q "A"; then
+    if [ "$POSITION_SCAFFOLD" = "False" ]; then
+        echo "[INFO] TOKEN_COND approach A requires POSITION_SCAFFOLD. Enabling."
+        POSITION_SCAFFOLD=True
+    fi
+    if [ "$POSITION_LAYOUT_RESIDUAL" = "True" ]; then
+        echo "[INFO] TOKEN_COND approach A uses scaffold anchors. Disabling POSITION_LAYOUT_RESIDUAL."
+        POSITION_LAYOUT_RESIDUAL=False
+    fi
 fi
 
-# Identify run
+if [ "$QUERY_DECODER" = "True" ]; then
+    if [ "$POSITION_SCAFFOLD" = "False" ]; then
+        echo "[INFO] QUERY_DECODER requires POSITION_SCAFFOLD. Enabling."
+        POSITION_SCAFFOLD=True
+    fi
+    if [ "$POSITION_LAYOUT_RESIDUAL" = "True" ]; then
+        echo "[INFO] QUERY_DECODER uses scaffold. Disabling POSITION_LAYOUT_RESIDUAL."
+        POSITION_LAYOUT_RESIDUAL=False
+    fi
+    if [ "$BATCH_SIZE" = "64" ]; then
+        echo "[WARNING] QUERY_DECODER has higher memory usage. Consider BATCH_SIZE=32."
+    fi
+fi
+
+# Identify run letter
 RUN_ID="custom"
-if [ "$LATENT_DISENTANGLE" = "False" ] && [ "$SCENE_LAYOUT_HEAD" = "False" ] \
-   && [ "$POSITION_LAYOUT_RESIDUAL" = "False" ] && [ "$JEPA_IDEA1" = "False" ] \
-   && [ "$SCENE_SEMANTIC_HEAD" = "False" ] && [ "$SEMANTIC_MODE" = "none" ] \
-   && [ "$POSITION_SCAFFOLD" = "False" ] && [ "$DECODER_SHAPE_CROSS_ATTN" = "False" ]; then
-    RUN_ID="A (baseline)"
-elif [ "$SCENE_LAYOUT_HEAD" = "True" ] && [ "$POSITION_LAYOUT_RESIDUAL" = "False" ] \
-   && [ "$LATENT_DISENTANGLE" = "False" ] && [ "$SCENE_SEMANTIC_HEAD" = "False" ]; then
-    RUN_ID="J (layout head only — supervision without arithmetic loop)"
-elif [ "$SCENE_LAYOUT_HEAD" = "True" ] && [ "$POSITION_LAYOUT_RESIDUAL" = "True" ] \
-   && [ "$LATENT_DISENTANGLE" = "False" ] && [ "$SCENE_SEMANTIC_HEAD" = "False" ]; then
-    RUN_ID="K (full position DC/AC)"
-elif [ "$LATENT_DISENTANGLE" = "True" ] && [ "$SCENE_SEMANTIC_HEAD" = "True" ] \
-   && [ "$SCENE_LAYOUT_HEAD" = "True" ] && [ "$POSITION_LAYOUT_RESIDUAL" = "True" ]; then
-    RUN_ID="L (Run H + position_layout_residual)"
+if [ "$DECODER_POS_ENC" = "True" ] && [ "$PREDICT_SEG_LABELS" = "False" ] \
+   && [ "$TOKEN_COND" = "False" ] && [ "$QUERY_DECODER" = "False" ]; then
+    RUN_ID="P (Run K + decoder_pos_enc only)"
+elif [ "$DECODER_POS_ENC" = "True" ] && [ "$PREDICT_SEG_LABELS" = "True" ] \
+   && [ "$TOKEN_COND" = "False" ] && [ "$QUERY_DECODER" = "False" ]; then
+    RUN_ID="Q (Run K + PE + Idea 1 seg_pred)"
+elif [ "$TOKEN_COND" = "True" ] && [ "$TOKEN_COND_APPROACH" = "A" ] \
+   && [ "$QUERY_DECODER" = "False" ]; then
+    RUN_ID="R (Run K + PE + Idea 2A token_cond scaffold)"
+elif [ "$TOKEN_COND" = "True" ] && [ "$TOKEN_COND_APPROACH" = "B" ] \
+   && [ "$QUERY_DECODER" = "False" ]; then
+    RUN_ID="S (Run K + PE + Idea 2B token_cond category)"
+elif [ "$TOKEN_COND" = "True" ] && [ "$TOKEN_COND_APPROACH" = "AB" ] \
+   && [ "$QUERY_DECODER" = "False" ]; then
+    RUN_ID="T (Run K + PE + Idea 2AB token_cond both)"
+elif [ "$QUERY_DECODER" = "True" ] && [ "$TOKEN_COND" = "False" ] \
+   && [ "$PREDICT_SEG_LABELS" = "False" ]; then
+    RUN_ID="U (Run K + PE + Idea 3 query_decoder)"
+elif [ "$QUERY_DECODER" = "True" ] && [ "$TOKEN_COND" = "True" ] \
+   && [ "$PREDICT_SEG_LABELS" = "True" ]; then
+    RUN_ID="V (all ideas combined)"
 fi
-echo "  Identified run: $RUN_ID"
+
+echo "========================================================================"
+echo "  CAN3TOK ABLATION — Run: $RUN_ID"
+echo "========================================================================"
+echo "  Existing contributions:"
+echo "    color_residual=$COLOR_RESIDUAL | scene_semantic=$SCENE_SEMANTIC_HEAD"
+echo "    position_scaffold=$POSITION_SCAFFOLD | posresid=$POSITION_LAYOUT_RESIDUAL"
+echo "    latent_disentangle=$LATENT_DISENTANGLE (dims=$SEMANTIC_DIMS)"
+echo "    scene_layout_head=$SCENE_LAYOUT_HEAD"
 echo ""
-echo "  Prior results:"
-echo "    Run A: L2=1.43  (color_residual only, 2780 epochs)"
-echo "    Run C: L2=1.80  (color_residual + scene_semantic, 1450 epochs)"
-echo "    Run H: L2=1.565 (color_semantic+disentangle+layout, 1300 epochs)"
+echo "  NEW IDEAS:"
+echo "    Idea 0: decoder_pos_enc=$DECODER_POS_ENC"
+echo "    Idea 1: predict_seg_labels=$PREDICT_SEG_LABELS (weight=$SEG_PRED_WEIGHT)"
+echo "    Idea 2: token_cond=$TOKEN_COND approach=$TOKEN_COND_APPROACH"
+echo "    Idea 3: query_decoder=$QUERY_DECODER"
+echo ""
+echo "  Prior results for comparison:"
+echo "    Run A: L2=1.43  (color_residual only)"
+echo "    Run H: L2=1.565 (semantic+disentangle+layout)"
+echo "    Run K: L2~1.0-1.2 (Run H + posresid, still converging)"
 echo "  Current: ${TRAIN_SCENES} scenes, ${NUM_EPOCHS} epochs"
 echo "========================================================================"
 echo ""
@@ -239,18 +280,18 @@ TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
 TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
 
-[ "$COLOR_RESIDUAL"            = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
+[ "$COLOR_RESIDUAL"         = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
 TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
 
-[ "$SCENE_SEMANTIC_HEAD"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
+[ "$SCENE_SEMANTIC_HEAD"    = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
 TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
 
-[ "$POSITION_SCAFFOLD"         = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold"
+[ "$POSITION_SCAFFOLD"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold"
 TRAIN_CMD="$TRAIN_CMD --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
 
-[ "$DECODER_SHAPE_PREPEND"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_prepend"
-[ "$DECODER_SHAPE_CROSS_ATTN"  = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_cross_attn"
+[ "$DECODER_SHAPE_PREPEND"  = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_prepend"
+[ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_cross_attn"
 TRAIN_CMD="$TRAIN_CMD --decoder_cross_attn_layers $DECODER_CROSS_ATTN_LAYERS"
 
 TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
@@ -260,22 +301,28 @@ TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
-[ "$LATENT_DISENTANGLE"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
+[ "$LATENT_DISENTANGLE"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
 TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
 TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --ortho_weight $ORTHO_WEIGHT"
 
-[ "$SCENE_LAYOUT_HEAD"         = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
+[ "$SCENE_LAYOUT_HEAD"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
 TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
+[ "$POSITION_LAYOUT_RESIDUAL" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_layout_residual"
 
-# NEW: position layout residual
-[ "$POSITION_LAYOUT_RESIDUAL"  = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_layout_residual"
-
-[ "$JEPA_IDEA1"                = "True" ] && TRAIN_CMD="$TRAIN_CMD --jepa_idea1"
+[ "$JEPA_IDEA1"             = "True" ] && TRAIN_CMD="$TRAIN_CMD --jepa_idea1"
 TRAIN_CMD="$TRAIN_CMD --jepa_idea1_weight $JEPA_IDEA1_WEIGHT"
 
+# NEW IDEAS
+[ "$DECODER_POS_ENC"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_pos_enc"
+[ "$PREDICT_SEG_LABELS"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --predict_seg_labels"
+TRAIN_CMD="$TRAIN_CMD --seg_pred_weight $SEG_PRED_WEIGHT"
+[ "$TOKEN_COND"             = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond"
+[ "$TOKEN_COND"             = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_approach $TOKEN_COND_APPROACH"
+[ "$QUERY_DECODER"          = "True" ] && TRAIN_CMD="$TRAIN_CMD --query_decoder"
+
 TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
-[ "$USE_CANONICAL_NORM" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+[ "$USE_CANONICAL_NORM"     = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
 
 TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
 TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
@@ -310,52 +357,49 @@ echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End:
 
 # Reconstruct checkpoint dir name
 SMODE="${SEMANTIC_MODE}"
-[ "$SEGMENT_WEIGHT" = "0.0" ] && SMODE="none"
 CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SMODE}"
-[ "$COLOR_RESIDUAL"            = "True" ] && CKPT_DIR="${CKPT_DIR}_colorresidual"
-[ "$SCENE_SEMANTIC_HEAD"       = "True" ] && CKPT_DIR="${CKPT_DIR}_scenesemantic"
-[ "$POSITION_SCAFFOLD"         = "True" ] && CKPT_DIR="${CKPT_DIR}_scaffold"
-[ "$DECODER_SHAPE_PREPEND"     = "True" ] && CKPT_DIR="${CKPT_DIR}_shapeprepend"
-[ "$DECODER_SHAPE_CROSS_ATTN"  = "True" ] && CKPT_DIR="${CKPT_DIR}_shapecrossattn"
-[ "$LATENT_DISENTANGLE"        = "True" ] && CKPT_DIR="${CKPT_DIR}_disentangle${SEMANTIC_DIMS}"
-[ "$SCENE_LAYOUT_HEAD"         = "True" ] && CKPT_DIR="${CKPT_DIR}_layout"
-[ "$POSITION_LAYOUT_RESIDUAL"  = "True" ] && CKPT_DIR="${CKPT_DIR}_posresid"
-[ "$JEPA_IDEA1"                = "True" ] && CKPT_DIR="${CKPT_DIR}_jepa1"
-[ "$SEMANTIC_MODE" != "none" ] && [ "$SEGMENT_WEIGHT" != "0.0" ] && \
-    CKPT_DIR="${CKPT_DIR}_beta${SEGMENT_WEIGHT}"
+[ "$COLOR_RESIDUAL"           = "True" ] && CKPT_DIR="${CKPT_DIR}_colorresidual"
+[ "$SCENE_SEMANTIC_HEAD"      = "True" ] && CKPT_DIR="${CKPT_DIR}_scenesemantic"
+[ "$POSITION_SCAFFOLD"        = "True" ] && CKPT_DIR="${CKPT_DIR}_scaffold"
+[ "$LATENT_DISENTANGLE"       = "True" ] && CKPT_DIR="${CKPT_DIR}_disentangle${SEMANTIC_DIMS}"
+[ "$SCENE_LAYOUT_HEAD"        = "True" ] && CKPT_DIR="${CKPT_DIR}_layout"
+[ "$POSITION_LAYOUT_RESIDUAL" = "True" ] && CKPT_DIR="${CKPT_DIR}_posresid"
+[ "$DECODER_POS_ENC"          = "True" ] && CKPT_DIR="${CKPT_DIR}_posenc"
+[ "$PREDICT_SEG_LABELS"       = "True" ] && CKPT_DIR="${CKPT_DIR}_segpred"
+[ "$TOKEN_COND"               = "True" ] && CKPT_DIR="${CKPT_DIR}_tokencond${TOKEN_COND_APPROACH}"
+[ "$QUERY_DECODER"            = "True" ] && CKPT_DIR="${CKPT_DIR}_querydec"
 
 if [ $TRAIN_EXIT -eq 0 ]; then
     echo ""
     echo "COMPLETED. Checkpoint: $CKPT_DIR"
     echo ""
-    echo "NEXT STEPS:"
+    echo "KEY DIAGNOSTICS:"
+    echo "  Position loss trajectory:"
+    echo "    grep 'Position:' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
+    echo "    Compare to Run K baseline"
     echo ""
-    echo "  1. Check position improvement (key metric for this run):"
-    echo "       grep -E 'Position|NEW BEST|L2' logs/can3tok_${SLURM_JOB_ID}.out | tail -20"
-    echo "       Target: position_loss < Run A's converged value"
-    echo "       If posresid worked: epoch-0 position loss should be ~20x smaller"
-    echo "         than absolute (check [PLR] lines in epoch 0 diagnostic)"
+    echo "  Seg pred convergence (Idea 1):"
+    echo "    grep 'SegPredCE' logs/can3tok_${SLURM_JOB_ID}.out | head -10"
+    echo "    CE should drop from ~4.3 (random) to <1.0 if categorically discriminative"
     echo ""
-    echo "  2. Check position diagnostic at epoch 0:"
-    echo "       grep 'PLR' logs/can3tok_${SLURM_JOB_ID}.out | head -5"
-    echo "       dynamic range reduction > 5x = DC/AC working"
+    echo "  Token cond effect (Idea 2):"
+    echo "    grep -E 'Idea2|tokencond' logs/can3tok_${SLURM_JOB_ID}.out | head -5"
+    echo "    Position loss should converge faster than Run K"
     echo ""
-    echo "  3. Compare val/position_loss trajectory:"
-    echo "       grep 'Position:' logs/can3tok_${SLURM_JOB_ID}.out"
-    echo "       Should converge faster and to lower floor than Run H (1.43 position)"
+    echo "  Query decoder (Idea 3):"
+    echo "    grep 'Idea3' logs/can3tok_${SLURM_JOB_ID}.out | head -5"
+    echo "    Position range at epoch 0 should match scaffold anchors range"
     echo ""
-    echo "  4. Test set eval:"
-    echo "       python can3tok_test_eval.py --checkpoint $CKPT_DIR/best_model.pth --n_scenes 20"
-    echo ""
-    echo "  5. Resume if time limit hit:"
-    echo "       RESUME_CHECKPOINT=$CKPT_DIR/best_model.pth"
-    echo "       (position_layout_residual must match checkpoint)"
+    echo "  Overall comparison:"
+    echo "    grep 'NEW BEST' logs/can3tok_${SLURM_JOB_ID}.out | tail -5"
+    echo "    Target: position_loss < Run K converged value"
 else
     echo ""
     echo "FAILED (exit $TRAIN_EXIT)"
-    echo "  posresid+scaffold conflict: cannot use both simultaneously"
-    echo "  posresid needs layout:      SCENE_LAYOUT_HEAD must be True"
-    echo "  point_feats:                grep point_feats $YAML_PATH  (must be 11)"
-    echo "  OOM:                        reduce BATCH_SIZE to 32"
-    echo "  Error log:                  cat logs/can3tok_${SLURM_JOB_ID}.err"
+    echo "  token_cond A needs scaffold: POSITION_SCAFFOLD=True"
+    echo "  token_cond B needs layout:   SCENE_LAYOUT_HEAD=True"
+    echo "  query_decoder needs scaffold: POSITION_SCAFFOLD=True"
+    echo "  posresid+scaffold conflict:  cannot use both"
+    echo "  OOM (Idea 3):                reduce BATCH_SIZE to 32"
+    echo "  Error log:                   cat logs/can3tok_${SLURM_JOB_ID}.err"
 fi

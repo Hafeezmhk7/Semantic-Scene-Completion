@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+"""
+asl_pl_module.py  — AlignedShapeAsLatentPLModule
+=================================================
+CHANGES vs original:
+  forward() now accepts scaffold_anchors and scaffold_token_ids (both optional).
+  These are passed through to self.shape_model for:
+    - Idea 2A (token_cond approach A): scaffold_anchors [B,512,3]
+    - Idea 2B (token_cond approach B): uses pred_centroids internally (no extra arg)
+    - Idea 3  (query_decoder):         scaffold_anchors + scaffold_token_ids [B,40000]
+
+  If the model flags are inactive the args are simply ignored.
+  Fully backward-compatible: old code calling forward(surface,image,text,volume_queries)
+  still works because both new args default to None.
+"""
 
 from typing import List, Tuple, Dict, Optional
 from omegaconf import DictConfig
@@ -105,27 +119,41 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
                 surface: torch.FloatTensor,
                 image: torch.FloatTensor,
                 text: torch.FloatTensor,
-                volume_queries: torch.FloatTensor):
+                volume_queries: torch.FloatTensor,
+                scaffold_anchors=None,
+                scaffold_token_ids=None):
         """
         Forward pass through the model.
-        
+
+        Args:
+            surface:            [B, N, feats]   — Gaussian features (pc + params)
+            image:              [B, N, feats]   — same as surface (not used separately)
+            text:               [B, N, feats]   — same as surface (not used separately)
+            volume_queries:     [B, N, 3]       — query positions for geo decoder
+            scaffold_anchors:   [B, 512, 3]     — voxel centroid positions (optional)
+                                                   Needed for:
+                                                   - Idea 2A (token_cond approach A)
+                                                   - Idea 3  (query_decoder)
+            scaffold_token_ids: [B, 40000]      — per-Gaussian voxel assignment (optional)
+                                                   Needed for:
+                                                   - Idea 3 (query_decoder)
+
         Returns:
-            shape_embed: [B, width] - Shape embedding
-            mu: [B, 16384] - VAE mean
-            log_var: [B, 16384] - VAE log variance
-            z: [B, 16384] - Sampled latent
-            UV_gs_recover: [B, 560000] - Reconstructed Gaussians
-            per_gaussian_features: [B, 40000, 32] or None - Semantic features
+            shape_embed:            [B, width]
+            mu:                     [B, 16384]
+            log_var:                [B, 16384]
+            z:                      [B, 16384]
+            UV_gs_recover:          [B, 560000]
+            per_gaussian_features:  [B, 40000, 32] or None
         """
-        # Call the actual model's forward method
         shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features = self.shape_model(
             pc=surface,
             feats=surface,
             volume_queries=volume_queries,
-            sample_posterior=True
-        )
-        
-        # Return all 6 values
+            sample_posterior=True,
+            scaffold_anchors=scaffold_anchors,
+            scaffold_token_ids=scaffold_token_ids)
+
         return shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
 
     def encode(self, surface: torch.FloatTensor, sample_posterior=True):
@@ -146,7 +174,7 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
 
         latents = self.shape_model.decode(z_q, return_semantic_features=False)
         return latents
-        
+
     def training_step(self, batch: Dict[str, torch.FloatTensor],
                       batch_idx: int, optimizer_idx: int = 0) -> torch.FloatTensor:
 
@@ -211,28 +239,21 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
 
         embed_outputs, shape_z = self.model(surface, image, text)
 
-        # calculate the similarity
         image_embed = embed_outputs["image_embed"]
         text_embed = embed_outputs["text_embed"]
         shape_embed = embed_outputs["shape_embed"]
 
-        # normalized features
         shape_embed = F.normalize(shape_embed, dim=-1, p=2)
         text_embed = F.normalize(text_embed, dim=-1, p=2)
         image_embed = F.normalize(image_embed, dim=-1, p=2)
 
-        # B x B
         shape_text_similarity = (100.0 * shape_embed @ text_embed.T).softmax(dim=-1)
-
-        # B x B
         shape_image_similarity = (100.0 * shape_embed @ image_embed.T).softmax(dim=-1)
 
-        # shape reconstruction
         shape_zq, posterior = self.model.shape_model.encode_kl_embed(shape_z)
         latents = self.model.shape_model.decode(shape_zq)
         geometric_func = partial(self.model.shape_model.query_geometry, latents=latents)
 
-        # 2. decode geometry
         mesh_v_f, has_surface = extract_geometry(
             geometric_func=geometric_func,
             device=device,
@@ -243,7 +264,6 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
             disable=not self.zero_rank
         )
 
-        # 3. decode texture
         for i, ((mesh_v, mesh_f), is_surface) in enumerate(zip(mesh_v_f, has_surface)):
             if not is_surface:
                 outputs.append(None)
@@ -273,7 +293,6 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
 
         geometric_func = partial(self.shape_model.query_geometry, latents=latents)
 
-        # 2. decode geometry
         device = latents.device
         mesh_v_f, has_surface = extract_geometry(
             geometric_func=geometric_func,
@@ -285,7 +304,6 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
             disable=not self.zero_rank
         )
 
-        # 3. decode texture
         for i, ((mesh_v, mesh_f), is_surface) in enumerate(zip(mesh_v_f, has_surface)):
             if not is_surface:
                 outputs.append(None)

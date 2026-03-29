@@ -9,41 +9,38 @@ Option 2:  Decoder Shape Cross-Attn   (--decoder_shape_cross_attn)
 InfoNCE:   Per-Gaussian contrastive   (--semantic_mode hidden)
 
 DISENTANGLEMENT SUITE:
-  --latent_disentangle        split mu into mu_s (semantic) | mu_g (geometric)
-  --semantic_dims             size of mu_s subspace (default 512)
-  --cross_recon_weight        enforce geometry survives semantic swap
-  --ortho_weight              penalise linear correlation mu_s vs mu_g
-  --scene_layout_head         shape_embed -> [B,72,3] per-category centroids
-  --layout_loss_weight        weight for layout MSE loss
-  --jepa_idea1                (shape_embed + voxel_xyz) -> [B,512,72]
-  --jepa_idea1_weight         weight for spatial KL loss
+  --latent_disentangle  --semantic_dims  --cross_recon_weight  --ortho_weight
+  --scene_layout_head  --layout_loss_weight  --position_layout_residual
 
-NEW: POSITION LAYOUT RESIDUAL  (--position_layout_residual)
-  Closes the DC/AC arithmetic loop for position.
-  Requires --scene_layout_head (uses category_centroids as DC term).
-  Mirrors Step 1 (color_residual) exactly:
+NEW: THREE SPATIAL INDUCTIVE BIAS IDEAS
+  Idea 0: --decoder_pos_enc
+    Learnable positional embeddings [512, width] before decoder transformer.
 
-  COLOR STEP 1:                        POSITION (this):
-  mean_color = scene mean color        dc_position = per-category centroid
-  color_resid = color - mean           pos_resid = coord - centroid
-  decoder targets residuals            decoder targets residuals
-  PLY adds mean_color back             PLY adds dc_position back
+  Idea 1: --predict_seg_labels  --seg_pred_weight
+    SegPredHead: Gaussian params [B,40000,14] -> seg logits [B,40000,72].
+    CrossEntropy loss; backprop forces decoder positions to be categorically
+    discriminative. At inference: soft centroid lookup from seg logits.
 
-  Without this flag: SceneLayoutHead only provides a gradient signal but
-  the decoder still reconstructs absolute positions — arithmetic not closed.
-  With this flag: decoder learns offsets from semantic centroids (~+-0.5m)
-  instead of absolute positions (~+-10m), same 20x dynamic range reduction
-  as color residual achieved for color.
+  Idea 2: --token_cond  --token_cond_approach (A / B / AB)
+    A: Fourier(scaffold_anchors[B,512,3]) -> token spatial bias
+    B: W[512,72] × pred_centroids[B,72,3] -> token spatial bias
+    Both approaches inject spatial identity into decoder tokens before transformer.
+
+  Idea 3: --query_decoder
+    Replaces GS_decoder MLP with SpatialAwareDecoder.
+    Per-Gaussian: gather(token_feat) + Fourier(voxel_anchor) -> MLP -> 14 params.
 
 ABLATION TABLE:
   Run A:  color_residual only                               (done, L2=1.43)
-  Run C:  color_residual + scene_semantic                   (done, L2=1.80)
-  Run J:  color_residual + scene_layout_head                (layout DC supervision only)
-  Run K:  color_residual + scene_layout_head
-          + position_layout_residual                        (full position DC/AC)
-  Run H:  color_residual + scene_semantic + disentangle
-          + cross_recon + ortho                             (current run 21107084)
-  Run L:  Run H + position_layout_residual                  (full combination)
+  Run H:  color_residual + semantic + disentangle + layout  (done, L2=1.565)
+  Run K:  Run H + position_layout_residual                  (done, L2~1.0-1.2)
+  Run P:  Run K + decoder_pos_enc                           position PE ablation
+  Run Q:  Run K + predict_seg_labels                        Idea 1 ablation
+  Run R:  Run K + token_cond approach A                     Idea 2A ablation
+  Run S:  Run K + token_cond approach B                     Idea 2B ablation
+  Run T:  Run K + token_cond approach AB                    Idea 2AB ablation
+  Run U:  Run K + query_decoder                             Idea 3 ablation
+  Run V:  Run K + all three ideas                           full combination
 """
 
 import torch
@@ -157,6 +154,23 @@ def compute_spatial_semantic_loss(pred_voxel, gt_voxel, voxel_valid, eps=1e-8):
     return (kl_per_voxel * voxel_valid).sum() / (voxel_valid.sum() + 1e-8)
 
 
+def compute_seg_pred_loss(seg_logits, segment_labels):
+    """
+    Idea 1: CrossEntropy between predicted per-Gaussian segment logits
+    and ground-truth segment labels.
+
+    seg_logits:     [B, 40000, 72]  — raw logits
+    segment_labels: [B, 40000]      — ground truth (>= 0 valid, -1 unlabelled)
+    """
+    B, N, C = seg_logits.shape
+    flat_logits = seg_logits.reshape(B * N, C)
+    flat_labels = segment_labels.reshape(B * N).long()
+    valid       = flat_labels >= 0
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=seg_logits.device)
+    return F.cross_entropy(flat_logits[valid], flat_labels[valid])
+
+
 # ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
@@ -214,19 +228,47 @@ parser.add_argument('--ortho_weight',         type=float, default=0.1)
 parser.add_argument('--scene_layout_head',    action='store_true', default=False)
 parser.add_argument('--layout_loss_weight',   type=float, default=0.3)
 
-# ── NEW: Position layout residual ────────────────────────────────────────────
-parser.add_argument('--position_layout_residual', action='store_true', default=False,
-    help='Close the DC/AC arithmetic loop for position. '
-         'Requires --scene_layout_head (category_centroids as DC term). '
-         'Swaps position reconstruction target from absolute xyz to per-Gaussian '
-         'residuals (coord - category_centroid). Dynamic range: +-10m -> +-0.5m. '
-         'PLY save adds dc_position back to recover absolute coordinates. '
-         'Mirrors Step 1 color_residual exactly. '
-         'Cannot be combined with --position_scaffold.')
+# Position layout residual
+parser.add_argument('--position_layout_residual', action='store_true', default=False)
 
 # JEPA Idea 1
 parser.add_argument('--jepa_idea1',           action='store_true', default=False)
 parser.add_argument('--jepa_idea1_weight',    type=float, default=1.0)
+
+# ── NEW: THREE SPATIAL INDUCTIVE BIAS IDEAS ──────────────────────────────────
+
+parser.add_argument('--decoder_pos_enc', action='store_true', default=False,
+    help='[Idea 0] Add learnable positional embeddings PE[512,width] to decoder '
+         'tokens before transformer. Gives tokens structural identity. '
+         'Safe to combine with any other flag. '
+         'Recommended as baseline companion for all Ideas 1-3.')
+
+parser.add_argument('--predict_seg_labels', action='store_true', default=False,
+    help='[Idea 1] SegPredHead: Gaussian params [B,40000,14] -> seg logits [B,40000,72]. '
+         'CE loss vs gt segment labels. Backprop forces position to be categorically '
+         'discriminative. Requires segment_labels (forces need_segment_labels=True). '
+         'At inference: soft centroid lookup from seg_logits removes label dependency.')
+
+parser.add_argument('--seg_pred_weight', type=float, default=0.3,
+    help='Weight for Idea 1 segment prediction cross-entropy loss (default 0.3).')
+
+parser.add_argument('--token_cond', action='store_true', default=False,
+    help='[Idea 2] Inject spatial conditioning into decoder tokens before transformer. '
+         'Use --token_cond_approach to choose approach.')
+
+parser.add_argument('--token_cond_approach', type=str, default='A',
+    choices=['A', 'B', 'AB'],
+    help='[Idea 2] Spatial conditioning approach: '
+         'A = scaffold anchor Fourier encoding (requires --position_scaffold), '
+         'B = learned W[512,72] x pred_centroids (requires --scene_layout_head), '
+         'AB = both applied additively.')
+
+parser.add_argument('--query_decoder', action='store_true', default=False,
+    help='[Idea 3] Replace flat GS_decoder MLP with SpatialAwareDecoder. '
+         'Per-Gaussian: gather(token_feat) + Fourier(voxel_anchor) -> MLP -> 14. '
+         'Requires --position_scaffold (needs scaffold_anchors + scaffold_token_ids). '
+         'Falls back to GS_decoder if scaffold data not available. '
+         'NOTE: may require --batch_size 32 due to higher memory usage.')
 
 # Label input
 parser.add_argument('--label_input',          action='store_true', default=False)
@@ -278,21 +320,34 @@ if args.jepa_idea1 and not args.position_scaffold:
     args.position_scaffold = True
 if args.semantic_dims % 32 != 0:
     raise ValueError(f"--semantic_dims ({args.semantic_dims}) must be divisible by 32.")
-# [PLR] position_layout_residual dependencies
 if args.position_layout_residual and not args.scene_layout_head:
     print("[INFO] --position_layout_residual requires --scene_layout_head. Enabling.")
     args.scene_layout_head = True
 if args.position_layout_residual and args.position_scaffold:
-    raise ValueError(
-        "--position_layout_residual and --position_scaffold both active. "
-        "They use different DC terms for position and cannot be combined. "
-        "Use one or the other.")
+    raise ValueError("--position_layout_residual and --position_scaffold are mutually exclusive.")
+
+# New idea validation
+if args.token_cond and 'A' in args.token_cond_approach.upper() and not args.position_scaffold:
+    print("[INFO] --token_cond approach A requires --position_scaffold. Enabling.")
+    args.position_scaffold = True
+if args.token_cond and 'B' in args.token_cond_approach.upper() and not args.scene_layout_head:
+    print("[INFO] --token_cond approach B requires --scene_layout_head. Enabling.")
+    args.scene_layout_head = True
+if args.query_decoder and not args.position_scaffold:
+    print("[INFO] --query_decoder requires --position_scaffold. Enabling.")
+    args.position_scaffold = True
+
+# need_scaffold_data: whether to load scaffold batch keys and pass to model
+need_scaffold_data = (args.position_scaffold or
+                      args.token_cond or
+                      args.query_decoder)
 
 semantic_requested      = (args.semantic_mode != 'none')
 semantic_loss_enabled   = (args.segment_loss_weight > 0 or args.instance_loss_weight > 0)
 enable_semantic         = semantic_requested and semantic_loss_enabled
 effective_semantic_mode = args.semantic_mode if enable_semantic else 'none'
-need_segment_labels     = enable_semantic or args.scene_semantic_head or args.jepa_idea1
+need_segment_labels     = (enable_semantic or args.scene_semantic_head or
+                           args.jepa_idea1 or args.predict_seg_labels)
 
 # ============================================================================
 # W&B
@@ -311,8 +366,12 @@ if args.use_wandb:
         if args.decoder_shape_cross_attn:     run_name += "_shapecrossattn"
         if args.latent_disentangle:           run_name += f"_disentangle{args.semantic_dims}"
         if args.scene_layout_head:            run_name += "_layout"
-        if args.position_layout_residual:     run_name += "_posresid"  # [PLR]
+        if args.position_layout_residual:     run_name += "_posresid"
         if args.jepa_idea1:                   run_name += "_jepa1"
+        if args.decoder_pos_enc:              run_name += "_posenc"
+        if args.predict_seg_labels:           run_name += "_segpred"
+        if args.token_cond:                   run_name += f"_tokencond{args.token_cond_approach}"
+        if args.query_decoder:                run_name += "_querydec"
         if enable_semantic:                   run_name += f"_beta{args.segment_loss_weight}"
         if args.resume_checkpoint:            run_name += "_resumed"
         wandb_run = wandb.init(
@@ -341,8 +400,12 @@ if args.decoder_shape_prepend:        tag += "_shapeprepend"
 if args.decoder_shape_cross_attn:     tag += "_shapecrossattn"
 if args.latent_disentangle:           tag += f"_disentangle{args.semantic_dims}"
 if args.scene_layout_head:            tag += "_layout"
-if args.position_layout_residual:     tag += "_posresid"   # [PLR]
+if args.position_layout_residual:     tag += "_posresid"
 if args.jepa_idea1:                   tag += "_jepa1"
+if args.decoder_pos_enc:              tag += "_posenc"
+if args.predict_seg_labels:           tag += "_segpred"
+if args.token_cond:                   tag += f"_tokencond{args.token_cond_approach}"
+if args.query_decoder:                tag += "_querydec"
 if enable_semantic:                   tag += f"_beta{args.segment_loss_weight}"
 if not args.use_canonical_norm:       tag += "_raw"
 
@@ -365,16 +428,17 @@ print(f"  latent_disentangle:        {args.latent_disentangle}  (semantic_dims={
 print(f"  cross_recon_weight:        {args.cross_recon_weight}")
 print(f"  ortho_weight:              {args.ortho_weight}")
 print(f"  scene_layout_head:         {args.scene_layout_head}  (weight={args.layout_loss_weight})")
-print(f"  position_layout_residual:  {args.position_layout_residual}")  # [PLR]
+print(f"  position_layout_residual:  {args.position_layout_residual}")
 print(f"  jepa_idea1:                {args.jepa_idea1}  (weight={args.jepa_idea1_weight})")
 print(f"  semantic_mode:             {effective_semantic_mode}")
+print(f"  ── NEW IDEAS ──────────────────────────────────────────────────────")
+print(f"  decoder_pos_enc:           {args.decoder_pos_enc}  (PE before transformer)")
+print(f"  predict_seg_labels:        {args.predict_seg_labels}  "
+      f"(weight={args.seg_pred_weight})")
+print(f"  token_cond:                {args.token_cond}  "
+      f"approach={args.token_cond_approach}")
+print(f"  query_decoder:             {args.query_decoder}  (per-Gaussian spatial MLP)")
 print(f"  Save: {save_path}")
-if args.position_layout_residual:
-    print(f"\n  POSITION DC/AC ACTIVE:")
-    print(f"    DC  = per-category centroid (from ScanNet72 labels)")
-    print(f"    AC  = coord - centroid  (~+-0.5m vs +-10m absolute)")
-    print(f"    Target: position_residuals from batch dict")
-    print(f"    PLY:    adds dc_position back for absolute output")
 print(f"{'='*70}\n")
 
 # ============================================================================
@@ -396,7 +460,12 @@ p.latent_disentangle         = args.latent_disentangle
 p.semantic_dims              = args.semantic_dims
 p.scene_layout_head          = args.scene_layout_head
 p.jepa_idea1                 = args.jepa_idea1
-# [PLR] model itself unchanged — no flag needed in model config
+# NEW
+p.decoder_pos_enc            = args.decoder_pos_enc
+p.predict_seg_labels         = args.predict_seg_labels
+p.token_cond                 = args.token_cond
+p.token_cond_approach        = args.token_cond_approach
+p.query_decoder              = args.query_decoder
 
 cfg_point_feats = p.point_feats
 expected_feats  = 12 if args.label_input else 11
@@ -421,6 +490,7 @@ if args.resume_checkpoint:
     print(f"\nResuming from: {args.resume_checkpoint}")
     ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
 
+    # Hard mismatches that break weight loading
     for flag_name, current_val, default_val in [
         ('color_residual',             args.color_residual,            False),
         ('label_input',                args.label_input,               False),
@@ -430,9 +500,8 @@ if args.resume_checkpoint:
         ('decoder_cross_attn_layers',  args.decoder_cross_attn_layers, 4),
         ('latent_disentangle',         args.latent_disentangle,        False),
         ('semantic_dims',              args.semantic_dims,              512),
-        # [PLR] position_layout_residual changes reconstruction target —
-        # cannot resume across this boundary
         ('position_layout_residual',   args.position_layout_residual,  False),
+        # New ideas are soft — changing them only means strict=False
     ]:
         saved_val = ckpt.get(flag_name, default_val)
         if saved_val != current_val:
@@ -440,14 +509,18 @@ if args.resume_checkpoint:
                 f"{flag_name} mismatch: checkpoint={saved_val}, current={current_val}. "
                 f"Cannot resume across this architectural/target boundary.")
 
-    saved_ssh = ckpt.get('scene_semantic_head', False)
-    saved_mode = ckpt.get('semantic_mode', 'none')
-    saved_slh  = ckpt.get('scene_layout_head', False)
-    saved_ji   = ckpt.get('jepa_idea1', False)
-    strict = (saved_ssh  == args.scene_semantic_head and
-              saved_mode == effective_semantic_mode and
-              saved_slh  == args.scene_layout_head and
-              saved_ji   == args.jepa_idea1)
+    # Soft flags: architecture may differ, use strict=False
+    strict = all([
+        ckpt.get('scene_semantic_head', False) == args.scene_semantic_head,
+        ckpt.get('semantic_mode', 'none') == effective_semantic_mode,
+        ckpt.get('scene_layout_head', False) == args.scene_layout_head,
+        ckpt.get('jepa_idea1', False) == args.jepa_idea1,
+        ckpt.get('decoder_pos_enc', False) == args.decoder_pos_enc,
+        ckpt.get('predict_seg_labels', False) == args.predict_seg_labels,
+        ckpt.get('token_cond', False) == args.token_cond,
+        ckpt.get('token_cond_approach', 'A') == args.token_cond_approach,
+        ckpt.get('query_decoder', False) == args.query_decoder,
+    ])
     if not strict:
         print(f"  Architecture changed — loading strict=False")
     gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=strict)
@@ -476,7 +549,7 @@ gs_dataset_train = gs_dataset(
     position_scaffold=args.position_scaffold,
     scene_layout_head=args.scene_layout_head,
     jepa_idea1=args.jepa_idea1,
-    position_layout_residual=args.position_layout_residual)   # [PLR]
+    position_layout_residual=args.position_layout_residual)
 trainDataLoader = Data.DataLoader(
     dataset=gs_dataset_train, batch_size=args.batch_size,
     shuffle=True, num_workers=9, pin_memory=True, persistent_workers=True)
@@ -492,7 +565,7 @@ gs_dataset_val = gs_dataset(
     position_scaffold=args.position_scaffold,
     scene_layout_head=args.scene_layout_head,
     jepa_idea1=args.jepa_idea1,
-    position_layout_residual=args.position_layout_residual)   # [PLR]
+    position_layout_residual=args.position_layout_residual)
 valDataLoader = Data.DataLoader(
     dataset=gs_dataset_val, batch_size=args.batch_size,
     shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True)
@@ -521,7 +594,14 @@ _ckpt_meta = {
     'semantic_dims':              args.semantic_dims,
     'scene_layout_head':          args.scene_layout_head,
     'jepa_idea1':                 args.jepa_idea1,
-    'position_layout_residual':   args.position_layout_residual,   # [PLR]
+    'position_layout_residual':   args.position_layout_residual,
+    # NEW
+    'decoder_pos_enc':            args.decoder_pos_enc,
+    'predict_seg_labels':         args.predict_seg_labels,
+    'token_cond':                 args.token_cond,
+    'token_cond_approach':        args.token_cond_approach,
+    'query_decoder':              args.query_decoder,
+    # Weights
     'mean_color_weight':          args.mean_color_weight,
     'scene_semantic_weight':      args.scene_semantic_weight,
     'anchor_loss_weight':         args.anchor_loss_weight,
@@ -529,6 +609,7 @@ _ckpt_meta = {
     'ortho_weight':               args.ortho_weight,
     'layout_loss_weight':         args.layout_loss_weight,
     'jepa_idea1_weight':          args.jepa_idea1_weight,
+    'seg_pred_weight':            args.seg_pred_weight,
     'color_loss_weight':          args.color_loss_weight,
     'use_canonical_norm':         args.use_canonical_norm,
     'scale_norm_mode':            args.scale_norm_mode,
@@ -547,13 +628,14 @@ def evaluate_model(model, dataloader, device, epoch=None):
     total_anchor_loss  = 0.0
     total_layout_loss  = 0.0
     total_spatial_kl   = 0.0
+    total_seg_pred     = 0.0
     per_param  = {k: 0.0 for k in PARAM_SLICES}
     n_scenes   = 0
     recon_preds_list = []
     recon_means_list = []
     recon_tids_list  = []
     recon_anch_list  = []
-    recon_dc_list    = []   # [PLR] per-Gaussian DC position
+    recon_dc_list    = []
     do_recon = (epoch is not None and epoch % args.recon_ply_freq == 0)
 
     with torch.no_grad():
@@ -562,33 +644,36 @@ def evaluate_model(model, dataloader, device, epoch=None):
             mean_color_gt = batch_data['mean_color'].float().to(device)
             B = UV_gs_batch.shape[0]
 
+            # Scaffold data for new ideas
+            sa_gpu  = (batch_data['scaffold_anchors'].float().to(device)
+                       if need_scaffold_data else None)
+            sti_gpu = (batch_data['scaffold_token_ids'].long().to(device)
+                       if args.query_decoder else None)
+
             (shape_embed, mu, log_var, z,
              UV_gs_recover, _) = model(
-                UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3])
+                UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3],
+                scaffold_anchors=sa_gpu,
+                scaffold_token_ids=sti_gpu)
 
             mean_color_pred     = model.shape_model.last_mean_color_pred
             scene_semantic_pred = model.shape_model.last_scene_semantic_pred
             anchor_pred         = model.shape_model.last_anchor_pred
             scene_layout_pred   = model.shape_model.last_scene_layout_pred
+            seg_pred            = model.shape_model.last_seg_pred
 
-            # ── [PLR] Reconstruction target swap ─────────────────────────────
+            # Position target
             target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]
-
             if args.position_scaffold:
                 position_offsets = batch_data['position_offsets'].float().to(device)
                 target = target_abs.clone()
                 target[:, :, 0:3] = position_offsets
-
             elif args.position_layout_residual:
-                # [PLR] Swap position target from absolute to DC/AC residual.
-                # Decoder output will be residuals; PLY save adds dc_position back.
                 pos_residuals = batch_data['position_residuals'].float().to(device)
                 target = target_abs.clone()
-                target[:, :, 0:3] = pos_residuals   # [B, 40000, 3]
-
+                target[:, :, 0:3] = pos_residuals
             else:
                 target = target_abs
-            # ─────────────────────────────────────────────────────────────────
 
             pred_3d    = UV_gs_recover.reshape(B, -1, 14)
             recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
@@ -601,21 +686,16 @@ def evaluate_model(model, dataloader, device, epoch=None):
                 total_scene_sem_kl += scene_semantic_kl_loss(
                     scene_semantic_pred, p_s).item() * B
             if anchor_pred is not None and args.position_scaffold:
-                scaffold_anchors = batch_data['scaffold_anchors'].float().to(device)
-                total_anchor_loss += F.mse_loss(anchor_pred, scaffold_anchors).item() * B
+                scaffold_anchors_gt = batch_data['scaffold_anchors'].float().to(device)
+                total_anchor_loss += F.mse_loss(anchor_pred, scaffold_anchors_gt).item() * B
             if scene_layout_pred is not None and args.scene_layout_head:
                 gt_centroids = batch_data['category_centroids'].float().to(device)
                 gt_valid     = batch_data['category_valid'].float().to(device)
                 total_layout_loss += compute_layout_loss(
                     scene_layout_pred, gt_centroids, gt_valid).item() * B
-            if args.jepa_idea1 and model.shape_model.spatial_semantic_module is not None:
-                scaffold_anchors_gpu = batch_data['scaffold_anchors'].float().to(device)
-                spatial_pred = model.shape_model.spatial_semantic_module(
-                    model.shape_model._shape_embed_cache, scaffold_anchors_gpu)
-                gt_voxel    = batch_data['voxel_label_dists'].float().to(device)
-                voxel_valid = batch_data['voxel_valid'].float().to(device)
-                total_spatial_kl += compute_spatial_semantic_loss(
-                    spatial_pred, gt_voxel, voxel_valid).item() * B
+            if args.predict_seg_labels and seg_pred is not None:
+                seg_labels_gpu = batch_data['segment_labels'].long().to(device)
+                total_seg_pred += compute_seg_pred_loss(seg_pred, seg_labels_gpu).item() * B
 
             total_l2 += recon_loss.item()
             total_kl += kl_loss.sum().item()
@@ -630,9 +710,8 @@ def evaluate_model(model, dataloader, device, epoch=None):
                 tids_np  = batch_data['scaffold_token_ids'].numpy()
                 anch_np  = (anchor_pred.cpu().numpy() if anchor_pred is not None
                             else batch_data['scaffold_anchors'].numpy())
-                # [PLR] collect dc_position for adding back at PLY save
-                dc_np = (batch_data['dc_position'].numpy()
-                         if args.position_layout_residual else None)
+                dc_np    = (batch_data['dc_position'].numpy()
+                            if args.position_layout_residual else None)
                 for si in range(B):
                     if len(recon_preds_list) >= args.recon_ply_num_scenes:
                         break
@@ -641,27 +720,21 @@ def evaluate_model(model, dataloader, device, epoch=None):
                     recon_tids_list.append(tids_np[si])
                     recon_anch_list.append(anch_np[si])
                     if dc_np is not None:
-                        recon_dc_list.append(dc_np[si])   # [PLR]
+                        recon_dc_list.append(dc_np[si])
 
     if do_recon and recon_preds_list and save_path:
         try:
             all_preds = np.stack(recon_preds_list, axis=0)
-
-            # Color: add mean back
             if args.color_residual:
                 for si in range(len(all_preds)):
                     all_preds[si, :, 3:6] += recon_means_list[si]
                     all_preds[si, :, 3:6]  = np.clip(all_preds[si, :, 3:6], 0, 1)
-
-            # Position: add DC back
             if args.position_scaffold:
                 for si in range(len(all_preds)):
                     all_preds[si, :, 0:3] += recon_anch_list[si][recon_tids_list[si]]
             elif args.position_layout_residual and recon_dc_list:
-                # [PLR] decoder output = residuals; add per-Gaussian centroid back
                 for si in range(len(all_preds)):
                     all_preds[si, :, 0:3] += recon_dc_list[si]
-
             recon_dir = Path(save_path) / "reconstructed_gaussians" / f"epoch_{epoch:03d}"
             save_reconstructed_gaussians(
                 predictions=all_preds, output_dir=recon_dir, epoch=epoch,
@@ -680,6 +753,7 @@ def evaluate_model(model, dataloader, device, epoch=None):
         'anchor_loss':       total_anchor_loss / n,
         'layout_loss':       total_layout_loss / n,
         'spatial_kl':        total_spatial_kl / n,
+        'seg_pred_loss':     total_seg_pred / n,
         **{f'{k}_loss': v / n for k, v in per_param.items()},
     }
 
@@ -700,6 +774,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     epoch_loss = epoch_recon = epoch_kl = epoch_sem = 0.0
     epoch_color_pred = epoch_scene_semantic = epoch_anchor = 0.0
     epoch_layout = epoch_spatial = epoch_cross_recon = epoch_ortho = 0.0
+    epoch_seg_pred = 0.0
     epoch_pos = epoch_col = epoch_opa = epoch_scl = epoch_rot = 0.0
 
     for i_batch, batch_data in enumerate(trainDataLoader):
@@ -707,6 +782,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         mean_color_gt = batch_data['mean_color'].float().to(device)
         B = UV_gs_batch.shape[0]
 
+        # Segment labels (needed for various losses)
         segment_labels  = None
         instance_labels = None
         if need_segment_labels:
@@ -714,22 +790,34 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             if enable_semantic:
                 instance_labels = batch_data['instance_labels'].long().to(device)
 
-        if args.position_scaffold:
+        # Scaffold data
+        scaffold_anchors    = None
+        scaffold_token_ids  = None
+        position_offsets    = None
+        if need_scaffold_data:
             scaffold_anchors   = batch_data['scaffold_anchors'].float().to(device)
             scaffold_token_ids = batch_data['scaffold_token_ids'].long().to(device)
+        if args.position_scaffold:
             position_offsets   = batch_data['position_offsets'].float().to(device)
 
         optimizer.zero_grad()
 
         # ── Forward ──────────────────────────────────────────────────────────
+        # Pass scaffold data for Idea 2 (token conditioning) and Idea 3 (query decoder)
+        sa_gpu  = scaffold_anchors   if need_scaffold_data else None
+        sti_gpu = scaffold_token_ids if args.query_decoder  else None
+
         (shape_embed, mu, log_var, z,
          UV_gs_recover, per_gaussian_features) = gs_autoencoder(
-            UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3])
+            UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:, :, :3],
+            scaffold_anchors=sa_gpu,
+            scaffold_token_ids=sti_gpu)
 
         mean_color_pred     = gs_autoencoder.shape_model.last_mean_color_pred
         scene_semantic_pred = gs_autoencoder.shape_model.last_scene_semantic_pred
         anchor_pred         = gs_autoencoder.shape_model.last_anchor_pred
         scene_layout_pred   = gs_autoencoder.shape_model.last_scene_layout_pred
+        seg_pred_logits     = gs_autoencoder.shape_model.last_seg_pred
         _mu_s               = gs_autoencoder.shape_model._mu_s_cache
         _mu_g               = gs_autoencoder.shape_model._mu_g_cache
 
@@ -741,25 +829,17 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             spatial_semantic_pred = gs_autoencoder.shape_model.spatial_semantic_module(
                 gs_autoencoder.shape_model._shape_embed_cache, scaffold_anchors_jepa)
 
-        # ── [PLR] Reconstruction target ───────────────────────────────────────
+        # ── Reconstruction target ─────────────────────────────────────────────
         target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]
-
         if args.position_scaffold:
-            # Scaffold: voxel centroid as DC, voxel offset as AC
             target = target_abs.clone()
             target[:, :, 0:3] = position_offsets
-
         elif args.position_layout_residual:
-            # [PLR] Category centroid as DC, offset as AC.
-            # Decoder now learns to predict offsets from semantic centroids.
-            # dc_position + position_residuals == absolute coord (exactly).
             pos_residuals = batch_data['position_residuals'].float().to(device)
             target = target_abs.clone()
-            target[:, :, 0:3] = pos_residuals   # [B, 40000, 3]
-
+            target[:, :, 0:3] = pos_residuals
         else:
             target = target_abs
-        # ─────────────────────────────────────────────────────────────────────
 
         pred_3d    = UV_gs_recover.reshape(B, -1, 14)
         recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
@@ -779,7 +859,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             scene_semantic_loss = scene_semantic_kl_loss(scene_semantic_pred, p_s)
 
         anchor_loss = torch.tensor(0.0, device=device)
-        if anchor_pred is not None and args.position_scaffold:
+        if anchor_pred is not None and args.position_scaffold and scaffold_anchors is not None:
             anchor_loss = F.mse_loss(anchor_pred, scaffold_anchors)
 
         layout_loss = torch.tensor(0.0, device=device)
@@ -794,6 +874,13 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             voxel_valid = batch_data['voxel_valid'].float().to(device)
             spatial_loss = compute_spatial_semantic_loss(
                 spatial_semantic_pred, gt_voxel, voxel_valid)
+
+        # ── NEW: Idea 1 — Segment Prediction Loss ────────────────────────────
+        # CE between predicted per-Gaussian segment logits and gt labels.
+        # Gradient forces decoder positions to be categorically discriminative.
+        seg_pred_loss = torch.tensor(0.0, device=device)
+        if args.predict_seg_labels and seg_pred_logits is not None and segment_labels is not None:
+            seg_pred_loss = compute_seg_pred_loss(seg_pred_logits, segment_labels)
 
         # ── InfoNCE ────────────────────────────────────────────────────────────
         semantic_loss    = torch.tensor(0.0, device=device)
@@ -831,9 +918,12 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             lat_cross = z_cross.reshape(B, 512, 32)
             se_shifted = torch.roll(
                 gs_autoencoder.shape_model._shape_embed_cache, shifts=1, dims=0)
+            # Pass scaffold data for cross-recon decode too (Idea 2A and 3)
             UV_cross, _ = gs_autoencoder.shape_model.decode(
                 lat_cross, volume_queries=None,
-                return_semantic_features=False, shape_embed=se_shifted)
+                return_semantic_features=False, shape_embed=se_shifted,
+                scaffold_anchors=scaffold_anchors,
+                scaffold_token_ids=scaffold_token_ids)
             pred_cross_3d    = UV_cross.reshape(B, -1, 14)
             cross_recon_loss = compute_cross_recon_loss(pred_cross_3d, target, B)
 
@@ -853,6 +943,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 + args.jepa_idea1_weight     * spatial_loss
                 + args.cross_recon_weight    * cross_recon_loss
                 + args.ortho_weight          * ortho_loss
+                + args.seg_pred_weight       * seg_pred_loss    # NEW
                 + semantic_loss)
         loss.backward()
         optimizer.step()
@@ -869,6 +960,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         epoch_spatial        += spatial_loss.item()
         epoch_cross_recon    += cross_recon_loss.item()
         epoch_ortho          += ortho_loss.item()
+        epoch_seg_pred       += seg_pred_loss.item()
         epoch_pos += ind['position']
         epoch_col += ind['color']
         epoch_opa += ind['opacity']
@@ -880,20 +972,29 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             print(f"\nEPOCH {epoch} DIAGNOSTIC (batch 0):")
             print(f"  mu range:    [{mu.min().item():.3f}, {mu.max().item():.3f}]")
             print(f"  recon_loss:  {recon_loss.item():.4f}")
-            if args.position_layout_residual:   # [PLR]
+            if args.position_layout_residual:
                 pos_resid_np = batch_data['position_residuals'].numpy()
                 pos_abs_np   = UV_gs_batch[:, :, 4:7].cpu().numpy()
-                print(f"  [PLR] pos_residual range: [{pos_resid_np.min():.3f}, "
-                      f"{pos_resid_np.max():.3f}]m")
-                print(f"  [PLR] pos_absolute range: [{pos_abs_np.min():.3f}, "
-                      f"{pos_abs_np.max():.3f}]m")
-                reduction = pos_abs_np.std() / (pos_resid_np.std() + 1e-8)
+                reduction    = pos_abs_np.std() / (pos_resid_np.std() + 1e-8)
+                print(f"  [PLR] pos_residual range: [{pos_resid_np.min():.3f}, {pos_resid_np.max():.3f}]m")
+                print(f"  [PLR] pos_absolute range: [{pos_abs_np.min():.3f}, {pos_abs_np.max():.3f}]m")
                 print(f"  [PLR] dynamic range reduction: {reduction:.1f}x  (want >5x)")
             if args.latent_disentangle and _mu_s is not None:
                 print(f"  mu_s range:  [{_mu_s.min().item():.3f}, {_mu_s.max().item():.3f}]")
                 print(f"  mu_g range:  [{_mu_g.min().item():.3f}, {_mu_g.max().item():.3f}]")
                 print(f"  cross_recon: {cross_recon_loss.item():.4f}")
                 print(f"  ortho:       {ortho_loss.item():.6f}")
+            if args.decoder_pos_enc:
+                pe = gs_autoencoder.shape_model.decoder_pos_emb
+                print(f"  [PE] decoder_pos_emb range: [{pe.min().item():.4f}, {pe.max().item():.4f}]")
+            if args.predict_seg_labels and seg_pred_logits is not None:
+                print(f"  [Idea1] seg_pred_loss: {seg_pred_loss.item():.4f}")
+            if args.token_cond:
+                print(f"  [Idea2] token_cond approach {args.token_cond_approach}")
+                if scaffold_anchors is not None:
+                    print(f"  [Idea2A] scaffold_anchors range: [{scaffold_anchors.min().item():.3f}, {scaffold_anchors.max().item():.3f}]")
+            if args.query_decoder:
+                print(f"  [Idea3] query_decoder active: per-Gaussian spatial MLP")
             if args.scene_layout_head and scene_layout_pred is not None:
                 print(f"  layout_loss: {layout_loss.item():.4f}")
             if args.color_residual and mean_color_pred is not None:
@@ -911,6 +1012,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 "train/step_spatial_kl":     spatial_loss.item(),
                 "train/step_cross_recon":    cross_recon_loss.item(),
                 "train/step_ortho":          ortho_loss.item(),
+                "train/step_seg_pred":       seg_pred_loss.item(),
                 "train/step_position":       ind['position'],
                 "train/step_color":          ind['color'],
                 "train/step_opacity":        ind['opacity'],
@@ -928,8 +1030,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | Recon={epoch_recon/nb:.4f} | "
           f"KL={epoch_kl/nb:.4f} | InfoNCE={epoch_sem/nb:.4f} | "
           f"ColorPred={epoch_color_pred/nb:.6f} | SceneSem={epoch_scene_semantic/nb:.4f} | "
-          f"Layout={epoch_layout/nb:.4f} | SpatialKL={epoch_spatial/nb:.4f} | "
-          f"CrossRecon={epoch_cross_recon/nb:.4f} | Ortho={epoch_ortho/nb:.6f}")
+          f"Layout={epoch_layout/nb:.4f} | CrossRecon={epoch_cross_recon/nb:.4f} | "
+          f"SegPred={epoch_seg_pred/nb:.4f} | Ortho={epoch_ortho/nb:.6f}")
     print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
           f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | Rot={epoch_rot/nb:.3f}")
 
@@ -938,8 +1040,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
         print(f"\n--- Validation (epoch {epoch}) ---")
         val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=epoch)
-        pos_label = '(residuals)' if args.position_layout_residual else \
-                    '(offsets)' if args.position_scaffold else '(absolute)'
+        pos_label = ('(residuals)' if args.position_layout_residual else
+                     '(offsets)'  if args.position_scaffold          else '(absolute)')
         print(f"  L2:              {val_metrics['avg_l2_error']:.4f}")
         print(f"  Position:        {val_metrics['position_loss']:.4f}  {pos_label}")
         print(f"  Color:           {val_metrics['color_loss']:.4f}"
@@ -955,8 +1057,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             print(f"  AnchorMSE:       {val_metrics['anchor_loss']:.4f}")
         if args.scene_layout_head:
             print(f"  LayoutMSE:       {val_metrics['layout_loss']:.4f}")
-        if args.jepa_idea1:
-            print(f"  SpatialKL:       {val_metrics['spatial_kl']:.4f}")
+        if args.predict_seg_labels:
+            print(f"  SegPredCE:       {val_metrics['seg_pred_loss']:.4f}")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
@@ -979,7 +1081,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             "val/scene_semantic_kl": val_metrics['scene_semantic_kl'],
             "val/anchor_mse":        val_metrics['anchor_loss'],
             "val/layout_mse":        val_metrics['layout_loss'],
-            "val/spatial_kl":        val_metrics['spatial_kl'],
+            "val/seg_pred_ce":       val_metrics['seg_pred_loss'],
             "val/opacity_loss":      val_metrics['opacity_loss'],
             "val/scale_loss":        val_metrics['scale_loss'],
             "val/rotation_loss":     val_metrics['rotation_loss'],

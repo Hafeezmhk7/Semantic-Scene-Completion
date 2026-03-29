@@ -8,19 +8,83 @@ Scaffold:  Position Scaffold          (position_scaffold)
 Option 1:  Decoder Shape Prepend      (decoder_shape_prepend)
 Option 2:  Decoder Shape Cross-Attn   (decoder_shape_cross_attn)
 
-DISENTANGLEMENT SUITE (NEW):
-  latent_disentangle:  mu_s from shape_embed | mu_g from tokens
-  scene_layout_head:   shape_embed -> [B,72,3] per-category centroids
-  jepa_idea1:          (shape_embed + voxel_xyz) -> [B,512,72] per-voxel dists
+DISENTANGLEMENT SUITE:
+  latent_disentangle  — mu_s from shape_embed | mu_g from tokens
+  scene_layout_head   — shape_embed -> [B,72,3] per-category centroids
+
+NEW: THREE IDEAS FOR SPATIAL INDUCTIVE BIAS IN DECODER
+======================================================
+
+IDEA 0 — Decoder Positional Encoding  (decoder_pos_enc)
+  Adds learnable positional embeddings PE[512, width] to the 512 decoder
+  transformer tokens BEFORE the self-attention stack.
+  Gives each token a unique identity so self-attention can learn
+  structure-aware communication (semantic vs geometric tokens, nearby tokens).
+  Zero risk: initialised near zero, no architectural change.
+
+IDEA 1 — Segment Label Prediction  (predict_seg_labels)
+  SegPredHead: takes decoder Gaussian outputs [B,40000,14] -> [B,40000,72].
+  Per-Gaussian lightweight MLP (14 → 128 → 128 → 72).
+  Cross-entropy loss vs gt segment labels.
+  At inference: soft centroid lookup replaces need for gt segment labels:
+    dc_i = sum_k  softmax(seg_logits_i)[k]  *  pred_centroids[k]
+  Backprop forces Gaussian params (especially position) to be semantically
+  discriminative. Leverages disentanglement: mu_s carries semantic structure
+  that mu_g can query via self-attention to produce category-informative outputs.
+
+IDEA 2 — Token Centroid Conditioning  (token_cond, token_cond_approach)
+  Injects spatial identity into each of the 512 decoder transformer tokens
+  BEFORE the self-attention stack, via Fourier-encoded spatial references.
+
+  Approach A (--token_cond_approach A):
+    Uses scaffold anchors [B, 512, 3] (voxel centroids from dataset).
+    Each token gets the Fourier encoding of its voxel's mean position.
+    Deterministic DC term, available from epoch 0.
+    Requires position_scaffold=True.
+
+  Approach B (--token_cond_approach B):
+    Learnable soft assignment W [512, 72] (token -> category).
+    token_centroid[t] = sum_k  W[t,k] * pred_centroids[k]
+    Injects predicted category centroids from SceneLayoutHead.
+    Semantically-grounded; adapts as SceneLayoutHead learns.
+    Requires scene_layout_head=True.
+
+  Approach AB (--token_cond_approach AB):
+    Both A and B applied additively.
+
+  Mathematical justification:
+    After conditioning, each transformer token carries a spatial positional
+    bias. The subsequent self-attention can exploit this to organise tokens
+    spatially, and the flat GS_decoder MLP can exploit the spatial structure
+    in the flattened token sequence (analogous to how CNNs exploit spatial
+    structure in feature maps via shared convolutional weights).
+
+IDEA 3 — Spatial-Aware Per-Gaussian Decoder  (query_decoder)
+  Replaces the flat GS_decoder MLP with a per-Gaussian decoder that has
+  explicit spatial inductive bias.
+
+  Architecture:
+    For each Gaussian i:
+      token_feat[i]   = transformer_tokens[scaffold_token_id[i]]  [B,40000,width]
+      spatial_enc[i]  = FourierEmbed(scaffold_anchor[token_id[i]])  [B,40000,fourier_dim]
+      combined[i]     = concat(token_feat[i], spatial_enc[i])
+      output[i]       = MLP_per_gaussian(combined[i])  -> 14 params
+
+  Key properties:
+    - Each Gaussian knows its spatial region (from scaffold anchor Fourier enc)
+    - Each Gaussian has access to its token's learned scene representation
+    - Position regression target is implicitly local to each token's voxel
+    - Only ~350K params vs ~800M for GS_decoder
+  Requires position_scaffold=True.
 
 GRADIENT PATHS INTO shape_embed (COMPLETE):
   Head 1  MeanColorHead:       MSE(pred_mean_color, gt)       [3]
   Head 2  SceneSemanticHead:   KL(p_s || p_hat)               [72]
   Head 3  AnchorPositionHead:  MSE(pred_anchors, gt)          [512x3]
-  Head 4  SceneLayoutHead:     MSE(pred_centroids, gt)        [72x3]  NEW
-  Head 5  SpatialSemanticHead: KL(per-voxel dist || pred)     [512x72] NEW
-  Opt1/2  decoder conditioning: reconstruction loss           (indirect)
-  Disentangle: mu_s_proj adds direct KL path                  NEW
+  Head 4  SceneLayoutHead:     MSE(pred_centroids, gt)        [72x3]
+  Head 5  SpatialSemanticHead: KL(per-voxel dist || pred)     [512x72]
+  Idea 2B token_cond: reconstruction path through token centroids
+  Idea 1  seg_pred: reconstruction loss backprop through seg labels
 """
 
 import torch
@@ -39,7 +103,7 @@ from .tsal_base import ShapeAsLatentModule
 
 
 # ============================================================================
-# SHAPE_EMBED AUXILIARY HEADS
+# SHAPE_EMBED AUXILIARY HEADS (unchanged)
 # ============================================================================
 
 class MeanColorHead(nn.Module):
@@ -87,14 +151,6 @@ class AnchorPositionHead(nn.Module):
 
 
 class SceneLayoutHead(nn.Module):
-    """
-    NEW — DC/AC Position Decomposition.
-    shape_embed -> [B, 72, 3] per-category spatial centroids.
-    Mirrors MeanColorHead but for position (72 category centres vs 1 scene mean).
-    Ground truth: mean xyz per ScanNet72 category (from dataset).
-    Loss: weighted MSE over occupied categories (category_valid mask).
-    Reduces position dynamic range mu_g must encode: +-10m -> +-0.5m offsets.
-    """
     NUM_CATS = 72
     def __init__(self, width=384):
         super().__init__()
@@ -112,13 +168,6 @@ class SceneLayoutHead(nn.Module):
 
 
 class SpatialSemanticHead(nn.Module):
-    """
-    NEW — JEPA Idea 1: Spatially-resolved semantic prediction.
-    (shape_embed [B, W] concat voxel_center [B, K, 3]) -> [B, K, 72] softmax.
-    Unlike SceneSemanticHead (global WHAT), teaches WHERE each category is.
-    Called EXTERNALLY in training loop — needs scaffold_anchors from batch_data.
-    Requires position_scaffold=True in dataset.
-    """
     NUM_CATS = 72
     def __init__(self, width=384, num_tokens=512):
         super().__init__()
@@ -129,14 +178,8 @@ class SpatialSemanticHead(nn.Module):
         self.num_tokens = num_tokens
         total = sum(p.numel() for p in self.parameters())
         print(f"[SpatialSemanticHead] [B,{width}+3] -> [B,{num_tokens},72] | {total:,} params")
-        print(f"  JEPA Idea 1 — spatially-resolved semantic prediction")
 
     def forward(self, shape_embed, voxel_centers):
-        """
-        shape_embed:   [B, W]
-        voxel_centers: [B, K, 3]
-        returns:       [B, K, 72]
-        """
         B, K, _ = voxel_centers.shape
         se_exp   = shape_embed.unsqueeze(1).expand(-1, K, -1)
         combined = torch.cat([se_exp, voxel_centers], dim=-1)
@@ -146,7 +189,159 @@ class SpatialSemanticHead(nn.Module):
 
 
 # ============================================================================
-# PER-GAUSSIAN SEMANTIC HEADS (InfoNCE path — via decoder hidden state)
+# NEW: THREE IDEAS — SPATIAL INDUCTIVE BIAS MODULES
+# ============================================================================
+
+class SegPredHead(nn.Module):
+    """
+    IDEA 1 — Per-Gaussian segment label prediction.
+
+    Takes the 14-dimensional Gaussian parameters output by the decoder
+    (position 3, color 3, opacity 1, scale 3, rotation 4) and predicts
+    which of the 72 ScanNet categories each Gaussian belongs to.
+
+    Why use Gaussian params as input (not the transformer hidden state):
+      The hidden state is a single 1024-dim vector for ALL 40k Gaussians —
+      no per-Gaussian identity. The 14 Gaussian params ARE per-Gaussian
+      and carry position, which correlates strongly with category
+      (floor at y=-4m, ceiling at y=+4m, etc.).
+
+    Gradient flow:
+      CE_seg → seg_pred_head → gaussian_params [B,40000,14] → GS_decoder
+      → transformer → z → encoder. This forces the decoder to produce
+      position values that are categorically discriminative, which is
+      exactly the spatial inductive bias we want.
+
+    At inference (no gt labels needed):
+      dc_i = Σ_k  softmax(seg_logits_i)[k] × pred_centroids[k]
+      final_pos_i = decoder_pos_i + dc_i
+    """
+    NUM_CATS = 72
+
+    def __init__(self, in_dim=14, num_cats=72):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, 128), nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, 128),    nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, num_cats))
+        total = sum(p.numel() for p in self.parameters())
+        print(f"[SegPredHead] [B,40000,{in_dim}] -> [B,40000,{num_cats}] | {total:,} params")
+        print(f"  Idea 1: seg labels from Gaussian params (no gt needed at inference)")
+
+    def forward(self, gaussian_params):
+        """
+        gaussian_params: [B, 40000, 14]
+        returns: [B, 40000, 72] — raw logits (apply softmax for probabilities)
+        """
+        B, N, D = gaussian_params.shape
+        return self.head(gaussian_params.reshape(B * N, D)).reshape(B, N, self.NUM_CATS)
+
+
+class TokenCondMLP(nn.Module):
+    """
+    IDEA 2 — Spatial-to-token-space projection.
+    Maps Fourier-encoded 3D spatial references to token-width vectors.
+    Used for both Approach A (scaffold anchors) and Approach B (category centroids).
+    """
+    def __init__(self, fourier_dim, width):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(fourier_dim, width), nn.LayerNorm(width), nn.ReLU(),
+            nn.Linear(width, width))
+        total = sum(p.numel() for p in self.parameters())
+        print(f"  [TokenCondMLP] fourier({fourier_dim}) -> token_bias({width}) | {total:,} params")
+
+    def forward(self, fourier_encoded):
+        """fourier_encoded: [B, 512, fourier_dim] -> [B, 512, width]"""
+        B, T, D = fourier_encoded.shape
+        return self.mlp(fourier_encoded.reshape(B * T, D)).reshape(B, T, -1)
+
+
+class SpatialAwareDecoder(nn.Module):
+    """
+    IDEA 3 — Per-Gaussian spatial decoder, replacing the flat GS_decoder MLP.
+
+    Architecture per Gaussian i:
+      1. Gather: token_feat[i] = transformer_tokens[b, scaffold_token_id[i], :]
+                                  [B, 40000, width]
+      2. Spatial:  spatial_enc[i] = Fourier(scaffold_anchor[token_id[i]])
+                                    [B, 40000, fourier_dim]
+      3. Combined: concat(token_feat, spatial_enc) -> [B, 40000, width+fourier_dim]
+      4. MLP:      per-Gaussian lightweight MLP -> [B, 40000, 14]
+
+    Properties:
+      - Each Gaussian knows WHICH spatial region (via Fourier spatial enc)
+      - Each Gaussian has access to its token's learned scene context
+      - MLP is tiny (~350K params) vs GS_decoder (~800M params)
+      - Position regression is implicitly local within each voxel
+      - Requires position_scaffold=True
+    """
+
+    def __init__(self, token_dim, fourier_embedder, hidden_dim=256, color_residual=False):
+        super().__init__()
+        self.fourier_embedder = fourier_embedder  # shared reference
+        fourier_dim = fourier_embedder.out_dim
+        self.color_residual = color_residual
+
+        self.mlp = nn.Sequential(
+            nn.Linear(token_dim + fourier_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 14))
+
+        total = sum(p.numel() for p in self.parameters()
+                    if p is not self.fourier_embedder)
+        # Count only MLP params (fourier_embedder is shared)
+        total = sum(p.numel() for p in self.mlp.parameters())
+        print(f"[SpatialAwareDecoder] token({token_dim})+fourier({fourier_dim})"
+              f" -> hidden({hidden_dim}) -> 14 | {total:,} MLP params")
+        print(f"  Idea 3: per-Gaussian decoder with spatial inductive bias")
+        print(f"  Each Gaussian: gather(token_feat) + Fourier(voxel_anchor) -> 14 params")
+
+    def forward(self, transformer_tokens, scaffold_anchors, scaffold_token_ids):
+        """
+        transformer_tokens:   [B, 512, token_dim]
+        scaffold_anchors:     [B, 512, 3]   — voxel centroid positions
+        scaffold_token_ids:   [B, 40000]    — which voxel each Gaussian belongs to
+
+        Returns: [B, 40000*14] to match GS_decoder output format
+        """
+        B, T, D = transformer_tokens.shape
+        N = scaffold_token_ids.shape[1]  # 40000
+
+        # Step 1: per-Gaussian anchor position
+        # scaffold_token_ids: [B, N] → index into scaffold_anchors [B, 512, 3]
+        # per_gaussian_anchor: [B, N, 3]
+        idx_for_anchors = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, 3)
+        per_gaussian_anchor = torch.gather(scaffold_anchors, 1, idx_for_anchors)  # [B, N, 3]
+
+        # Step 2: Fourier encode per-Gaussian spatial anchor
+        spatial_enc = self.fourier_embedder(per_gaussian_anchor)  # [B, N, fourier_dim]
+
+        # Step 3: gather token features per Gaussian
+        idx_for_tokens = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, D)
+        token_feats = torch.gather(transformer_tokens, 1, idx_for_tokens)  # [B, N, D]
+
+        # Step 4: per-Gaussian decode
+        combined = torch.cat([token_feats, spatial_enc], dim=-1)  # [B, N, D+fourier_dim]
+        BN = B * N
+        raw = self.mlp(combined.reshape(BN, -1)).reshape(B, N, 14)
+
+        # Step 5: apply activations (same as GS_decoder)
+        pos   = raw[:, :, 0:3]
+        color = (raw[:, :, 3:6] if self.color_residual
+                 else torch.clamp(raw[:, :, 3:6], 0.0, 1.0))
+        opac  = torch.sigmoid(raw[:, :, 6:7])
+        scale = torch.exp(raw[:, :, 7:10])
+        quat  = F.normalize(raw[:, :, 10:14], p=2, dim=-1)
+
+        out = torch.cat([pos, color, opac, scale, quat], dim=-1)
+        return out.reshape(B, -1)  # [B, N*14] — same format as GS_decoder
+
+
+# ============================================================================
+# PER-GAUSSIAN SEMANTIC HEADS (InfoNCE path — unchanged)
 # ============================================================================
 
 class SemanticProjectionHead(nn.Module):
@@ -201,7 +396,7 @@ class SemanticProjectionHeadGeometric(nn.Module):
 
 
 # ============================================================================
-# ENCODER
+# ENCODER (unchanged)
 # ============================================================================
 
 class CrossAttentionEncoder(nn.Module):
@@ -260,7 +455,7 @@ class CrossAttentionEncoder(nn.Module):
 
 
 # ============================================================================
-# GEOMETRY DECODER
+# GEOMETRY DECODER (unchanged)
 # ============================================================================
 
 class CrossAttentionDecoder(nn.Module):
@@ -294,7 +489,7 @@ class GaussianSemanticAttentionHead(CrossAttentionDecoder):
 
 
 # ============================================================================
-# GS DECODER MLP
+# GS DECODER MLP (unchanged)
 # ============================================================================
 
 class GS_decoder(nn.Module):
@@ -326,7 +521,7 @@ class GS_decoder(nn.Module):
 
 
 # ============================================================================
-# BASE PERCEIVER (unchanged from original)
+# BASE PERCEIVER (unchanged)
 # ============================================================================
 
 class ShapeAsLatentPerceiver(ShapeAsLatentModule):
@@ -401,27 +596,31 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
 
 class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
     """
-    Full Can3Tok VAE with all objectives and decoder shape conditioning.
+    Full Can3Tok VAE with all objectives and three new spatial inductive bias ideas.
 
-    NEW FLAGS (in addition to existing):
-      latent_disentangle (bool):
-        Splits mu = concat(mu_s [B,semantic_dims], mu_g [B,16384-semantic_dims]).
-        mu_s from shape_embed via mu_s_proj_mean/var.
-        mu_g from kl_flat via kl_emb_proj_mean_g/var_g.
-        Total mu = 16384 unchanged. Decoder reshape unchanged.
-        Training loop reads _mu_s_cache/_mu_g_cache for cross-recon and ortho.
+    NEW FLAGS:
+      decoder_pos_enc (bool, default False):
+        Adds learnable positional embeddings PE[512, width] to decoder tokens
+        before the transformer. Gives tokens structural identity so self-attention
+        can learn spatially-organised communication patterns.
 
-      semantic_dims (int, default 512):
-        Must satisfy: semantic_dims % embed_dim == 0 and semantic_dims < 16384.
+      predict_seg_labels (bool, default False):
+        SegPredHead: gaussian_params [B,40000,14] -> seg_logits [B,40000,72].
+        Cross-entropy loss forces decoder position outputs to be categorically
+        discriminative. Inference: soft centroid lookup from seg_logits + pred_centroids.
 
-      scene_layout_head (bool):
-        SceneLayoutHead: shape_embed -> [B,72,3] category centroids.
-        Prediction in self.last_scene_layout_pred.
+      token_cond (bool, default False):
+        Injects spatial conditioning into decoder tokens before transformer.
 
-      jepa_idea1 (bool):
-        SpatialSemanticHead: (shape_embed + voxel_center) -> [B,512,72].
-        Called externally (training loop calls self.spatial_semantic_module).
-        self.last_spatial_semantic_pred always None after forward().
+      token_cond_approach (str, default 'A'):
+        'A'  — scaffold anchor Fourier encoding (requires position_scaffold=True)
+        'B'  — soft category centroid (requires scene_layout_head=True)
+        'AB' — both approaches applied additively
+
+      query_decoder (bool, default False):
+        Replaces flat GS_decoder MLP with SpatialAwareDecoder.
+        Per-Gaussian: gather(token_feat) + Fourier(voxel_anchor) -> small MLP -> 14.
+        Requires position_scaffold=True.
     """
 
     def __init__(self, *, device, dtype, num_latents, point_feats=0, embed_dim=0,
@@ -435,11 +634,16 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  decoder_shape_prepend=False,
                  decoder_shape_cross_attn=False,
                  decoder_cross_attn_layers=4,
-                 # NEW disentanglement flags
                  latent_disentangle=False,
                  semantic_dims=512,
                  scene_layout_head=False,
-                 jepa_idea1=False):
+                 jepa_idea1=False,
+                 # ── NEW: three ideas ──────────────────────────────────────────
+                 decoder_pos_enc=False,
+                 predict_seg_labels=False,
+                 token_cond=False,
+                 token_cond_approach='A',
+                 query_decoder=False):
 
         super().__init__(
             device=device, dtype=dtype, num_latents=1 + num_latents,
@@ -461,17 +665,41 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.latent_disentangle       = latent_disentangle
         self.semantic_dims            = semantic_dims
         self._jepa_idea1_enabled      = jepa_idea1
+        # ── New idea flags ──────────────────────────────────────────────────
+        self.decoder_pos_enc_flag     = decoder_pos_enc
+        self.predict_seg_labels_flag  = predict_seg_labels
+        self.token_cond_flag          = token_cond
+        self.token_cond_approach      = token_cond_approach.upper()
+        self.query_decoder_flag       = query_decoder
+
+        # Validate new flag dependencies
+        if token_cond and 'A' in self.token_cond_approach and not position_scaffold:
+            print("  [WARNING] token_cond approach A requires position_scaffold=True. "
+                  "Approach A will be inactive unless scaffold data is provided.")
+        if token_cond and 'B' in self.token_cond_approach and not scene_layout_head:
+            print("  [WARNING] token_cond approach B requires scene_layout_head=True. "
+                  "Approach B will be inactive until SceneLayoutHead is enabled.")
+        if query_decoder and not position_scaffold:
+            print("  [WARNING] query_decoder requires position_scaffold=True. "
+                  "Query decoder will fall back to GS_decoder if scaffold data absent.")
 
         print(f"\n{'='*70}")
         print(f"  CAN3TOK")
         print(f"  semantic='{semantic_mode}' | color_residual={color_residual}")
         print(f"  scene_semantic_head={scene_semantic_head} | position_scaffold={position_scaffold}")
-        print(f"  decoder_shape_prepend={decoder_shape_prepend} | decoder_shape_cross_attn={decoder_shape_cross_attn}")
+        print(f"  decoder_shape_prepend={decoder_shape_prepend} | "
+              f"decoder_shape_cross_attn={decoder_shape_cross_attn}")
         print(f"  latent_disentangle={latent_disentangle}  semantic_dims={semantic_dims}")
         print(f"  scene_layout_head={scene_layout_head}  jepa_idea1={jepa_idea1}")
+        print(f"  ── NEW IDEAS ──────────────────────────────────────────────────")
+        print(f"  decoder_pos_enc:    {decoder_pos_enc}  (PE before transformer)")
+        print(f"  predict_seg_labels: {predict_seg_labels}  (Idea 1: seg from Gaussian params)")
+        print(f"  token_cond:         {token_cond}  approach={token_cond_approach}  "
+              f"(Idea 2: spatial token conditioning)")
+        print(f"  query_decoder:      {query_decoder}  (Idea 3: per-Gaussian spatial decoder)")
         print(f"{'='*70}")
 
-        # Existing auxiliary heads
+        # ── EXISTING AUXILIARY HEADS ─────────────────────────────────────────
         self.mean_color_head      = None
         self.last_mean_color_pred = None
         if color_residual:
@@ -487,14 +715,11 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         if position_scaffold:
             self.anchor_position_head = AnchorPositionHead(width=width)
 
-        # NEW: SceneLayoutHead
         self.scene_layout_module    = None
         self.last_scene_layout_pred = None
         if scene_layout_head:
             self.scene_layout_module = SceneLayoutHead(width=width)
 
-        # NEW: SpatialSemanticHead (JEPA Idea 1)
-        # Called externally — forward() always sets last_spatial_semantic_pred=None.
         self.spatial_semantic_module    = None
         self.last_spatial_semantic_pred = None
         if jepa_idea1:
@@ -503,35 +728,27 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             else:
                 self.spatial_semantic_module = SpatialSemanticHead(width=width, num_tokens=512)
 
-        # NEW: Latent disentanglement projections
-        # kl_emb_proj_mean/var (from parent) KEPT for backward compat.
-        # _mu_s_cache / _mu_g_cache used by training loop.
+        # ── LATENT DISENTANGLEMENT ───────────────────────────────────────────
         self._mu_s_cache = None
         self._mu_g_cache = None
-
         if latent_disentangle:
-            assert embed_dim > 0, "latent_disentangle requires embed_dim > 0"
-            assert semantic_dims % embed_dim == 0, \
-                f"semantic_dims ({semantic_dims}) must be divisible by embed_dim ({embed_dim})"
+            assert embed_dim > 0
+            assert semantic_dims % embed_dim == 0
             geom_dims = 64 * 64 * 4 - semantic_dims
-            assert geom_dims > 0, f"semantic_dims ({semantic_dims}) must be < 16384"
-
+            assert geom_dims > 0
             self.mu_s_proj_mean = nn.Linear(width, semantic_dims)
             self.mu_s_proj_var  = nn.Linear(width, semantic_dims)
-
-            kl_in = (1 + num_latents - 1) * embed_dim  # 512 * 32 = 16384
+            kl_in = (1 + num_latents - 1) * embed_dim
             self.kl_emb_proj_mean_g = nn.Linear(kl_in, geom_dims)
             self.kl_emb_proj_var_g  = nn.Linear(kl_in, geom_dims)
+            print(f"  DISENTANGLE: mu_s[{semantic_dims}] from shape_embed | "
+                  f"mu_g[{geom_dims}] from tokens")
 
-            print(f"  DISENTANGLE: mu_s[{semantic_dims}] from shape_embed | mu_g[{geom_dims}] from tokens")
-
-        # Decoder shape conditioning (existing)
+        # ── DECODER SHAPE CONDITIONING (existing) ────────────────────────────
         self.project_shape_for_prepend = None
         if decoder_shape_prepend:
             self.project_shape_for_prepend = nn.Sequential(
                 nn.Linear(width, width), nn.LayerNorm(width))
-            total = sum(p.numel() for p in self.project_shape_for_prepend.parameters())
-            print(f"  Option 1: shape prepend | {total:,} params")
 
         self.project_shape_for_cross_attn = None
         self.shape_cross_attn_layers      = None
@@ -545,11 +762,59 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                     qkv_bias=qkv_bias, flash=flash)
                 for _ in range(decoder_cross_attn_layers)
             ])
-            proj_p = sum(p.numel() for p in self.project_shape_for_cross_attn.parameters())
-            attn_p = sum(p.numel() for p in self.shape_cross_attn_layers.parameters())
-            print(f"  Option 2: {decoder_cross_attn_layers} cross-attn layers | {(proj_p+attn_p)/1e6:.3f}M params")
 
-        # Per-Gaussian InfoNCE heads
+        # ── NEW IDEA 0: POSITIONAL ENCODING ──────────────────────────────────
+        self.decoder_pos_emb = None
+        if decoder_pos_enc:
+            # Learnable PE for 512 decoder tokens, initialised near zero
+            # so it does not perturb existing training when loading from ckpt
+            self.decoder_pos_emb = nn.Parameter(torch.zeros(512, width))
+            nn.init.trunc_normal_(self.decoder_pos_emb, std=0.02)
+            print(f"[DecoderPosEnc] learnable PE [512, {width}] — "
+                  f"{512*width:,} params (init ~N(0, 0.02))")
+
+        # ── NEW IDEA 1: SEGMENT PREDICTION HEAD ──────────────────────────────
+        self.seg_pred_head = None
+        self.last_seg_pred = None
+        if predict_seg_labels:
+            self.seg_pred_head = SegPredHead(in_dim=14, num_cats=72)
+
+        # ── NEW IDEA 2: TOKEN CENTROID CONDITIONING ───────────────────────────
+        self.token_cond_mlp_A      = None
+        self.token_cond_mlp_B      = None
+        self.token_cat_assign      = None
+        fourier_out_dim = self.fourier_embedder.out_dim
+
+        if token_cond:
+            print(f"[TokenCond] approach='{token_cond_approach}' | "
+                  f"fourier_dim={fourier_out_dim}")
+            if 'A' in self.token_cond_approach:
+                # Approach A: Fourier(scaffold_anchor) → token spatial bias
+                self.token_cond_mlp_A = TokenCondMLP(fourier_out_dim, width)
+                print(f"  Approach A: Fourier(scaffold_anchor[B,512,3]) -> bias[B,512,{width}]")
+
+            if 'B' in self.token_cond_approach:
+                # Approach B: learned token→category assignment × pred_centroids
+                self.token_cat_assign = nn.Parameter(torch.zeros(512, 72))
+                nn.init.trunc_normal_(self.token_cat_assign, std=0.01)
+                self.token_cond_mlp_B = TokenCondMLP(fourier_out_dim, width)
+                total_B = sum(p.numel() for p in self.token_cond_mlp_B.parameters()) + 512 * 72
+                print(f"  Approach B: W[512,72] × pred_centroids[B,72,3] -> "
+                      f"Fourier -> bias[B,512,{width}] | {total_B:,} params")
+                print(f"    Requires scene_layout_head=True (uses last_scene_layout_pred)")
+
+        # ── NEW IDEA 3: QUERY-BASED SPATIAL DECODER ───────────────────────────
+        self.spatial_aware_decoder = None
+        if query_decoder:
+            self.spatial_aware_decoder = SpatialAwareDecoder(
+                token_dim=width,
+                fourier_embedder=self.fourier_embedder,
+                hidden_dim=256,
+                color_residual=color_residual)
+            print(f"  Idea 3: GS_decoder MLP replaced by SpatialAwareDecoder")
+            print(f"    Falls back to GS_decoder if scaffold data not provided")
+
+        # ── PER-GAUSSIAN INFONCE HEADS (existing, unchanged) ─────────────────
         self.semantic_projection_hidden    = None
         self.semantic_projection_geometric = None
         self.semantic_attention_head       = None
@@ -569,8 +834,6 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         elif semantic_mode != 'none':
             raise ValueError(f"Unknown semantic_mode: '{semantic_mode}'")
 
-        if semantic_mode != 'none':
-            print(f"  InfoNCE: mode='{semantic_mode}'")
         print(f"{'='*70}\n")
 
     # ── Encode helpers ────────────────────────────────────────────────────────
@@ -590,18 +853,10 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         return kl_embed, posterior
 
     def encode(self, pc, feats=None, sample_posterior=True):
-        """
-        Full encode. When latent_disentangle=True:
-          mu_s = mu_s_proj_mean(shape_embed)            [B, D_s]
-          mu_g = kl_emb_proj_mean_g(kl_flat)            [B, D_g]
-          mu   = concat(mu_s, mu_g)                     [B, 16384]
-          _mu_s_cache, _mu_g_cache set for training loop.
-        """
         shape_embed, latents    = self.encode_latents(pc, feats)
         self._shape_embed_cache = shape_embed
-
-        kl_embed, posterior = self.encode_kl_embed(latents, sample_posterior)
-        kl_flat = kl_embed.reshape(kl_embed.shape[0], -1)
+        kl_embed, posterior     = self.encode_kl_embed(latents, sample_posterior)
+        kl_flat                 = kl_embed.reshape(kl_embed.shape[0], -1)
 
         if self.latent_disentangle:
             mu_s      = self.mu_s_proj_mean(shape_embed)
@@ -622,14 +877,21 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         return shape_embed, mu, log_var, z, posterior
 
     def decode(self, latents, volume_queries=None, return_semantic_features=False,
-               shape_embed=None):
+               shape_embed=None,
+               scaffold_anchors=None,
+               scaffold_token_ids=None):
         """
-        Decode [B, 512, 32] -> Gaussian attributes.
-        When latent_disentangle=True, z = concat(z_s, z_g), reshape works identically.
-        Cross-reconstruction enforcement is in the training loop, not here.
-        """
-        latents = self.post_kl(latents)
+        Decode [B, 512, 32] -> Gaussian attributes [B, 560000].
 
+        Args:
+            latents:            [B, 512, 32]   — reshaped z from VAE
+            scaffold_anchors:   [B, 512, 3]    — voxel centroids (for Idea 2A, 3)
+            scaffold_token_ids: [B, 40000]     — per-Gaussian voxel assignment (for Idea 3)
+            shape_embed:        [B, width]     — for decoder conditioning (existing)
+        """
+        latents = self.post_kl(latents)  # [B, 512, width]
+
+        # ── [Existing] Option 2: shape cross-attention conditioning ───────────
         if (self.decoder_shape_cross_attn and
                 self.shape_cross_attn_layers is not None and
                 shape_embed is not None):
@@ -637,6 +899,42 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             for cross_attn_layer in self.shape_cross_attn_layers:
                 latents = cross_attn_layer(latents, shape_context)
 
+        # ── NEW: Idea 0 — Positional Encoding ────────────────────────────────
+        # Applied BEFORE transformer so attention can learn spatial structure.
+        # PE is initialised near zero and learnable, safe to add to existing ckpts.
+        if self.decoder_pos_emb is not None:
+            latents = latents + self.decoder_pos_emb.unsqueeze(0)  # [B, 512, width]
+
+        # ── NEW: Idea 2 — Token Centroid Conditioning ─────────────────────────
+        # Applied BEFORE transformer so conditioned representations flow through
+        # all 12 attention layers, maximising propagation of spatial context.
+        if self.token_cond_flag:
+            # Approach A: scaffold anchor Fourier encoding
+            if ('A' in self.token_cond_approach and
+                    self.token_cond_mlp_A is not None and
+                    scaffold_anchors is not None):
+                # scaffold_anchors: [B, 512, 3] → Fourier → [B, 512, fourier_dim]
+                fourier_A    = self.fourier_embedder(scaffold_anchors)
+                spatial_A    = self.token_cond_mlp_A(fourier_A)   # [B, 512, width]
+                latents      = latents + spatial_A
+
+            # Approach B: soft category centroid from SceneLayoutHead
+            if ('B' in self.token_cond_approach and
+                    self.token_cat_assign is not None and
+                    self.token_cond_mlp_B is not None and
+                    self.last_scene_layout_pred is not None):
+                # W: [512, 72] soft assignment (scene-agnostic, learnable)
+                W = F.softmax(self.token_cat_assign, dim=-1)        # [512, 72]
+                pred_c = self.last_scene_layout_pred                 # [B, 72, 3]
+                # token_centroids: [B, 512, 3]
+                #   einsum 'tk,bkd->btd': for each batch b, for each token t,
+                #   sum over categories k: W[t,k] * pred_c[b,k,:]
+                token_centroids = torch.einsum('tk,bkd->btd', W, pred_c)
+                fourier_B    = self.fourier_embedder(token_centroids)
+                spatial_B    = self.token_cond_mlp_B(fourier_B)    # [B, 512, width]
+                latents      = latents + spatial_B
+
+        # ── [Existing] Option 1: shape prepend ───────────────────────────────
         shape_token_prepended = False
         if (self.decoder_shape_prepend and
                 self.project_shape_for_prepend is not None and
@@ -645,25 +943,53 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             latents = torch.cat([shape_token, latents], dim=1)
             shape_token_prepended = True
 
+        # ── Transformer ───────────────────────────────────────────────────────
         latents_out = self.transformer(latents)
         if shape_token_prepended:
-            latents_out = latents_out[:, 1:, :]
+            latents_out = latents_out[:, 1:, :]    # remove prepended shape token
 
-        latents_flat = latents_out.reshape(latents_out.shape[0], -1)
+        # ── NEW: Idea 3 — Spatial-Aware Decoder ──────────────────────────────
+        # Uses per-Gaussian gather from transformer tokens + spatial Fourier encoding.
+        # Falls back to GS_decoder if scaffold data unavailable.
+        use_query_decoder = (
+            self.query_decoder_flag and
+            self.spatial_aware_decoder is not None and
+            scaffold_anchors is not None and
+            scaffold_token_ids is not None)
 
         has_sem = any([self.semantic_projection_hidden,
                        self.semantic_projection_geometric,
                        self.semantic_attention_head,
                        self.semantic_distribution_head])
-        need_hidden = return_semantic_features and self.training and has_sem
+        need_hidden = (return_semantic_features and self.training and
+                       has_sem and not use_query_decoder)
 
-        if need_hidden:
-            reconstruction, hidden = self.GS_decoder(latents_flat, return_hidden=True)
+        hidden = None
+        if use_query_decoder:
+            # Idea 3: per-Gaussian spatial decoder
+            reconstruction = self.spatial_aware_decoder(
+                latents_out, scaffold_anchors, scaffold_token_ids)
         else:
-            reconstruction = self.GS_decoder(latents_flat, return_hidden=False)
+            # Standard GS_decoder (flat MLP)
+            latents_flat = latents_out.reshape(latents_out.shape[0], -1)
+            if need_hidden:
+                reconstruction, hidden = self.GS_decoder(latents_flat, return_hidden=True)
+            else:
+                reconstruction = self.GS_decoder(latents_flat, return_hidden=False)
 
+        # ── NEW: Idea 1 — Segment Prediction ─────────────────────────────────
+        # Takes the 14-dim Gaussian params as input → lightweight per-Gaussian MLP.
+        # Gradient flows back through Gaussian params into the decoder,
+        # forcing position/color to be categorically discriminative.
+        self.last_seg_pred = None
+        if self.seg_pred_head is not None:
+            B_r = reconstruction.shape[0]
+            g_params = reconstruction.reshape(B_r, 40000, 14)
+            self.last_seg_pred = self.seg_pred_head(g_params)  # [B, 40000, 72]
+
+        # ── [Existing] Semantic features for InfoNCE ─────────────────────────
         semantic_features = None
-        if return_semantic_features and self.training and has_sem:
+        if return_semantic_features and self.training and has_sem and hidden is not None:
             B       = reconstruction.shape[0]
             recon_g = reconstruction.reshape(B, 40000, 14)
             if self.semantic_mode == 'hidden':
@@ -678,31 +1004,38 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
 
         return reconstruction, semantic_features
 
-    def forward(self, pc, feats, volume_queries, sample_posterior=True):
+    def forward(self, pc, feats, volume_queries, sample_posterior=True,
+                scaffold_anchors=None, scaffold_token_ids=None):
         """
-        6-value return (unchanged):
+        6-value return (unchanged API):
           shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
 
-        After forward(), training loop reads:
-          model.shape_model.last_mean_color_pred       [B,3] or None
-          model.shape_model.last_scene_semantic_pred   [B,72] or None
-          model.shape_model.last_anchor_pred           [B,512,3] or None
-          model.shape_model.last_scene_layout_pred     [B,72,3] or None  NEW
-          model.shape_model.last_spatial_semantic_pred None (set externally) NEW
-          model.shape_model._mu_s_cache                [B,D_s] or None   NEW
-          model.shape_model._mu_g_cache                [B,D_g] or None   NEW
-          model.shape_model._shape_embed_cache         [B,width]
+        NEW optional args:
+          scaffold_anchors:   [B, 512, 3]  — needed for Idea 2A and Idea 3
+          scaffold_token_ids: [B, 40000]   — needed for Idea 3
+
+        NOTE: SceneLayoutHead computed BEFORE decode() so Approach B of
+        Idea 2 can use pred_centroids inside the decode() call.
         """
         shape_embed, mu, log_var, z, posterior = self.encode(pc, feats, sample_posterior)
+        _se = self._shape_embed_cache
+
+        # ── SceneLayoutHead computed BEFORE decode() ─────────────────────────
+        # Reason: Idea 2 Approach B needs pred_centroids inside decode() to
+        # compute token_centroids. All other heads are computed after decode().
+        self.last_scene_layout_pred = (
+            self.scene_layout_module(_se)
+            if self.scene_layout_module is not None else None)
 
         latents = z.reshape(z.shape[0], 512, 32)
         UV_gs_recover, per_gaussian_features = self.decode(
             latents, volume_queries,
             return_semantic_features=self.training,
-            shape_embed=self._shape_embed_cache)
+            shape_embed=_se,
+            scaffold_anchors=scaffold_anchors,
+            scaffold_token_ids=scaffold_token_ids)
 
-        _se = self._shape_embed_cache
-
+        # ── Remaining heads ───────────────────────────────────────────────────
         self.last_mean_color_pred = (
             self.mean_color_head(_se) if self.mean_color_head is not None else None)
         self.last_scene_semantic_pred = (
@@ -711,10 +1044,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.last_anchor_pred = (
             self.anchor_position_head(_se)
             if self.anchor_position_head is not None else None)
-        self.last_scene_layout_pred = (
-            self.scene_layout_module(_se)
-            if self.scene_layout_module is not None else None)
-        # SpatialSemanticHead always called externally
+        # last_scene_layout_pred already set above
         self.last_spatial_semantic_pred = None
 
         return shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
