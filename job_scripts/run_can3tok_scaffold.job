@@ -78,7 +78,7 @@ DECODER_SHAPE_CROSS_ATTN=False
 DECODER_CROSS_ATTN_LAYERS=6
 
 # ── InfoNCE ───────────────────────────────────────────────────────────────────
-SEMANTIC_MODE="none"
+SEMANTIC_MODE="hidden"
 SEGMENT_WEIGHT=0.3
 INSTANCE_WEIGHT=0.0
 SEMANTIC_TEMP=0.07
@@ -108,7 +108,7 @@ JEPA_IDEA1_WEIGHT=1.0
 # Learnable PE[512, width] added to decoder tokens before transformer.
 # RECOMMENDED: add to every run as a baseline companion.
 # No extra compute, safe to combine with everything else.
-DECODER_POS_ENC=True
+DECODER_POS_ENC=False
 
 # ── Idea 1: Segment Label Prediction ─────────────────────────────────────────
 # SegPredHead: Gaussian params [B,40000,14] -> seg logits [B,40000,72].
@@ -124,7 +124,7 @@ SEG_PRED_WEIGHT=0.3
 # Approach B requires SCENE_LAYOUT_HEAD=True (already True above)
 # If using A or AB: set POSITION_SCAFFOLD=True, POSITION_LAYOUT_RESIDUAL=False
 TOKEN_COND=True
-TOKEN_COND_APPROACH="A"   # A, B, or AB
+TOKEN_COND_APPROACH="AB"   # A, B, or AB
 
 # ── Idea 3: Query-Based Spatial Decoder ──────────────────────────────────────
 # Replaces flat GS_decoder MLP with per-Gaussian spatial MLP.
@@ -133,7 +133,7 @@ TOKEN_COND_APPROACH="A"   # A, B, or AB
 QUERY_DECODER=False
 
 # ── Core training ─────────────────────────────────────────────────────────────
-BATCH_SIZE=64   # reduce to 32 if QUERY_DECODER=True
+BATCH_SIZE=100   # reduce to 32 if QUERY_DECODER=True
 NUM_EPOCHS=1500
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-6
