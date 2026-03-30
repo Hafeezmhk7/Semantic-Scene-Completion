@@ -543,9 +543,15 @@ def evaluate_model(model, dataloader, device, epoch=None):
     n_scenes   = 0
     recon_preds_list       = []
     recon_means_list       = []
-    recon_smooth_anch_list = []   # CHANGE 1: was recon_anch_list + recon_tids_list
+    recon_smooth_anch_list = []
     recon_dc_list          = []
     do_recon = (epoch is not None and epoch % args.recon_ply_freq == 0)
+
+    # PCA visualisation — collect a few scenes for CloudCompare export
+    pca_input_list = []   # raw input Gaussian features [40000, 18]
+    pca_recon_list = []   # reconstructed Gaussian params [40000, 14]
+    pca_seg_list   = []   # segment labels [40000]
+    do_pca = (epoch is not None and epoch % args.pca_vis_freq == 0)
 
     with torch.no_grad():
         for batch_data in tqdm(dataloader, desc="Evaluating", leave=False):
@@ -632,6 +638,18 @@ def evaluate_model(model, dataloader, device, epoch=None):
                     if dc_np is not None:
                         recon_dc_list.append(dc_np[si])
 
+            # Collect PCA scenes — input, reconstruction, and segment labels
+            if do_pca and len(pca_input_list) < args.pca_num_scenes:
+                seg_np = batch_data['segment_labels'].numpy()   # [B, 40000]
+                inp_np = UV_gs_batch.cpu().numpy()              # [B, 40000, 18]
+                rec_np = pred_3d.cpu().numpy()                  # [B, 40000, 14]
+                for si in range(B):
+                    if len(pca_input_list) >= args.pca_num_scenes:
+                        break
+                    pca_input_list.append(inp_np[si])
+                    pca_recon_list.append(rec_np[si])
+                    pca_seg_list.append(seg_np[si])
+
     if do_recon and recon_preds_list and save_path:
         try:
             all_preds = np.stack(recon_preds_list, axis=0)
@@ -662,6 +680,26 @@ def evaluate_model(model, dataloader, device, epoch=None):
                 color_mode="1", prefix="scene")
         except Exception as e:
             print(f"  PLY save error: {e}")
+
+    # ── PCA visualisation (CloudCompare PLY with feature-coloured Gaussians) ──
+    if do_pca and pca_input_list and save_path:
+        try:
+            pca_dir = Path(save_path) / "pca_visualisations" / f"epoch_{epoch:03d}"
+            pca_dir.mkdir(parents=True, exist_ok=True)
+            all_inputs = np.stack(pca_input_list, axis=0)   # [S, 40000, 18]
+            all_recons = np.stack(pca_recon_list, axis=0)   # [S, 40000, 14]
+            all_segs   = np.stack(pca_seg_list,   axis=0)   # [S, 40000]
+            visualize_comparison(
+                input_gs=all_inputs,
+                recon_gs=all_recons,
+                segment_labels=all_segs,
+                output_dir=str(pca_dir),
+                epoch=epoch,
+                num_scenes=len(pca_input_list),
+                brightness=args.pca_brightness)
+            print(f"  PCA PLY saved: {pca_dir}")
+        except Exception as e:
+            print(f"  PCA visualisation error: {e}")
 
     model.train()
     n = max(n_scenes, 1)
@@ -925,8 +963,10 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
     nb = len(trainDataLoader)
     print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | Recon={epoch_recon/nb:.4f} | "
-          f"KL={epoch_kl/nb:.4f} | Layout={epoch_layout/nb:.4f} | "
-          f"CrossRecon={epoch_cross_recon/nb:.4f} | Ortho={epoch_ortho/nb:.6f}")
+          f"KL={epoch_kl/nb:.4f} | InfoNCE={epoch_sem/nb:.4f} | "
+          f"ColorPred={epoch_color_pred/nb:.6f} | SceneSem={epoch_scene_semantic/nb:.4f} | "
+          f"Layout={epoch_layout/nb:.4f} | CrossRecon={epoch_cross_recon/nb:.4f} | "
+          f"SegPred={epoch_seg_pred/nb:.4f} | Ortho={epoch_ortho/nb:.6f}")
     print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
           f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | Rot={epoch_rot/nb:.3f}")
 
