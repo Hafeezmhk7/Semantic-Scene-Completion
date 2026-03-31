@@ -78,8 +78,8 @@ DECODER_SHAPE_CROSS_ATTN=False
 DECODER_CROSS_ATTN_LAYERS=6
 
 # ── InfoNCE ───────────────────────────────────────────────────────────────────
-SEMANTIC_MODE="hidden"
-SEGMENT_WEIGHT=0.3
+SEMANTIC_MODE="none"
+SEGMENT_WEIGHT=0.0
 INSTANCE_WEIGHT=0.0
 SEMANTIC_TEMP=0.07
 SEMANTIC_SUBSAMPLE=10000
@@ -108,7 +108,7 @@ JEPA_IDEA1_WEIGHT=1.0
 # Learnable PE[512, width] added to decoder tokens before transformer.
 # RECOMMENDED: add to every run as a baseline companion.
 # No extra compute, safe to combine with everything else.
-DECODER_POS_ENC=False
+DECODER_POS_ENC=True
 
 # ── Idea 1: Segment Label Prediction ─────────────────────────────────────────
 # SegPredHead: Gaussian params [B,40000,14] -> seg logits [B,40000,72].
@@ -134,14 +134,29 @@ QUERY_DECODER=False
 
 # ── Core training ─────────────────────────────────────────────────────────────
 BATCH_SIZE=100   # reduce to 32 if QUERY_DECODER=True
-NUM_EPOCHS=1500
+NUM_EPOCHS=2000
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-6
 EVAL_EVERY=50
 FAILURE_THRESHOLD=100
 
+# ── LR Scheduler (AdamW + linear warmup + cosine decay to floor) ─────────────
+# Warmup: ramps LR from 0 → LEARNING_RATE over WARMUP_STEPS steps.
+# Decay:  cosine from LEARNING_RATE → (LEARNING_RATE * LR_MIN_RATIO) at end.
+#
+# Scaling guide for WARMUP_STEPS when increasing dataset:
+#   300 scenes  (BS=100) → ~3 batches/epoch  → 100  steps  (~33 epochs warmup)
+#   1K  scenes  (BS=64)  → ~16 batches/epoch → 300  steps  (~19 epochs warmup)
+#   full 7K     (BS=64)  → ~110 batches/epoch→ 1000-2000 steps (~10-20 epochs warmup)
+#
+# LR_MIN_RATIO: 0.1 = 10% floor (GaussianGPT-style), e.g. 1e-4 → 1e-5
+#               1.0 = constant LR, no decay (set to compare against)
+WEIGHT_DECAY=1e-2
+WARMUP_STEPS=100
+LR_MIN_RATIO=0.1
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
-TRAIN_SCENES=300
+TRAIN_SCENES=3500
 VAL_SCENES=50
 SAMPLING_METHOD="opacity"
 
@@ -231,10 +246,13 @@ echo "    Idea 1: predict_seg_labels=$PREDICT_SEG_LABELS (weight=$SEG_PRED_WEIGH
 echo "    Idea 2: token_cond=$TOKEN_COND approach=$TOKEN_COND_APPROACH"
 echo "    Idea 3: query_decoder=$QUERY_DECODER"
 echo ""
+echo "  LR schedule: peak=$LEARNING_RATE | floor=$(echo "$LEARNING_RATE * $LR_MIN_RATIO" | bc -l | xargs printf '%.0e') ($(($(echo "$LR_MIN_RATIO * 100" | bc)| cut -d. -f1)% of peak) | warmup=$WARMUP_STEPS steps | weight_decay=$WEIGHT_DECAY"
+echo ""
 echo "  Prior results for comparison:"
 echo "    Run A: L2=1.43  (color_residual only)"
 echo "    Run H: L2=1.565 (semantic+disentangle+layout)"
 echo "    Run K: L2~1.0-1.2 (Run H + posresid, still converging)"
+echo "    Run T2: L2=0.606 (best — token_cond AB + trilinear smoothing)"
 echo "  Current: ${TRAIN_SCENES} scenes, ${NUM_EPOCHS} epochs"
 echo "========================================================================"
 echo ""
@@ -274,6 +292,9 @@ TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
 TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY"
+TRAIN_CMD="$TRAIN_CMD --warmup_steps $WARMUP_STEPS"
+TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO"
 TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
@@ -374,6 +395,10 @@ if [ $TRAIN_EXIT -eq 0 ]; then
     echo "COMPLETED. Checkpoint: $CKPT_DIR"
     echo ""
     echo "KEY DIAGNOSTICS:"
+    echo "  LR trajectory:"
+    echo "    grep 'LR=' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
+    echo "    Should warmup over first ~33 epochs then cosine-decay to ~1e-5"
+    echo ""
     echo "  Position loss trajectory:"
     echo "    grep 'Position:' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
     echo "    Compare to Run K baseline"

@@ -52,7 +52,7 @@ import torch.utils.data as Data
 
 from semantic_losses import compute_semantic_loss
 from distribution_loss import compute_distribution_loss
-from pca_feature_visualization import visualize_comparison
+from pca_feature_visualization import visualize_semantic_features
 from gs_ply_reconstructor import save_reconstructed_gaussians
 
 import sys
@@ -167,6 +167,15 @@ parser.add_argument('--batch_size',           type=int,   default=64)
 parser.add_argument('--num_epochs',           type=int,   default=1000)
 parser.add_argument('--lr',                   type=float, default=1e-4)
 parser.add_argument('--kl_weight',            type=float, default=1e-5)
+parser.add_argument('--weight_decay',         type=float, default=1e-2,
+    help='AdamW weight decay (default 1e-2, matches original YAML).')
+parser.add_argument('--warmup_steps',         type=int,   default=100,
+    help='Linear LR warmup steps. Scale with dataset: ~100 for 300 scenes, '
+         '~1000-2000 for full SceneSplat-7K. Set 0 to disable warmup.')
+parser.add_argument('--lr_min_ratio',         type=float, default=0.1,
+    help='Minimum LR as fraction of peak LR at end of cosine decay. '
+         'Default 0.1 = 10pct floor (e.g. 1e-4 decays to 1e-5). '
+         'Set 1.0 to keep constant LR (no decay).')
 parser.add_argument('--eval_every',           type=int,   default=20)
 parser.add_argument('--failure_threshold',    type=float, default=100.0)
 parser.add_argument('--train_scenes',         type=int,   default=None)
@@ -393,7 +402,11 @@ print(f"  point_feats={cfg_point_feats} OK")
 
 gs_autoencoder = instantiate_from_config(model_config)
 gs_autoencoder.to(device)
-optimizer = torch.optim.Adam(gs_autoencoder.parameters(), lr=args.lr, betas=[0.9, 0.999])
+optimizer = torch.optim.AdamW(
+    gs_autoencoder.parameters(),
+    lr=args.lr,
+    betas=[0.9, 0.999],
+    weight_decay=args.weight_decay)
 
 # ============================================================================
 # CHECKPOINT LOADING
@@ -444,6 +457,72 @@ if args.resume_checkpoint:
     best_val_loss = ckpt.get('val_l2_error', ckpt.get('best_val_l2', float('inf')))
     best_epoch    = ckpt.get('epoch', 0)
     print(f"  Resumed epoch {start_epoch} (saved val L2: {best_val_loss:.4f})")
+
+# ============================================================================
+# LR SCHEDULER — linear warmup + cosine decay to lr_min_ratio floor
+# ============================================================================
+# Formula (per step):
+#   warmup phase  (step < warmup_steps):  lr = peak * step / warmup_steps
+#   cosine phase  (step >= warmup_steps): lr = lr_min + 0.5*(peak-lr_min)*(1+cos(π*t/T))
+#   where t = step - warmup_steps, T = total_steps - warmup_steps
+#
+# Scaling guide for warmup_steps when increasing dataset:
+#   300 scenes   → ~100  steps  (default)
+#   1000 scenes  → ~300  steps
+#   full 7K      → ~1000-2000 steps
+#
+# Scaling guide for lr_min_ratio:
+#   0.1 (default) → 10% floor, e.g. 1e-4 → 1e-5  (GaussianGPT-style)
+#   1.0           → constant LR, no decay (original behaviour)
+
+import math
+
+def build_lr_lambda(warmup_steps, total_steps, lr_min_ratio):
+    """
+    Returns a LambdaLR multiplier function.
+    The optimizer's base LR is the peak; this returns a multiplier in [lr_min_ratio, 1.0].
+    When resuming, pass the already-elapsed steps so the schedule continues
+    from where it left off rather than restarting.
+    """
+    cosine_steps = max(total_steps - warmup_steps, 1)
+
+    def lr_lambda(current_step):
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step) / float(warmup_steps)
+        t = current_step - warmup_steps
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * t / cosine_steps))
+        return lr_min_ratio + (1.0 - lr_min_ratio) * cosine_factor
+
+    return lr_lambda
+
+# Total steps for the scheduler — from start_epoch to end, not from epoch 0.
+# This means a resumed run continues the cosine curve rather than restarting it.
+# Compute an approximate total training steps over the whole run
+# (dataset not loaded yet, so we estimate: train_scenes / batch_size * num_epochs)
+_approx_batches_per_epoch = max(1, (args.train_scenes or 300) // args.batch_size)
+_total_steps_full         = _approx_batches_per_epoch * args.num_epochs
+_elapsed_steps            = _approx_batches_per_epoch * start_epoch
+
+# The lambda sees step indices starting from 0 for the resumed portion,
+# so we offset by elapsed steps to place us correctly on the full curve.
+_lr_lambda = build_lr_lambda(
+    warmup_steps  = max(0, args.warmup_steps - _elapsed_steps),  # remaining warmup
+    total_steps   = _total_steps_full - _elapsed_steps,
+    lr_min_ratio  = args.lr_min_ratio)
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
+# If resuming, the optimizer state (including momentum buffers) is already loaded.
+# We do NOT call scheduler.load_state_dict here — the lambda handles position
+# implicitly because we offset the step count above.
+
+print(f"\n  LR SCHEDULER: linear warmup + cosine decay")
+print(f"    peak LR:       {args.lr:.2e}")
+print(f"    floor LR:      {args.lr * args.lr_min_ratio:.2e}  ({args.lr_min_ratio*100:.0f}% of peak)")
+print(f"    warmup steps:  {args.warmup_steps}  (remaining: {max(0, args.warmup_steps - _elapsed_steps)})")
+print(f"    total steps:   ~{_total_steps_full:,}  (remaining: ~{_total_steps_full - _elapsed_steps:,})")
+if args.lr_min_ratio >= 1.0:
+    print(f"    NOTE: lr_min_ratio=1.0 — effectively constant LR (no decay)")
 
 # ============================================================================
 # DATASETS
@@ -523,6 +602,9 @@ _ckpt_meta = {
     'color_loss_weight':          args.color_loss_weight,
     'use_canonical_norm':         args.use_canonical_norm,
     'scale_norm_mode':            args.scale_norm_mode,
+    'weight_decay':               args.weight_decay,
+    'warmup_steps':               args.warmup_steps,
+    'lr_min_ratio':               args.lr_min_ratio,
 }
 
 # ============================================================================
@@ -548,9 +630,10 @@ def evaluate_model(model, dataloader, device, epoch=None):
     do_recon = (epoch is not None and epoch % args.recon_ply_freq == 0)
 
     # PCA visualisation — collect a few scenes for CloudCompare export
-    pca_input_list = []   # raw input Gaussian features [40000, 18]
-    pca_recon_list = []   # reconstructed Gaussian params [40000, 14]
-    pca_seg_list   = []   # segment labels [40000]
+    pca_input_list      = []   # raw input Gaussian features [40000, 18]
+    pca_recon_list      = []   # reconstructed Gaussian params [40000, 14]
+    pca_seg_list        = []   # segment labels [40000]
+    pca_smooth_anch_list = []  # per-Gaussian smooth anchor [40000, 3] (for position recovery)
     do_pca = (epoch is not None and epoch % args.pca_vis_freq == 0)
 
     with torch.no_grad():
@@ -643,12 +726,16 @@ def evaluate_model(model, dataloader, device, epoch=None):
                 seg_np = batch_data['segment_labels'].numpy()   # [B, 40000]
                 inp_np = UV_gs_batch.cpu().numpy()              # [B, 40000, 18]
                 rec_np = pred_3d.cpu().numpy()                  # [B, 40000, 14]
+                sa_np  = (batch_data['smooth_anchor'].numpy()   # [B, 40000, 3]
+                          if args.position_scaffold else None)
                 for si in range(B):
                     if len(pca_input_list) >= args.pca_num_scenes:
                         break
                     pca_input_list.append(inp_np[si])
                     pca_recon_list.append(rec_np[si])
                     pca_seg_list.append(seg_np[si])
+                    if sa_np is not None:
+                        pca_smooth_anch_list.append(sa_np[si])
 
     if do_recon and recon_preds_list and save_path:
         try:
@@ -685,21 +772,53 @@ def evaluate_model(model, dataloader, device, epoch=None):
     if do_pca and pca_input_list and save_path:
         try:
             pca_dir = Path(save_path) / "pca_visualisations" / f"epoch_{epoch:03d}"
-            pca_dir.mkdir(parents=True, exist_ok=True)
             all_inputs = np.stack(pca_input_list, axis=0)   # [S, 40000, 18]
             all_recons = np.stack(pca_recon_list, axis=0)   # [S, 40000, 14]
             all_segs   = np.stack(pca_seg_list,   axis=0)   # [S, 40000]
-            visualize_comparison(
-                input_gs=all_inputs,
-                recon_gs=all_recons,
-                segment_labels=all_segs,
-                output_dir=str(pca_dir),
-                epoch=epoch,
-                num_scenes=len(pca_input_list),
-                brightness=args.pca_brightness)
-            print(f"  PCA PLY saved: {pca_dir}")
+            pca_dir.mkdir(parents=True, exist_ok=True)
+
+            saved = []
+            for si in range(len(pca_input_list)):
+                # Positions: absolute xyz from input features (cols 4:7)
+                coords_in  = all_inputs[si, :, 4:7]   # [40000, 3]
+                # Features to PCA-colour:
+                #   - input:  full 18-dim input feature vector
+                #   - recon:  reconstructed 14-dim Gaussian params
+                #   - seg:    segment labels mapped to one-hot (for colour variety)
+                feats_in   = all_inputs[si]            # [40000, 18]
+                feats_rec  = all_recons[si]            # [40000, 14]
+
+                # Input point cloud coloured by PCA of input features
+                out_input = str(pca_dir / f"scene{si:02d}_input.ply")
+                visualize_semantic_features(
+                    coords=coords_in,
+                    features=feats_in,
+                    output_path=out_input,
+                    brightness=args.pca_brightness)
+
+                # Reconstructed point cloud coloured by PCA of recon params
+                # Use recon positions (add smooth_anchor back if scaffold)
+                coords_rec = feats_rec[:, 0:3].copy()
+                if args.position_scaffold and len(pca_smooth_anch_list) > si:
+                    coords_rec = coords_rec + pca_smooth_anch_list[si]
+                out_recon = str(pca_dir / f"scene{si:02d}_recon.ply")
+                visualize_semantic_features(
+                    coords=coords_rec,
+                    features=feats_rec,
+                    output_path=out_recon,
+                    brightness=args.pca_brightness)
+
+                saved.append(f"scene{si:02d}")
+
+            print(f"  PCA PLY saved → {pca_dir}  ({len(saved)} scenes: input+recon each)")
+        except TypeError as e:
+            import traceback
+            print(f"  PCA TypeError — check pca_feature_visualization.py signature:")
+            traceback.print_exc()
         except Exception as e:
+            import traceback
             print(f"  PCA visualisation error: {e}")
+            traceback.print_exc()
 
     model.train()
     n = max(n_scenes, 1)
@@ -896,6 +1015,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 + semantic_loss)
         loss.backward()
         optimizer.step()
+        scheduler.step()   # advance LR schedule one step
 
         ind = compute_individual_losses(pred_3d, target)
         epoch_loss           += loss.item()
@@ -962,11 +1082,12 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         global_step += 1
 
     nb = len(trainDataLoader)
+    current_lr = scheduler.get_last_lr()[0]
     print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | Recon={epoch_recon/nb:.4f} | "
           f"KL={epoch_kl/nb:.4f} | InfoNCE={epoch_sem/nb:.4f} | "
           f"ColorPred={epoch_color_pred/nb:.6f} | SceneSem={epoch_scene_semantic/nb:.4f} | "
           f"Layout={epoch_layout/nb:.4f} | CrossRecon={epoch_cross_recon/nb:.4f} | "
-          f"SegPred={epoch_seg_pred/nb:.4f} | Ortho={epoch_ortho/nb:.6f}")
+          f"SegPred={epoch_seg_pred/nb:.4f} | Ortho={epoch_ortho/nb:.6f} | LR={current_lr:.2e}")
     print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
           f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | Rot={epoch_rot/nb:.3f}")
 
@@ -1021,6 +1142,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             "best/val_l2":           best_val_loss,
             "best/epoch":            best_epoch,
             "train/epoch":           epoch,
+            "train/lr":              current_lr,
         }, step=global_step)
 
     if epoch >= 10 and epoch % 500 == 0:
