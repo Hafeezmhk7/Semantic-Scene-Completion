@@ -1,28 +1,26 @@
 """
-Can3Tok Training
-================
-Step 1:    Color Residual             (--color_residual)
-Move 1:    Scene Semantic Head        (--scene_semantic_head)
-Scaffold:  Position Scaffold          (--position_scaffold)
-Option 1:  Decoder Shape Prepend      (--decoder_shape_prepend)
-Option 2:  Decoder Shape Cross-Attn   (--decoder_shape_cross_attn)
-InfoNCE:   Per-Gaussian contrastive   (--semantic_mode hidden)
+Can3Tok Training — INFERENCE-FIXED VERSION
+==========================================
+KEY CHANGES vs previous version:
 
-DISENTANGLEMENT SUITE:
-  --latent_disentangle  --semantic_dims  --cross_recon_weight  --ortho_weight
-  --scene_layout_head  --layout_loss_weight  --position_layout_residual
+1. AnchorPredFromTokens replaces AnchorPositionHead:
+   - Previously: shape_embed -> AnchorPositionHead -> predicted_anchors (auxiliary only)
+   - Now:        transformer_tokens -> AnchorPredFromTokens -> predicted_anchors (used in decode)
+   - anchor_loss now supervises AnchorPredFromTokens via last_predicted_anchors_from_tokens
 
-NEW: THREE SPATIAL INDUCTIVE BIAS IDEAS
-  Idea 0: --decoder_pos_enc
-  Idea 1: --predict_seg_labels  --seg_pred_weight
-  Idea 2: --token_cond  --token_cond_approach (A / B / AB)
-  Idea 3: --query_decoder
+2. Training target is ABSOLUTE POSITIONS (not smooth offsets):
+   - Previously: target[:,:,0:3] = smooth_anchor_offsets  (GT data leaked at inference)
+   - Now:        target = target_abs  (absolute xyz, decoder outputs include DC)
+   - DC (predicted anchor) is added to position output INSIDE decode()
 
-TRILINEAR ANCHOR SMOOTHING (always active when --position_scaffold):
-  position_offsets = coord - smooth_anchor  (continuous, no voxel boundary seams)
-  smooth_anchor    = trilinear_blend(coord, 8 surrounding voxel anchors)
-  PLY save:         abs_pos = decoder_pos + smooth_anchor
-  Eliminates seam artifacts visible at voxel boundaries on large surfaces.
+3. scaffold_token_ids always passed to model when position_scaffold=True:
+   - Enables accurate DC assignment at training time
+   - At inference: pass scaffold_token_ids=None → fixed j→j*512//40000 used
+
+4. PLY save simplified:
+   - Previously: all_preds[:,:,0:3] += GT smooth_anchor  (GT leaked)
+   - Now:        decoder output is already absolute (DC added inside decode())
+   - Just save decoder output directly (after adding mean_color back for color)
 
 ABLATION TABLE:
   Run A:  color_residual only                               (done, L2=1.43)
@@ -33,7 +31,8 @@ ABLATION TABLE:
   Run R:  Run K + token_cond approach A                     (done, L2=0.589)
   Run S:  Run K + token_cond approach B                     (done, unstable)
   Run T:  Run K + token_cond approach AB                    (done, best visual)
-  Run T2: Run T + trilinear smoothing                       <- LAUNCH THIS
+  Run T2: Run T + trilinear smoothing                       (done, L2=0.606)
+  Run V:  Run T + AnchorPredFromTokens (INFERENCE FIX)      <- LAUNCH THIS
 """
 
 import torch
@@ -85,7 +84,7 @@ GEO_ONLY_SLICES = {
 }
 
 # ============================================================================
-# LOSS HELPERS (unchanged)
+# LOSS HELPERS
 # ============================================================================
 
 def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0):
@@ -110,6 +109,9 @@ def scene_semantic_kl_loss(p_hat, p_s, eps=1e-8):
 
 
 def compute_cross_recon_loss(pred_cross_3d, target, batch_size):
+    # Uses GEO_ONLY_SLICES: position, opacity, scale, rotation.
+    # pred_cross_3d passed here must already have DC subtracted from position
+    # (see cross-recon block in training loop) so comparison is offset vs offset.
     loss = torch.tensor(0.0, device=pred_cross_3d.device)
     for sl in GEO_ONLY_SLICES.values():
         loss = loss + torch.norm(
@@ -147,6 +149,19 @@ def compute_spatial_semantic_loss(pred_voxel, gt_voxel, voxel_valid, eps=1e-8):
     return (kl_per_voxel * voxel_valid).sum() / (voxel_valid.sum() + 1e-8)
 
 
+def compute_scale_penalty(pred_3d, threshold=0.5):
+    """
+    Penalise Gaussians whose scale exceeds threshold (metres).
+    pred_3d: [B, 40000, 14] — scale values at indices 7:10 are already post-exp
+             (GS_decoder applies exp() internally so these are in metres).
+    Only the excess above threshold is penalised, not the full scale value.
+    This avoids penalising correctly-sized Gaussians.
+    """
+    scale_pred = pred_3d[:, :, 7:10]   # [B, 40000, 3], post-exp metres
+    excess     = torch.clamp(scale_pred - threshold, min=0.0)
+    return (excess ** 2).mean()
+
+
 def compute_seg_pred_loss(seg_logits, segment_labels):
     B, N, C = seg_logits.shape
     flat_logits = seg_logits.reshape(B * N, C)
@@ -158,24 +173,18 @@ def compute_seg_pred_loss(seg_logits, segment_labels):
 
 
 # ============================================================================
-# ARGUMENT PARSING (unchanged)
+# ARGUMENT PARSING
 # ============================================================================
 
-parser = argparse.ArgumentParser(description='Can3Tok Training')
+parser = argparse.ArgumentParser(description='Can3Tok Training (Inference-Fixed)')
 
 parser.add_argument('--batch_size',           type=int,   default=64)
 parser.add_argument('--num_epochs',           type=int,   default=1000)
 parser.add_argument('--lr',                   type=float, default=1e-4)
 parser.add_argument('--kl_weight',            type=float, default=1e-5)
-parser.add_argument('--weight_decay',         type=float, default=1e-2,
-    help='AdamW weight decay (default 1e-2, matches original YAML).')
-parser.add_argument('--warmup_steps',         type=int,   default=100,
-    help='Linear LR warmup steps. Scale with dataset: ~100 for 300 scenes, '
-         '~1000-2000 for full SceneSplat-7K. Set 0 to disable warmup.')
-parser.add_argument('--lr_min_ratio',         type=float, default=0.1,
-    help='Minimum LR as fraction of peak LR at end of cosine decay. '
-         'Default 0.1 = 10pct floor (e.g. 1e-4 decays to 1e-5). '
-         'Set 1.0 to keep constant LR (no decay).')
+parser.add_argument('--weight_decay',         type=float, default=1e-2)
+parser.add_argument('--warmup_steps',         type=int,   default=100)
+parser.add_argument('--lr_min_ratio',         type=float, default=0.1)
 parser.add_argument('--eval_every',           type=int,   default=20)
 parser.add_argument('--failure_threshold',    type=float, default=100.0)
 parser.add_argument('--train_scenes',         type=int,   default=None)
@@ -220,6 +229,13 @@ parser.add_argument('--no_label_input',       dest='label_input', action='store_
 parser.add_argument('--scale_norm_mode',      type=str, default='linear',
                     choices=['log', 'linear'])
 parser.add_argument('--color_loss_weight',    type=float, default=1.0)
+parser.add_argument('--scale_penalty_weight',    type=float, default=0.0,
+    help='Weight for scale penalty loss. 0 = disabled (default). '
+         'Penalises Gaussians with scale > scale_penalty_threshold. '
+         'Start with 0.1 and adjust. Safe to add to a trained checkpoint.')
+parser.add_argument('--scale_penalty_threshold', type=float, default=0.5,
+    help='Scale threshold in metres. Gaussians above this are penalised. '
+         'Default 0.5m (50cm). For indoor SceneSplat scenes ~0.3-0.5m is reasonable.')
 norm_grp = parser.add_mutually_exclusive_group()
 norm_grp.add_argument('--use_canonical_norm', dest='use_canonical_norm',
                       action='store_true', default=True)
@@ -302,6 +318,7 @@ if args.use_wandb:
         if args.query_decoder:            run_name += "_querydec"
         if enable_semantic:               run_name += f"_beta{args.segment_loss_weight}"
         if args.resume_checkpoint:        run_name += "_resumed"
+        run_name += "_inferencefixed"
         wandb_run = wandb.init(
             entity=args.wandb_entity, project=args.wandb_project,
             name=run_name, config=vars(args))
@@ -336,6 +353,7 @@ if args.token_cond:               tag += f"_tokencond{args.token_cond_approach}"
 if args.query_decoder:            tag += "_querydec"
 if enable_semantic:               tag += f"_beta{args.segment_loss_weight}"
 if not args.use_canonical_norm:   tag += "_raw"
+tag += "_inferencefixed"   # marks this as the inference-compatible version
 
 save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{tag}/"
 os.makedirs(save_path, exist_ok=True)
@@ -345,26 +363,27 @@ os.makedirs(save_path, exist_ok=True)
 # ============================================================================
 
 print(f"\n{'='*70}")
-print(f"CAN3TOK TRAINING")
+print(f"CAN3TOK TRAINING — INFERENCE-FIXED")
 print(f"{'='*70}")
+print(f"  INFERENCE FIX:")
+print(f"    AnchorPredFromTokens inside decode() predicts scaffold anchors from z")
+print(f"    DC added to decoder positions → output is absolute positions")
+print(f"    Training target positions: OFFSETS (coord - GT_hard_anchor, range ~±2m)")
+print(f"    DC supervised separately via L_anchor (AnchorPredFromTokens vs GT anchors)")
+print(f"    PLY save: decoder output used directly (absolute, DC already inside decode())")
+print(f"    Second-stage inference: pass scaffold_token_ids=None → fixed assignment")
 print(f"  color_residual:            {args.color_residual}")
 print(f"  scene_semantic_head:       {args.scene_semantic_head}")
 print(f"  position_scaffold:         {args.position_scaffold}")
-if args.position_scaffold:
-    print(f"  TRILINEAR ANCHOR SMOOTHING: active")
-    print(f"    position_offsets = coord - smooth_anchor  (no boundary seams)")
-    print(f"    PLY save: abs_pos = decoder_pos + smooth_anchor  (per-Gaussian)")
 print(f"  latent_disentangle:        {args.latent_disentangle}  (semantic_dims={args.semantic_dims})")
-print(f"  cross_recon_weight:        {args.cross_recon_weight}")
-print(f"  ortho_weight:              {args.ortho_weight}")
 print(f"  scene_layout_head:         {args.scene_layout_head}  (weight={args.layout_loss_weight})")
 print(f"  position_layout_residual:  {args.position_layout_residual}")
-print(f"  semantic_mode:             {effective_semantic_mode}")
-print(f"  ── NEW IDEAS ──────────────────────────────────────────────────────")
 print(f"  decoder_pos_enc:           {args.decoder_pos_enc}")
-print(f"  predict_seg_labels:        {args.predict_seg_labels}  (weight={args.seg_pred_weight})")
+print(f"  predict_seg_labels:        {args.predict_seg_labels}")
 print(f"  token_cond:                {args.token_cond}  approach={args.token_cond_approach}")
 print(f"  query_decoder:             {args.query_decoder}")
+print(f"  scale_penalty_weight:      {args.scale_penalty_weight}  "
+      f"threshold={args.scale_penalty_threshold}m  (0=disabled)")
 print(f"  Save: {save_path}")
 print(f"{'='*70}\n")
 
@@ -404,9 +423,7 @@ gs_autoencoder = instantiate_from_config(model_config)
 gs_autoencoder.to(device)
 optimizer = torch.optim.AdamW(
     gs_autoencoder.parameters(),
-    lr=args.lr,
-    betas=[0.9, 0.999],
-    weight_decay=args.weight_decay)
+    lr=args.lr, betas=[0.9, 0.999], weight_decay=args.weight_decay)
 
 # ============================================================================
 # CHECKPOINT LOADING
@@ -459,70 +476,35 @@ if args.resume_checkpoint:
     print(f"  Resumed epoch {start_epoch} (saved val L2: {best_val_loss:.4f})")
 
 # ============================================================================
-# LR SCHEDULER — linear warmup + cosine decay to lr_min_ratio floor
+# LR SCHEDULER
 # ============================================================================
-# Formula (per step):
-#   warmup phase  (step < warmup_steps):  lr = peak * step / warmup_steps
-#   cosine phase  (step >= warmup_steps): lr = lr_min + 0.5*(peak-lr_min)*(1+cos(π*t/T))
-#   where t = step - warmup_steps, T = total_steps - warmup_steps
-#
-# Scaling guide for warmup_steps when increasing dataset:
-#   300 scenes   → ~100  steps  (default)
-#   1000 scenes  → ~300  steps
-#   full 7K      → ~1000-2000 steps
-#
-# Scaling guide for lr_min_ratio:
-#   0.1 (default) → 10% floor, e.g. 1e-4 → 1e-5  (GaussianGPT-style)
-#   1.0           → constant LR, no decay (original behaviour)
 
 import math
 
 def build_lr_lambda(warmup_steps, total_steps, lr_min_ratio):
-    """
-    Returns a LambdaLR multiplier function.
-    The optimizer's base LR is the peak; this returns a multiplier in [lr_min_ratio, 1.0].
-    When resuming, pass the already-elapsed steps so the schedule continues
-    from where it left off rather than restarting.
-    """
     cosine_steps = max(total_steps - warmup_steps, 1)
-
     def lr_lambda(current_step):
         if warmup_steps > 0 and current_step < warmup_steps:
             return float(current_step) / float(warmup_steps)
         t = current_step - warmup_steps
         cosine_factor = 0.5 * (1.0 + math.cos(math.pi * t / cosine_steps))
         return lr_min_ratio + (1.0 - lr_min_ratio) * cosine_factor
-
     return lr_lambda
 
-# Total steps for the scheduler — from start_epoch to end, not from epoch 0.
-# This means a resumed run continues the cosine curve rather than restarting it.
-# Compute an approximate total training steps over the whole run
-# (dataset not loaded yet, so we estimate: train_scenes / batch_size * num_epochs)
 _approx_batches_per_epoch = max(1, (args.train_scenes or 300) // args.batch_size)
 _total_steps_full         = _approx_batches_per_epoch * args.num_epochs
 _elapsed_steps            = _approx_batches_per_epoch * start_epoch
 
-# The lambda sees step indices starting from 0 for the resumed portion,
-# so we offset by elapsed steps to place us correctly on the full curve.
 _lr_lambda = build_lr_lambda(
-    warmup_steps  = max(0, args.warmup_steps - _elapsed_steps),  # remaining warmup
+    warmup_steps  = max(0, args.warmup_steps - _elapsed_steps),
     total_steps   = _total_steps_full - _elapsed_steps,
     lr_min_ratio  = args.lr_min_ratio)
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
-# If resuming, the optimizer state (including momentum buffers) is already loaded.
-# We do NOT call scheduler.load_state_dict here — the lambda handles position
-# implicitly because we offset the step count above.
-
 print(f"\n  LR SCHEDULER: linear warmup + cosine decay")
-print(f"    peak LR:       {args.lr:.2e}")
-print(f"    floor LR:      {args.lr * args.lr_min_ratio:.2e}  ({args.lr_min_ratio*100:.0f}% of peak)")
-print(f"    warmup steps:  {args.warmup_steps}  (remaining: {max(0, args.warmup_steps - _elapsed_steps)})")
-print(f"    total steps:   ~{_total_steps_full:,}  (remaining: ~{_total_steps_full - _elapsed_steps:,})")
-if args.lr_min_ratio >= 1.0:
-    print(f"    NOTE: lr_min_ratio=1.0 — effectively constant LR (no decay)")
+print(f"    peak LR: {args.lr:.2e}  |  floor LR: {args.lr * args.lr_min_ratio:.2e}")
+print(f"    warmup steps: {args.warmup_steps}")
 
 # ============================================================================
 # DATASETS
@@ -591,6 +573,7 @@ _ckpt_meta = {
     'token_cond':                 args.token_cond,
     'token_cond_approach':        args.token_cond_approach,
     'query_decoder':              args.query_decoder,
+    'inference_fixed':            True,   # marks this checkpoint as inference-compatible
     'mean_color_weight':          args.mean_color_weight,
     'scene_semantic_weight':      args.scene_semantic_weight,
     'anchor_loss_weight':         args.anchor_loss_weight,
@@ -600,6 +583,8 @@ _ckpt_meta = {
     'jepa_idea1_weight':          args.jepa_idea1_weight,
     'seg_pred_weight':            args.seg_pred_weight,
     'color_loss_weight':          args.color_loss_weight,
+    'scale_penalty_weight':       args.scale_penalty_weight,
+    'scale_penalty_threshold':    args.scale_penalty_threshold,
     'use_canonical_norm':         args.use_canonical_norm,
     'scale_norm_mode':            args.scale_norm_mode,
     'weight_decay':               args.weight_decay,
@@ -619,21 +604,16 @@ def evaluate_model(model, dataloader, device, epoch=None):
     total_scene_sem_kl = 0.0
     total_anchor_loss  = 0.0
     total_layout_loss  = 0.0
-    total_spatial_kl   = 0.0
     total_seg_pred     = 0.0
     per_param  = {k: 0.0 for k in PARAM_SLICES}
     n_scenes   = 0
-    recon_preds_list       = []
-    recon_means_list       = []
-    recon_smooth_anch_list = []
-    recon_dc_list          = []
+    recon_preds_list   = []
+    recon_means_list   = []
     do_recon = (epoch is not None and epoch % args.recon_ply_freq == 0)
 
-    # PCA visualisation — collect a few scenes for CloudCompare export
-    pca_input_list      = []   # raw input Gaussian features [40000, 18]
-    pca_recon_list      = []   # reconstructed Gaussian params [40000, 14]
-    pca_seg_list        = []   # segment labels [40000]
-    pca_smooth_anch_list = []  # per-Gaussian smooth anchor [40000, 3] (for position recovery)
+    pca_input_list = []
+    pca_recon_list = []
+    pca_seg_list   = []
     do_pca = (epoch is not None and epoch % args.pca_vis_freq == 0)
 
     with torch.no_grad():
@@ -644,8 +624,9 @@ def evaluate_model(model, dataloader, device, epoch=None):
 
             sa_gpu  = (batch_data['scaffold_anchors'].float().to(device)
                        if need_scaffold_data else None)
+            # Always pass scaffold_token_ids when position_scaffold for accurate DC
             sti_gpu = (batch_data['scaffold_token_ids'].long().to(device)
-                       if args.query_decoder else None)
+                       if args.position_scaffold else None)
 
             (shape_embed, mu, log_var, z,
              UV_gs_recover, _) = model(
@@ -655,24 +636,34 @@ def evaluate_model(model, dataloader, device, epoch=None):
 
             mean_color_pred     = model.shape_model.last_mean_color_pred
             scene_semantic_pred = model.shape_model.last_scene_semantic_pred
-            anchor_pred         = model.shape_model.last_anchor_pred
+            # CHANGED: use AnchorPredFromTokens prediction
+            anchor_pred         = model.shape_model.last_predicted_anchors_from_tokens
             scene_layout_pred   = model.shape_model.last_scene_layout_pred
             seg_pred            = model.shape_model.last_seg_pred
 
-            # Position target
+            # TARGET — matches training: offset supervision for scaffold path
             target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]
+
             if args.position_scaffold:
-                position_offsets = batch_data['position_offsets'].float().to(device)
+                # Hard offsets as target; subtract predicted DC from pred to compare offset vs offset
+                pos_offset_gt = batch_data['position_offsets'].float().to(device)
                 target = target_abs.clone()
-                target[:, :, 0:3] = position_offsets   # smooth offsets from dataset
+                target[:, :, 0:3] = pos_offset_gt
+
+                pred_3d = UV_gs_recover.reshape(B, -1, 14).clone()
+                if anchor_pred is not None and sti_gpu is not None:
+                    idx_3d  = sti_gpu.unsqueeze(-1).expand(-1, -1, 3)
+                    pred_dc = torch.gather(anchor_pred, 1, idx_3d)
+                    pred_3d[:, :, 0:3] = pred_3d[:, :, 0:3] - pred_dc
             elif args.position_layout_residual:
                 pos_residuals = batch_data['position_residuals'].float().to(device)
                 target = target_abs.clone()
                 target[:, :, 0:3] = pos_residuals
+                pred_3d = UV_gs_recover.reshape(B, -1, 14)
             else:
-                target = target_abs
+                target  = target_abs
+                pred_3d = UV_gs_recover.reshape(B, -1, 14)
 
-            pred_3d    = UV_gs_recover.reshape(B, -1, 14)
             recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
             kl_loss    = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
 
@@ -682,6 +673,7 @@ def evaluate_model(model, dataloader, device, epoch=None):
                 p_s = batch_data['label_dist'].float().to(device)
                 total_scene_sem_kl += scene_semantic_kl_loss(
                     scene_semantic_pred, p_s).item() * B
+            # CHANGED: anchor_loss now supervises AnchorPredFromTokens
             if anchor_pred is not None and args.position_scaffold:
                 scaffold_anchors_gt = batch_data['scaffold_anchors'].float().to(device)
                 total_anchor_loss += F.mse_loss(anchor_pred, scaffold_anchors_gt).item() * B
@@ -701,64 +693,42 @@ def evaluate_model(model, dataloader, device, epoch=None):
             for k in per_param:
                 per_param[k] += ind[k]
 
+            # PLY save: decoder output is already absolute (DC added inside decode())
+            # Just add mean_color back if color_residual, then save directly.
             if do_recon and len(recon_preds_list) < args.recon_ply_num_scenes:
                 preds_np = pred_3d.cpu().numpy()
                 means_np = mean_color_gt.cpu().numpy()
-
-                # CHANGE 2: collect smooth_anchor [B, 40000, 3] from batch
-                # This is the per-Gaussian DC term for position recovery.
-                # No need to index by token_id — smooth_anchor is already per-Gaussian.
-                smooth_anch_np = batch_data['smooth_anchor'].numpy()   # [B, 40000, 3]
-
-                dc_np = (batch_data['dc_position'].numpy()
-                         if args.position_layout_residual else None)
                 for si in range(B):
                     if len(recon_preds_list) >= args.recon_ply_num_scenes:
                         break
                     recon_preds_list.append(preds_np[si])
                     recon_means_list.append(means_np[si])
-                    recon_smooth_anch_list.append(smooth_anch_np[si])   # [40000, 3]
-                    if dc_np is not None:
-                        recon_dc_list.append(dc_np[si])
 
-            # Collect PCA scenes — input, reconstruction, and segment labels
             if do_pca and len(pca_input_list) < args.pca_num_scenes:
-                seg_np = batch_data['segment_labels'].numpy()   # [B, 40000]
-                inp_np = UV_gs_batch.cpu().numpy()              # [B, 40000, 18]
-                rec_np = pred_3d.cpu().numpy()                  # [B, 40000, 14]
-                sa_np  = (batch_data['smooth_anchor'].numpy()   # [B, 40000, 3]
-                          if args.position_scaffold else None)
+                seg_np = batch_data['segment_labels'].numpy()
+                inp_np = UV_gs_batch.cpu().numpy()
+                rec_np = pred_3d.cpu().numpy()
                 for si in range(B):
                     if len(pca_input_list) >= args.pca_num_scenes:
                         break
                     pca_input_list.append(inp_np[si])
                     pca_recon_list.append(rec_np[si])
                     pca_seg_list.append(seg_np[si])
-                    if sa_np is not None:
-                        pca_smooth_anch_list.append(sa_np[si])
 
+    # PLY reconstruction: decoder output positions are already absolute
     if do_recon and recon_preds_list and save_path:
         try:
             all_preds = np.stack(recon_preds_list, axis=0)
 
-            # Color: add mean back
+            # Add mean color back (color residual path)
             if args.color_residual:
                 for si in range(len(all_preds)):
                     all_preds[si, :, 3:6] += recon_means_list[si]
                     all_preds[si, :, 3:6]  = np.clip(all_preds[si, :, 3:6], 0, 1)
 
-            # CHANGE 3: position recovery using smooth_anchor (no indexing needed)
-            # OLD: all_preds[si, :, 0:3] += recon_anch_list[si][recon_tids_list[si]]
-            # NEW: all_preds[si, :, 0:3] += recon_smooth_anch_list[si]
-            # The smooth_anchor already has shape [40000, 3] — one entry per Gaussian.
-            # This eliminates the voxel boundary seam because smooth_anchor varies
-            # continuously with position, unlike the hard voxel centroid lookup.
-            if args.position_scaffold:
-                for si in range(len(all_preds)):
-                    all_preds[si, :, 0:3] += recon_smooth_anch_list[si]  # [40000, 3]
-            elif args.position_layout_residual and recon_dc_list:
-                for si in range(len(all_preds)):
-                    all_preds[si, :, 0:3] += recon_dc_list[si]
+            # CHANGED: NO smooth_anchor addition here.
+            # Positions are already absolute — AnchorPredFromTokens DC was added inside decode().
+            # This is exactly what second-stage inference will do: use decoder output directly.
 
             recon_dir = Path(save_path) / "reconstructed_gaussians" / f"epoch_{epoch:03d}"
             save_reconstructed_gaussians(
@@ -768,56 +738,34 @@ def evaluate_model(model, dataloader, device, epoch=None):
         except Exception as e:
             print(f"  PLY save error: {e}")
 
-    # ── PCA visualisation (CloudCompare PLY with feature-coloured Gaussians) ──
+    # PCA visualisation
     if do_pca and pca_input_list and save_path:
         try:
             pca_dir = Path(save_path) / "pca_visualisations" / f"epoch_{epoch:03d}"
-            all_inputs = np.stack(pca_input_list, axis=0)   # [S, 40000, 18]
-            all_recons = np.stack(pca_recon_list, axis=0)   # [S, 40000, 14]
-            all_segs   = np.stack(pca_seg_list,   axis=0)   # [S, 40000]
+            all_inputs = np.stack(pca_input_list, axis=0)
+            all_recons = np.stack(pca_recon_list, axis=0)
+            all_segs   = np.stack(pca_seg_list,   axis=0)
             pca_dir.mkdir(parents=True, exist_ok=True)
 
-            saved = []
             for si in range(len(pca_input_list)):
-                # Positions: absolute xyz from input features (cols 4:7)
-                coords_in  = all_inputs[si, :, 4:7]   # [40000, 3]
-                # Features to PCA-colour:
-                #   - input:  full 18-dim input feature vector
-                #   - recon:  reconstructed 14-dim Gaussian params
-                #   - seg:    segment labels mapped to one-hot (for colour variety)
-                feats_in   = all_inputs[si]            # [40000, 18]
-                feats_rec  = all_recons[si]            # [40000, 14]
+                coords_in  = all_inputs[si, :, 4:7]
+                feats_in   = all_inputs[si]
+                feats_rec  = all_recons[si]
 
-                # Input point cloud coloured by PCA of input features
                 out_input = str(pca_dir / f"scene{si:02d}_input.ply")
-                visualize_semantic_features(
-                    coords=coords_in,
-                    features=feats_in,
-                    output_path=out_input,
-                    brightness=args.pca_brightness)
+                visualize_semantic_features(coords=coords_in, features=feats_in,
+                                            output_path=out_input, brightness=args.pca_brightness)
 
-                # Reconstructed point cloud coloured by PCA of recon params
-                # Use recon positions (add smooth_anchor back if scaffold)
-                coords_rec = feats_rec[:, 0:3].copy()
-                if args.position_scaffold and len(pca_smooth_anch_list) > si:
-                    coords_rec = coords_rec + pca_smooth_anch_list[si]
+                # CHANGED: decoder output positions are already absolute, no smooth_anchor needed
+                coords_rec = feats_rec[:, 0:3].copy()   # already absolute
                 out_recon = str(pca_dir / f"scene{si:02d}_recon.ply")
-                visualize_semantic_features(
-                    coords=coords_rec,
-                    features=feats_rec,
-                    output_path=out_recon,
-                    brightness=args.pca_brightness)
+                visualize_semantic_features(coords=coords_rec, features=feats_rec,
+                                            output_path=out_recon, brightness=args.pca_brightness)
 
-                saved.append(f"scene{si:02d}")
-
-            print(f"  PCA PLY saved → {pca_dir}  ({len(saved)} scenes: input+recon each)")
-        except TypeError as e:
-            import traceback
-            print(f"  PCA TypeError — check pca_feature_visualization.py signature:")
-            traceback.print_exc()
+            print(f"  PCA PLY saved → {pca_dir}  ({len(pca_input_list)} scenes)")
         except Exception as e:
             import traceback
-            print(f"  PCA visualisation error: {e}")
+            print(f"  PCA error: {e}")
             traceback.print_exc()
 
     model.train()
@@ -829,14 +777,13 @@ def evaluate_model(model, dataloader, device, epoch=None):
         'scene_semantic_kl': total_scene_sem_kl / n,
         'anchor_loss':       total_anchor_loss / n,
         'layout_loss':       total_layout_loss / n,
-        'spatial_kl':        total_spatial_kl / n,
         'seg_pred_loss':     total_seg_pred / n,
         **{f'{k}_loss': v / n for k, v in per_param.items()},
     }
 
 
 # ============================================================================
-# TRAINING LOOP (unchanged — loss computation is identical)
+# TRAINING LOOP
 # ============================================================================
 
 print(f"{'='*70}")
@@ -851,7 +798,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     epoch_loss = epoch_recon = epoch_kl = epoch_sem = 0.0
     epoch_color_pred = epoch_scene_semantic = epoch_anchor = 0.0
     epoch_layout = epoch_spatial = epoch_cross_recon = epoch_ortho = 0.0
-    epoch_seg_pred = 0.0
+    epoch_seg_pred = epoch_scale_penalty = 0.0
     epoch_pos = epoch_col = epoch_opa = epoch_scl = epoch_rot = 0.0
 
     for i_batch, batch_data in enumerate(trainDataLoader):
@@ -866,22 +813,18 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             if enable_semantic:
                 instance_labels = batch_data['instance_labels'].long().to(device)
 
-        scaffold_anchors    = None
-        scaffold_token_ids  = None
-        position_offsets    = None
+        scaffold_anchors   = None
+        scaffold_token_ids = None
         if need_scaffold_data:
             scaffold_anchors   = batch_data['scaffold_anchors'].float().to(device)
             scaffold_token_ids = batch_data['scaffold_token_ids'].long().to(device)
-        if args.position_scaffold:
-            # position_offsets from dataset = coord - smooth_anchor (trilinear)
-            # The training loss is computed against these smooth offsets.
-            # No code change here — the dataset already provides smooth values.
-            position_offsets   = batch_data['position_offsets'].float().to(device)
 
         optimizer.zero_grad()
 
-        sa_gpu  = scaffold_anchors   if need_scaffold_data else None
-        sti_gpu = scaffold_token_ids if args.query_decoder  else None
+        sa_gpu  = scaffold_anchors   if need_scaffold_data      else None
+        # CHANGED: always pass scaffold_token_ids when position_scaffold
+        # This enables accurate DC assignment inside decode()
+        sti_gpu = scaffold_token_ids if args.position_scaffold   else None
 
         (shape_embed, mu, log_var, z,
          UV_gs_recover, per_gaussian_features) = gs_autoencoder(
@@ -891,7 +834,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
         mean_color_pred     = gs_autoencoder.shape_model.last_mean_color_pred
         scene_semantic_pred = gs_autoencoder.shape_model.last_scene_semantic_pred
-        anchor_pred         = gs_autoencoder.shape_model.last_anchor_pred
+        # CHANGED: AnchorPredFromTokens replaces AnchorPositionHead
+        anchor_pred         = gs_autoencoder.shape_model.last_predicted_anchors_from_tokens
         scene_layout_pred   = gs_autoencoder.shape_model.last_scene_layout_pred
         seg_pred_logits     = gs_autoencoder.shape_model.last_seg_pred
         _mu_s               = gs_autoencoder.shape_model._mu_s_cache
@@ -904,19 +848,40 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             spatial_semantic_pred = gs_autoencoder.shape_model.spatial_semantic_module(
                 gs_autoencoder.shape_model._shape_embed_cache, scaffold_anchors_jepa)
 
-        # Reconstruction target
+        # RECONSTRUCTION TARGET
+        # OFFSET SUPERVISION (position_scaffold path):
+        #   L_recon supervises raw position offsets (coord - GT_hard_anchor, range ~±2m).
+        #   L_anchor separately supervises the DC term (AnchorPredFromTokens vs GT anchors).
+        #   This keeps the two losses orthogonal and reduces position dynamic range 5×.
+        #   pred_3d positions = raw_offset + predicted_DC (added inside decode()).
+        #   We subtract predicted_DC before computing L_recon so we compare offset vs offset.
+        #   PLY save is unaffected — decoder output is still absolute (DC stays in output).
         target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]
+
         if args.position_scaffold:
+            # Build offset target: coord - GT_scaffold_anchors[scaffold_token_ids]
+            # This is the hard offset already in the batch as 'position_offsets'.
+            pos_offset_gt = batch_data['position_offsets'].float().to(device)  # [B, 40000, 3]
             target = target_abs.clone()
-            target[:, :, 0:3] = position_offsets   # smooth offsets (trilinear DC)
+            target[:, :, 0:3] = pos_offset_gt   # range ~±2m vs ±10m absolute
+
+            # Subtract predicted DC from pred_3d positions so loss is offset vs offset.
+            # anchor_pred is None only if position_scaffold=False, which cannot happen here.
+            pred_3d = UV_gs_recover.reshape(B, -1, 14).clone()
+            if anchor_pred is not None:
+                # Gather predicted anchor for each Gaussian using GT spatial assignment
+                idx_3d  = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, 3)
+                pred_dc = torch.gather(anchor_pred, 1, idx_3d)   # [B, 40000, 3]
+                pred_3d[:, :, 0:3] = pred_3d[:, :, 0:3] - pred_dc  # back to raw offset
         elif args.position_layout_residual:
             pos_residuals = batch_data['position_residuals'].float().to(device)
             target = target_abs.clone()
             target[:, :, 0:3] = pos_residuals
+            pred_3d = UV_gs_recover.reshape(B, -1, 14)
         else:
-            target = target_abs
+            target  = target_abs
+            pred_3d = UV_gs_recover.reshape(B, -1, 14)
 
-        pred_3d    = UV_gs_recover.reshape(B, -1, 14)
         recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
 
         KL_loss = -0.5 * torch.sum(
@@ -931,11 +896,11 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             p_s = batch_data['label_dist'].float().to(device)
             scene_semantic_loss = scene_semantic_kl_loss(scene_semantic_pred, p_s)
 
+        # CHANGED: anchor_loss now supervises AnchorPredFromTokens (inside decoder)
+        # vs GT scaffold_anchors from dataset.
+        # Gradient: L_anchor → AnchorPredFromTokens → transformer tokens → post_kl → z
         anchor_loss = torch.tensor(0.0, device=device)
         if anchor_pred is not None and args.position_scaffold and scaffold_anchors is not None:
-            # anchor_loss: AnchorPositionHead predicts voxel centroids
-            # supervised against the per-voxel mean positions (scaffold_anchors)
-            # Unchanged — still uses hard scaffold_anchors for the supervision signal
             anchor_loss = F.mse_loss(anchor_pred, scaffold_anchors)
 
         layout_loss = torch.tensor(0.0, device=device)
@@ -994,13 +959,50 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 return_semantic_features=False, shape_embed=se_shifted,
                 scaffold_anchors=scaffold_anchors,
                 scaffold_token_ids=scaffold_token_ids)
-            pred_cross_3d    = UV_cross.reshape(B, -1, 14)
-            cross_recon_loss = compute_cross_recon_loss(pred_cross_3d, target, B)
+            pred_cross_3d = UV_cross.reshape(B, -1, 14)
+
+            # CROSS-RECON POSITION FIX — offset space comparison.
+            # pred_cross_3d positions = raw_offset + cross_DC, where cross_DC comes
+            # from AnchorPredFromTokens run on the mixed latent z_cross=[mu_s_B,mu_g_A].
+            # That DC is spatially incoherent (neither scene A nor B).
+            # Solution: subtract cross_DC (DETACHED) from pred positions to recover
+            # raw offsets, then compare against the offset target.
+            # Detaching cross_DC ensures gradients from cross-recon do NOT flow through
+            # AnchorPredFromTokens — preventing the anchor-collapse-to-zero that caused
+            # all positions to compress into a blob in SuperSplat.
+            # This gives position cross-recon in offset space, consistent with
+            # offset supervision, without contaminating the DC gradient path.
+            if args.position_scaffold:
+                cross_anchors = gs_autoencoder.shape_model.last_predicted_anchors_from_tokens
+                if cross_anchors is not None and scaffold_token_ids is not None:
+                    idx_3d_cr = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, 3)
+                    cross_dc  = torch.gather(cross_anchors, 1, idx_3d_cr).detach()
+                    pred_cross_for_loss = pred_cross_3d.clone()
+                    pred_cross_for_loss[:, :, 0:3] = pred_cross_3d[:, :, 0:3] - cross_dc
+                else:
+                    pred_cross_for_loss = pred_cross_3d
+            else:
+                pred_cross_for_loss = pred_cross_3d
+
+            cross_recon_loss = compute_cross_recon_loss(pred_cross_for_loss, target, B)
 
         ortho_loss = torch.tensor(0.0, device=device)
         if (args.latent_disentangle and args.ortho_weight > 0
                 and _mu_s is not None and _mu_g is not None and B > 1):
             ortho_loss = compute_orthogonality_loss(_mu_s, _mu_g)
+
+        # Scale penalty — penalises Gaussians with scale > threshold (metres).
+        # pred_3d[:,:,7:10] are post-exp scale values. DC subtraction only affected
+        # position (0:3) so scale values here are the true decoder outputs.
+        # Safe to enable on a pre-trained checkpoint — acts as fine-tuning signal.
+        scale_penalty_loss = torch.tensor(0.0, device=device)
+        if args.scale_penalty_weight > 0:
+            # Use original UV_gs_recover (not pred_3d with DC subtracted) for scale.
+            # Both are identical for scale — DC subtraction only touches position — but
+            # using the raw output makes the intent clearer.
+            raw_pred_for_scale = UV_gs_recover.reshape(B, -1, 14)
+            scale_penalty_loss = compute_scale_penalty(
+                raw_pred_for_scale, threshold=args.scale_penalty_threshold)
 
         loss = (recon_loss
                 + args.kl_weight             * KL_loss
@@ -1012,10 +1014,11 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 + args.cross_recon_weight    * cross_recon_loss
                 + args.ortho_weight          * ortho_loss
                 + args.seg_pred_weight       * seg_pred_loss
+                + args.scale_penalty_weight  * scale_penalty_loss
                 + semantic_loss)
         loss.backward()
         optimizer.step()
-        scheduler.step()   # advance LR schedule one step
+        scheduler.step()
 
         ind = compute_individual_losses(pred_3d, target)
         epoch_loss           += loss.item()
@@ -1030,6 +1033,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         epoch_cross_recon    += cross_recon_loss.item()
         epoch_ortho          += ortho_loss.item()
         epoch_seg_pred       += seg_pred_loss.item()
+        epoch_scale_penalty  += scale_penalty_loss.item()
         epoch_pos += ind['position']
         epoch_col += ind['color']
         epoch_opa += ind['opacity']
@@ -1038,24 +1042,29 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
         if epoch == start_epoch and i_batch == 0:
             print(f"\nEPOCH {epoch} DIAGNOSTIC (batch 0):")
-            print(f"  mu range:    [{mu.min().item():.3f}, {mu.max().item():.3f}]")
-            print(f"  recon_loss:  {recon_loss.item():.4f}")
+            print(f"  mu range:        [{mu.min().item():.3f}, {mu.max().item():.3f}]")
+            print(f"  recon_loss:      {recon_loss.item():.4f}  (vs position OFFSETS ±~2m)")
             if args.position_scaffold:
-                pos_off_np  = batch_data['position_offsets'].numpy()
-                smooth_a_np = batch_data['smooth_anchor'].numpy()
-                pos_abs_np  = UV_gs_batch[:, :, 4:7].cpu().numpy()
-                print(f"  [TRILINEAR] smooth offset range: [{pos_off_np.min():.3f}, {pos_off_np.max():.3f}]m")
-                print(f"  [TRILINEAR] absolute pos range:  [{pos_abs_np.min():.3f}, {pos_abs_np.max():.3f}]m")
-                reduction = pos_abs_np.std() / (pos_off_np.std() + 1e-8)
-                print(f"  [TRILINEAR] dynamic range reduction: {reduction:.1f}x")
+                pos_abs_np    = UV_gs_batch[:, :, 4:7].cpu().numpy()
+                pos_offset_np = batch_data['position_offsets'].numpy()
+                pred_pos_off  = pred_3d[:, :, 0:3].detach().cpu().numpy()
+                print(f"  [OFFSET SUPERVISION] GT abs pos range:   [{pos_abs_np.min():.3f}, {pos_abs_np.max():.3f}]m")
+                print(f"  [OFFSET SUPERVISION] GT offset range:    [{pos_offset_np.min():.3f}, {pos_offset_np.max():.3f}]m  (~5x smaller)")
+                print(f"  [OFFSET SUPERVISION] Pred offset range:  [{pred_pos_off.min():.3f}, {pred_pos_off.max():.3f}]m")
+                if anchor_pred is not None:
+                    anch_np = anchor_pred.detach().cpu().numpy()
+                    print(f"  [AnchorPredFromTokens] range: [{anch_np.min():.3f}, {anch_np.max():.3f}]m")
+                    print(f"  anchor_loss: {anchor_loss.item():.4f}  (DC supervised separately)")
             if args.latent_disentangle and _mu_s is not None:
                 print(f"  mu_s range:  [{_mu_s.min().item():.3f}, {_mu_s.max().item():.3f}]")
                 print(f"  cross_recon: {cross_recon_loss.item():.4f}")
-                print(f"  ortho:       {ortho_loss.item():.6f}")
-            if args.token_cond:
-                print(f"  token_cond approach {args.token_cond_approach}")
-            if args.scene_layout_head and scene_layout_pred is not None:
-                print(f"  layout_loss: {layout_loss.item():.4f}")
+            if args.scale_penalty_weight > 0:
+                scale_np = raw_pred_for_scale[:, :, 7:10].detach().cpu().numpy()
+                print(f"  [SCALE PENALTY] mean scale: {scale_np.mean():.4f}m  "
+                      f"max: {scale_np.max():.4f}m  threshold: {args.scale_penalty_threshold}m")
+                print(f"  [SCALE PENALTY] frac above threshold: "
+                      f"{(scale_np > args.scale_penalty_threshold).mean()*100:.1f}%")
+                print(f"  scale_penalty_loss: {scale_penalty_loss.item():.6f}")
 
         if wandb_enabled:
             log = {
@@ -1069,6 +1078,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 "train/step_cross_recon":    cross_recon_loss.item(),
                 "train/step_ortho":          ortho_loss.item(),
                 "train/step_seg_pred":       seg_pred_loss.item(),
+                "train/step_scale_penalty":  scale_penalty_loss.item(),
                 "train/step_position":       ind['position'],
                 "train/step_color":          ind['color'],
                 "train/step_opacity":        ind['opacity'],
@@ -1084,10 +1094,11 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     nb = len(trainDataLoader)
     current_lr = scheduler.get_last_lr()[0]
     print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | Recon={epoch_recon/nb:.4f} | "
-          f"KL={epoch_kl/nb:.4f} | InfoNCE={epoch_sem/nb:.4f} | "
+          f"KL={epoch_kl/nb:.4f} | Anchor={epoch_anchor/nb:.4f} | "
           f"ColorPred={epoch_color_pred/nb:.6f} | SceneSem={epoch_scene_semantic/nb:.4f} | "
           f"Layout={epoch_layout/nb:.4f} | CrossRecon={epoch_cross_recon/nb:.4f} | "
-          f"SegPred={epoch_seg_pred/nb:.4f} | Ortho={epoch_ortho/nb:.6f} | LR={current_lr:.2e}")
+          f"SegPred={epoch_seg_pred/nb:.4f} | ScalePenalty={epoch_scale_penalty/nb:.6f} | "
+          f"Ortho={epoch_ortho/nb:.6f} | LR={current_lr:.2e}")
     print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
           f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | Rot={epoch_rot/nb:.3f}")
 
@@ -1095,7 +1106,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
     if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
         print(f"\n--- Validation (epoch {epoch}) ---")
         val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=epoch)
-        pos_label = ('(smooth offsets)' if args.position_scaffold else
+        pos_label = ('(offsets ±~2m, DC separate)' if args.position_scaffold else
                      '(residuals)' if args.position_layout_residual else '(absolute)')
         print(f"  L2:              {val_metrics['avg_l2_error']:.4f}")
         print(f"  Position:        {val_metrics['position_loss']:.4f}  {pos_label}")
@@ -1108,11 +1119,14 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         if args.scene_semantic_head:
             print(f"  SceneSemanticKL: {val_metrics['scene_semantic_kl']:.4f}")
         if args.position_scaffold:
-            print(f"  AnchorMSE:       {val_metrics['anchor_loss']:.4f}")
+            print(f"  AnchorMSE:       {val_metrics['anchor_loss']:.4f}  (AnchorPredFromTokens)")
         if args.scene_layout_head:
             print(f"  LayoutMSE:       {val_metrics['layout_loss']:.4f}")
         if args.predict_seg_labels:
             print(f"  SegPredCE:       {val_metrics['seg_pred_loss']:.4f}")
+        if args.scale_penalty_weight > 0:
+            print(f"  ScalePenalty:    {val_metrics['scale_loss']:.4f}  "
+                  f"(Scl loss shown; threshold={args.scale_penalty_threshold}m)")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
@@ -1177,6 +1191,12 @@ torch.save({
 }, os.path.join(save_path, "final.pth"))
 
 print(f"\nSaved: {save_path}final.pth")
+print(f"\nINFERENCE NOTE:")
+print(f"  At second-stage diffusion inference, call decode() with scaffold_token_ids=None.")
+print(f"  AnchorPredFromTokens uses fixed assignment j→j*512//40000 for DC.")
+print(f"  Decoder output positions are absolute (raw_offset + predicted_DC).")
+print(f"  Add mean_color back if color_residual=True, then save PLY directly.")
+print(f"  L_recon was trained on offsets; L_anchor trained DC separately — both are baked into weights.")
 if wandb_enabled:
     wandb_run.summary.update({
         "final_val_l2": final_metrics['avg_l2_error'],
