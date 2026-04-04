@@ -54,6 +54,9 @@ from distribution_loss import compute_distribution_loss
 from pca_feature_visualization import visualize_semantic_features
 from gs_ply_reconstructor import save_reconstructed_gaussians
 
+from accelerate import Accelerator
+from accelerate import DistributedDataParallelKwargs
+
 import sys
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
@@ -297,11 +300,30 @@ need_segment_labels     = (enable_semantic or args.scene_semantic_head or
                            args.jepa_idea1 or args.predict_seg_labels)
 
 # ============================================================================
+# ACCELERATE INIT
+# ============================================================================
+# Must be created before any device assignment or WandB init.
+# mixed_precision='bf16' is optimal for H100s; change to 'no' to disable.
+# The config file (accelerate_config.yaml) controls num_gpus and strategy.
+# find_unused_parameters=True is required because the model has conditionally
+# inactive parameters (kl_emb_proj_mean/var from parent class, geo_decoder)
+# that never receive gradients in the GS training path.
+# Without this DDP raises a 'reduction not finished' error on the 2nd iteration.
+# static_graph=True is needed because the model uses gradient checkpointing
+# (custom checkpoint.py). DDP sees the same parameters fire twice per backward
+# (once real forward, once checkpointing recompute) and raises "marked ready twice".
+# static_graph=True tells DDP the graph is fixed every iteration, which is true
+# for our model, and removes the restriction on parameters firing multiple times.
+# find_unused_parameters is still needed for the inactive parent-class modules.
+_ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True, static_graph=True)
+accelerator = Accelerator(kwargs_handlers=[_ddp_kwargs])
+
+# ============================================================================
 # W&B
 # ============================================================================
 
 wandb_enabled = False
-if args.use_wandb:
+if args.use_wandb and accelerator.is_main_process:
     try:
         import wandb
         job_id   = os.environ.get('SLURM_JOB_ID', 'local')
@@ -331,8 +353,8 @@ if args.use_wandb:
 # DEVICE + PATHS
 # ============================================================================
 
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-device    = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# os.environ["CUDA_VISIBLE_DEVICES"] removed — Accelerate assigns GPUs automatically
+device    = accelerator.device   # set by Accelerate based on config / SLURM env
 data_path = "/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs"
 
 job_id = os.environ.get('SLURM_JOB_ID', None)
@@ -362,30 +384,34 @@ os.makedirs(save_path, exist_ok=True)
 # STARTUP SUMMARY
 # ============================================================================
 
-print(f"\n{'='*70}")
-print(f"CAN3TOK TRAINING — INFERENCE-FIXED")
-print(f"{'='*70}")
-print(f"  INFERENCE FIX:")
-print(f"    AnchorPredFromTokens inside decode() predicts scaffold anchors from z")
-print(f"    DC added to decoder positions → output is absolute positions")
-print(f"    Training target positions: OFFSETS (coord - GT_hard_anchor, range ~±2m)")
-print(f"    DC supervised separately via L_anchor (AnchorPredFromTokens vs GT anchors)")
-print(f"    PLY save: decoder output used directly (absolute, DC already inside decode())")
-print(f"    Second-stage inference: pass scaffold_token_ids=None → fixed assignment")
-print(f"  color_residual:            {args.color_residual}")
-print(f"  scene_semantic_head:       {args.scene_semantic_head}")
-print(f"  position_scaffold:         {args.position_scaffold}")
-print(f"  latent_disentangle:        {args.latent_disentangle}  (semantic_dims={args.semantic_dims})")
-print(f"  scene_layout_head:         {args.scene_layout_head}  (weight={args.layout_loss_weight})")
-print(f"  position_layout_residual:  {args.position_layout_residual}")
-print(f"  decoder_pos_enc:           {args.decoder_pos_enc}")
-print(f"  predict_seg_labels:        {args.predict_seg_labels}")
-print(f"  token_cond:                {args.token_cond}  approach={args.token_cond_approach}")
-print(f"  query_decoder:             {args.query_decoder}")
-print(f"  scale_penalty_weight:      {args.scale_penalty_weight}  "
-      f"threshold={args.scale_penalty_threshold}m  (0=disabled)")
-print(f"  Save: {save_path}")
-print(f"{'='*70}\n")
+if accelerator.is_main_process:
+    print(f"\n{'='*70}")
+    print(f"CAN3TOK TRAINING — INFERENCE-FIXED")
+    print(f"{'='*70}")
+    print(f"  INFERENCE FIX:")
+    print(f"    AnchorPredFromTokens inside decode() predicts scaffold anchors from z")
+    print(f"    DC added to decoder positions → output is absolute positions")
+    print(f"    Training target positions: OFFSETS (coord - GT_hard_anchor, range ~±2m)")
+    print(f"    DC supervised separately via L_anchor (AnchorPredFromTokens vs GT anchors)")
+    print(f"    PLY save: decoder output used directly (absolute, DC already inside decode())")
+    print(f"    Second-stage inference: pass scaffold_token_ids=None → fixed assignment")
+    print(f"  color_residual:            {args.color_residual}")
+    print(f"  scene_semantic_head:       {args.scene_semantic_head}")
+    print(f"  position_scaffold:         {args.position_scaffold}")
+    print(f"  latent_disentangle:        {args.latent_disentangle}  (semantic_dims={args.semantic_dims})")
+    print(f"  scene_layout_head:         {args.scene_layout_head}  (weight={args.layout_loss_weight})")
+    print(f"  position_layout_residual:  {args.position_layout_residual}")
+    print(f"  decoder_pos_enc:           {args.decoder_pos_enc}")
+    print(f"  predict_seg_labels:        {args.predict_seg_labels}")
+    print(f"  token_cond:                {args.token_cond}  approach={args.token_cond_approach}")
+    print(f"  query_decoder:             {args.query_decoder}")
+    print(f"  scale_penalty_weight:      {args.scale_penalty_weight}  "
+          f"threshold={args.scale_penalty_threshold}m  (0=disabled)")
+    print(f"  Save: {save_path}")
+    print(f"  Accelerate: {accelerator.num_processes} GPU(s) | "
+          f"per-GPU batch: {args.batch_size} | "
+          f"effective batch: {args.batch_size * accelerator.num_processes}")
+    print(f"{'='*70}\n")
 
 # ============================================================================
 # MODEL
@@ -491,7 +517,9 @@ def build_lr_lambda(warmup_steps, total_steps, lr_min_ratio):
         return lr_min_ratio + (1.0 - lr_min_ratio) * cosine_factor
     return lr_lambda
 
-_approx_batches_per_epoch = max(1, (args.train_scenes or 300) // args.batch_size)
+# Divide by num_processes: with DDP each GPU sees train_scenes/num_processes scenes.
+# This keeps the LR schedule calibrated correctly regardless of GPU count.
+_approx_batches_per_epoch = max(1, (args.train_scenes or 300) // (args.batch_size * accelerator.num_processes))
 _total_steps_full         = _approx_batches_per_epoch * args.num_epochs
 _elapsed_steps            = _approx_batches_per_epoch * start_epoch
 
@@ -524,9 +552,13 @@ gs_dataset_train = gs_dataset(
     scene_layout_head=args.scene_layout_head,
     jepa_idea1=args.jepa_idea1,
     position_layout_residual=args.position_layout_residual)
+# shuffle=False here — Accelerate.prepare() adds DistributedSampler(shuffle=True)
+# internally. Passing shuffle=True with persistent_workers=True prevents Accelerate
+# from properly replacing the sampler, causing each GPU to see ALL scenes instead of
+# its share (300 vs 75), tripling actual steps and exhausting the LR schedule 3× faster.
 trainDataLoader = Data.DataLoader(
     dataset=gs_dataset_train, batch_size=args.batch_size,
-    shuffle=True, num_workers=9, pin_memory=True, persistent_workers=True)
+    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=False)
 
 print(f"\n--- Validation Dataset ---")
 gs_dataset_val = gs_dataset(
@@ -542,12 +574,23 @@ gs_dataset_val = gs_dataset(
     position_layout_residual=args.position_layout_residual)
 valDataLoader = Data.DataLoader(
     dataset=gs_dataset_val, batch_size=args.batch_size,
-    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True)
+    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=False)
 
-print(f"\n{'='*70}")
-print(f"  Train: {len(gs_dataset_train)} scenes, {len(trainDataLoader)} batches/epoch")
-print(f"  Val:   {len(gs_dataset_val)} scenes,  {len(valDataLoader)} batches")
-print(f"{'='*70}\n")
+if accelerator.is_main_process:
+    print(f"\n{'='*70}")
+    print(f"  Train: {len(gs_dataset_train)} scenes, {len(trainDataLoader)} batches/epoch")
+    print(f"  Val:   {len(gs_dataset_val)} scenes,  {len(valDataLoader)} batches")
+    print(f"{'='*70}\n")
+
+# ============================================================================
+# ACCELERATE PREPARE — distribute across GPUs
+# ============================================================================
+# Must happen AFTER checkpoint loading (which loaded weights onto single device)
+# and AFTER scheduler/dataloaders are created.
+# After prepare: gs_autoencoder is wrapped (DDP/FSDP), raw_model exposes plain attrs.
+gs_autoencoder, optimizer, trainDataLoader, valDataLoader, scheduler = accelerator.prepare(
+    gs_autoencoder, optimizer, trainDataLoader, valDataLoader, scheduler)
+raw_model = accelerator.unwrap_model(gs_autoencoder)
 
 # ============================================================================
 # CHECKPOINT METADATA
@@ -596,7 +639,7 @@ _ckpt_meta = {
 # EVALUATION
 # ============================================================================
 
-def evaluate_model(model, dataloader, device, epoch=None):
+def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None):
     model.eval()
     total_l2           = 0.0
     total_kl           = 0.0
@@ -634,15 +677,19 @@ def evaluate_model(model, dataloader, device, epoch=None):
                 scaffold_anchors=sa_gpu,
                 scaffold_token_ids=sti_gpu)
 
-            mean_color_pred     = model.shape_model.last_mean_color_pred
-            scene_semantic_pred = model.shape_model.last_scene_semantic_pred
+            mean_color_pred     = raw_model.shape_model.last_mean_color_pred
+            scene_semantic_pred = raw_model.shape_model.last_scene_semantic_pred
             # CHANGED: use AnchorPredFromTokens prediction
-            anchor_pred         = model.shape_model.last_predicted_anchors_from_tokens
-            scene_layout_pred   = model.shape_model.last_scene_layout_pred
-            seg_pred            = model.shape_model.last_seg_pred
+            anchor_pred         = raw_model.shape_model.last_predicted_anchors_from_tokens
+            scene_layout_pred   = raw_model.shape_model.last_scene_layout_pred
+            seg_pred            = raw_model.shape_model.last_seg_pred
 
             # TARGET — matches training: offset supervision for scaffold path
             target_abs = UV_gs_batch[:, :, GEOMETRIC_INDICES]
+
+            # pred_abs always holds absolute positions — used for PLY save.
+            # UV_gs_recover has absolute positions because DC is added inside decode().
+            pred_abs = UV_gs_recover.reshape(B, -1, 14)
 
             if args.position_scaffold:
                 # Hard offsets as target; subtract predicted DC from pred to compare offset vs offset
@@ -650,7 +697,7 @@ def evaluate_model(model, dataloader, device, epoch=None):
                 target = target_abs.clone()
                 target[:, :, 0:3] = pos_offset_gt
 
-                pred_3d = UV_gs_recover.reshape(B, -1, 14).clone()
+                pred_3d = pred_abs.clone()
                 if anchor_pred is not None and sti_gpu is not None:
                     idx_3d  = sti_gpu.unsqueeze(-1).expand(-1, -1, 3)
                     pred_dc = torch.gather(anchor_pred, 1, idx_3d)
@@ -659,10 +706,11 @@ def evaluate_model(model, dataloader, device, epoch=None):
                 pos_residuals = batch_data['position_residuals'].float().to(device)
                 target = target_abs.clone()
                 target[:, :, 0:3] = pos_residuals
-                pred_3d = UV_gs_recover.reshape(B, -1, 14)
+                pred_3d = pred_abs.clone()
+                pred_3d[:, :, 0:3] = pred_3d[:, :, 0:3]  # absolute, no change
             else:
                 target  = target_abs
-                pred_3d = UV_gs_recover.reshape(B, -1, 14)
+                pred_3d = pred_abs
 
             recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
             kl_loss    = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
@@ -689,14 +737,23 @@ def evaluate_model(model, dataloader, device, epoch=None):
             total_l2 += recon_loss.item()
             total_kl += kl_loss.sum().item()
             n_scenes  += B
+            # Track absolute position range for monitoring (catches position collapse early)
+            if n_scenes <= B:  # first batch only to keep it cheap
+                _abs_pos = pred_abs[:, :, 0:3].cpu()
+                _gt_pos  = UV_gs_batch[:, :, 4:7].cpu()
+                _pos_abs_min = _abs_pos.min().item()
+                _pos_abs_max = _abs_pos.max().item()
+                _pos_gt_range = (_gt_pos.max() - _gt_pos.min()).item() / 2.0
             ind = compute_individual_losses(pred_3d, target)
             for k in per_param:
                 per_param[k] += ind[k]
 
-            # PLY save: decoder output is already absolute (DC added inside decode())
-            # Just add mean_color back if color_residual, then save directly.
+            # PLY save: use pred_abs (absolute positions, DC already in decode()).
+            # pred_3d has DC subtracted for loss computation — saving that would give
+            # offsets (~±2m) instead of absolute scene positions (~±9m), causing the
+            # "position collapse blob" artifact in SuperSplat even when training is fine.
             if do_recon and len(recon_preds_list) < args.recon_ply_num_scenes:
-                preds_np = pred_3d.cpu().numpy()
+                preds_np = pred_abs.cpu().numpy()
                 means_np = mean_color_gt.cpu().numpy()
                 for si in range(B):
                     if len(recon_preds_list) >= args.recon_ply_num_scenes:
@@ -705,9 +762,9 @@ def evaluate_model(model, dataloader, device, epoch=None):
                     recon_means_list.append(means_np[si])
 
             if do_pca and len(pca_input_list) < args.pca_num_scenes:
-                seg_np = batch_data['segment_labels'].numpy()
+                seg_np = batch_data['segment_labels'].cpu().numpy()
                 inp_np = UV_gs_batch.cpu().numpy()
-                rec_np = pred_3d.cpu().numpy()
+                rec_np = pred_abs.cpu().numpy()   # absolute positions for PCA coords
                 for si in range(B):
                     if len(pca_input_list) >= args.pca_num_scenes:
                         break
@@ -715,8 +772,8 @@ def evaluate_model(model, dataloader, device, epoch=None):
                     pca_recon_list.append(rec_np[si])
                     pca_seg_list.append(seg_np[si])
 
-    # PLY reconstruction: decoder output positions are already absolute
-    if do_recon and recon_preds_list and save_path:
+    # PLY reconstruction: only on main process (saves disk IO, avoids race conditions)
+    if do_recon and recon_preds_list and save_path and accelerator.is_main_process:
         try:
             all_preds = np.stack(recon_preds_list, axis=0)
 
@@ -739,7 +796,7 @@ def evaluate_model(model, dataloader, device, epoch=None):
             print(f"  PLY save error: {e}")
 
     # PCA visualisation
-    if do_pca and pca_input_list and save_path:
+    if do_pca and pca_input_list and save_path and accelerator.is_main_process:
         try:
             pca_dir = Path(save_path) / "pca_visualisations" / f"epoch_{epoch:03d}"
             all_inputs = np.stack(pca_input_list, axis=0)
@@ -772,6 +829,10 @@ def evaluate_model(model, dataloader, device, epoch=None):
     n = max(n_scenes, 1)
     return {
         'avg_l2_error':      total_l2,
+        'pos_abs_range':     _pos_abs_max - _pos_abs_min if n_scenes > 0 else 0.0,
+        'pos_abs_min':       _pos_abs_min if n_scenes > 0 else 0.0,
+        'pos_abs_max':       _pos_abs_max if n_scenes > 0 else 0.0,
+        'pos_gt_range':      _pos_gt_range if n_scenes > 0 else 0.0,
         'avg_kl':            total_kl / n,
         'color_pred_loss':   total_color_pred / n,
         'scene_semantic_kl': total_scene_sem_kl / n,
@@ -792,7 +853,8 @@ print(f"{'='*70}\n")
 
 global_step = 0
 
-for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
+for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
+                  disable=not accelerator.is_main_process):
     gs_autoencoder.train()
 
     epoch_loss = epoch_recon = epoch_kl = epoch_sem = 0.0
@@ -832,21 +894,21 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             scaffold_anchors=sa_gpu,
             scaffold_token_ids=sti_gpu)
 
-        mean_color_pred     = gs_autoencoder.shape_model.last_mean_color_pred
-        scene_semantic_pred = gs_autoencoder.shape_model.last_scene_semantic_pred
+        mean_color_pred     = raw_model.shape_model.last_mean_color_pred
+        scene_semantic_pred = raw_model.shape_model.last_scene_semantic_pred
         # CHANGED: AnchorPredFromTokens replaces AnchorPositionHead
-        anchor_pred         = gs_autoencoder.shape_model.last_predicted_anchors_from_tokens
-        scene_layout_pred   = gs_autoencoder.shape_model.last_scene_layout_pred
-        seg_pred_logits     = gs_autoencoder.shape_model.last_seg_pred
-        _mu_s               = gs_autoencoder.shape_model._mu_s_cache
-        _mu_g               = gs_autoencoder.shape_model._mu_g_cache
+        anchor_pred         = raw_model.shape_model.last_predicted_anchors_from_tokens
+        scene_layout_pred   = raw_model.shape_model.last_scene_layout_pred
+        seg_pred_logits     = raw_model.shape_model.last_seg_pred
+        _mu_s               = raw_model.shape_model._mu_s_cache
+        _mu_g               = raw_model.shape_model._mu_g_cache
 
         spatial_semantic_pred = None
         if (args.jepa_idea1 and
-                gs_autoencoder.shape_model.spatial_semantic_module is not None):
+                raw_model.shape_model.spatial_semantic_module is not None):
             scaffold_anchors_jepa = batch_data['scaffold_anchors'].float().to(device)
-            spatial_semantic_pred = gs_autoencoder.shape_model.spatial_semantic_module(
-                gs_autoencoder.shape_model._shape_embed_cache, scaffold_anchors_jepa)
+            spatial_semantic_pred = raw_model.shape_model.spatial_semantic_module(
+                raw_model.shape_model._shape_embed_cache, scaffold_anchors_jepa)
 
         # RECONSTRUCTION TARGET
         # OFFSET SUPERVISION (position_scaffold path):
@@ -953,12 +1015,35 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             z_cross   = torch.cat([z_s_swapped, z_g_current], dim=-1)
             lat_cross = z_cross.reshape(B, 512, 32)
             se_shifted = torch.roll(
-                gs_autoencoder.shape_model._shape_embed_cache, shifts=1, dims=0)
-            UV_cross, _ = gs_autoencoder.shape_model.decode(
-                lat_cross, volume_queries=None,
-                return_semantic_features=False, shape_embed=se_shifted,
-                scaffold_anchors=scaffold_anchors,
-                scaffold_token_ids=scaffold_token_ids)
+                raw_model.shape_model._shape_embed_cache, shifts=1, dims=0)
+
+            # Update last_scene_layout_pred for scene B BEFORE the cross-recon decode.
+            # Background: decode() uses self.last_scene_layout_pred for TokenCond B.
+            # After the main forward, this cached value is scene A's layout.
+            # The cross-recon latent is z_cross=[mu_s_B, mu_g_A], so the semantic
+            # conditioning should correspond to scene B (se_shifted). Without this fix,
+            # the cross-recon decoder receives scene B's semantic latent but scene A's
+            # spatial category layout — a mismatched conditioning signal that weakens
+            # the disentanglement loss and slows convergence.
+            if (raw_model.shape_model.scene_layout_module is not None and
+                    args.token_cond and 'B' in args.token_cond_approach.upper()):
+                with torch.no_grad():
+                    raw_model.shape_model.last_scene_layout_pred =                         raw_model.shape_model.scene_layout_module(se_shifted)
+
+            # Wrap in autocast so dtype matches the main forward pass.
+            # raw_model.shape_model.decode() is called outside Accelerate's
+            # automatic autocast wrapper (which only covers gs_autoencoder.__call__).
+            # Without this, bf16 model parameters meet fp32 cached tensors
+            # (e.g. last_scene_layout_pred) and the einsum raises a dtype error.
+            _mp = accelerator.mixed_precision
+            _autocast_dtype = torch.bfloat16 if _mp == 'bf16' else (
+                              torch.float16 if _mp == 'fp16' else torch.float32)
+            with torch.autocast('cuda', dtype=_autocast_dtype, enabled=(_mp != 'no')):
+                UV_cross, _ = raw_model.shape_model.decode(
+                    lat_cross, volume_queries=None,
+                    return_semantic_features=False, shape_embed=se_shifted,
+                    scaffold_anchors=scaffold_anchors,
+                    scaffold_token_ids=scaffold_token_ids)
             pred_cross_3d = UV_cross.reshape(B, -1, 14)
 
             # CROSS-RECON POSITION FIX — offset space comparison.
@@ -973,7 +1058,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             # This gives position cross-recon in offset space, consistent with
             # offset supervision, without contaminating the DC gradient path.
             if args.position_scaffold:
-                cross_anchors = gs_autoencoder.shape_model.last_predicted_anchors_from_tokens
+                cross_anchors = raw_model.shape_model.last_predicted_anchors_from_tokens
                 if cross_anchors is not None and scaffold_token_ids is not None:
                     idx_3d_cr = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, 3)
                     cross_dc  = torch.gather(cross_anchors, 1, idx_3d_cr).detach()
@@ -985,6 +1070,12 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 pred_cross_for_loss = pred_cross_3d
 
             cross_recon_loss = compute_cross_recon_loss(pred_cross_for_loss, target, B)
+
+            # Restore scene A's layout pred (used by layout_loss computation below).
+            # The cross-recon temporarily set it to scene B's.
+            if (raw_model.shape_model.scene_layout_module is not None and
+                    args.token_cond and 'B' in args.token_cond_approach.upper()):
+                raw_model.shape_model.last_scene_layout_pred = scene_layout_pred
 
         ortho_loss = torch.tensor(0.0, device=device)
         if (args.latent_disentangle and args.ortho_weight > 0
@@ -1016,7 +1107,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                 + args.seg_pred_weight       * seg_pred_loss
                 + args.scale_penalty_weight  * scale_penalty_loss
                 + semantic_loss)
-        loss.backward()
+        accelerator.backward(loss)
         optimizer.step()
         scheduler.step()
 
@@ -1040,13 +1131,13 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         epoch_scl += ind['scale']
         epoch_rot += ind['rotation']
 
-        if epoch == start_epoch and i_batch == 0:
+        if epoch == start_epoch and i_batch == 0 and accelerator.is_main_process:
             print(f"\nEPOCH {epoch} DIAGNOSTIC (batch 0):")
             print(f"  mu range:        [{mu.min().item():.3f}, {mu.max().item():.3f}]")
             print(f"  recon_loss:      {recon_loss.item():.4f}  (vs position OFFSETS ±~2m)")
             if args.position_scaffold:
                 pos_abs_np    = UV_gs_batch[:, :, 4:7].cpu().numpy()
-                pos_offset_np = batch_data['position_offsets'].numpy()
+                pos_offset_np = batch_data['position_offsets'].cpu().numpy()
                 pred_pos_off  = pred_3d[:, :, 0:3].detach().cpu().numpy()
                 print(f"  [OFFSET SUPERVISION] GT abs pos range:   [{pos_abs_np.min():.3f}, {pos_abs_np.max():.3f}]m")
                 print(f"  [OFFSET SUPERVISION] GT offset range:    [{pos_offset_np.min():.3f}, {pos_offset_np.max():.3f}]m  (~5x smaller)")
@@ -1066,7 +1157,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
                       f"{(scale_np > args.scale_penalty_threshold).mean()*100:.1f}%")
                 print(f"  scale_penalty_loss: {scale_penalty_loss.item():.6f}")
 
-        if wandb_enabled:
+        if wandb_enabled and accelerator.is_main_process:
             log = {
                 "train/step_loss":           loss.item(),
                 "train/step_recon":          recon_loss.item(),
@@ -1093,23 +1184,28 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 
     nb = len(trainDataLoader)
     current_lr = scheduler.get_last_lr()[0]
-    print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | Recon={epoch_recon/nb:.4f} | "
+    if accelerator.is_main_process: print(f"\nEpoch {epoch} | Loss={epoch_loss/nb:.4f} | Recon={epoch_recon/nb:.4f} | "
           f"KL={epoch_kl/nb:.4f} | Anchor={epoch_anchor/nb:.4f} | "
           f"ColorPred={epoch_color_pred/nb:.6f} | SceneSem={epoch_scene_semantic/nb:.4f} | "
           f"Layout={epoch_layout/nb:.4f} | CrossRecon={epoch_cross_recon/nb:.4f} | "
           f"SegPred={epoch_seg_pred/nb:.4f} | ScalePenalty={epoch_scale_penalty/nb:.6f} | "
           f"Ortho={epoch_ortho/nb:.6f} | LR={current_lr:.2e}")
-    print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
+    if accelerator.is_main_process: print(f"  Pos={epoch_pos/nb:.3f} | Col={epoch_col/nb:.3f} | "
           f"Opa={epoch_opa/nb:.3f} | Scl={epoch_scl/nb:.3f} | Rot={epoch_rot/nb:.3f}")
 
     val_metrics = None
     if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
-        print(f"\n--- Validation (epoch {epoch}) ---")
-        val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, epoch=epoch)
+        if accelerator.is_main_process:
+            print(f"\n--- Validation (epoch {epoch}) ---")
+        val_metrics = evaluate_model(gs_autoencoder, raw_model, valDataLoader, device, accelerator, epoch=epoch)
         pos_label = ('(offsets ±~2m, DC separate)' if args.position_scaffold else
                      '(residuals)' if args.position_layout_residual else '(absolute)')
         print(f"  L2:              {val_metrics['avg_l2_error']:.4f}")
         print(f"  Position:        {val_metrics['position_loss']:.4f}  {pos_label}")
+        if 'pos_abs_range' in val_metrics:
+            print(f"  Pos abs range:   [{val_metrics['pos_abs_min']:.2f}, "
+                  f"{val_metrics['pos_abs_max']:.2f}]m  "
+                  f"(GT: ±{val_metrics['pos_gt_range']:.1f}m)")
         print(f"  Color:           {val_metrics['color_loss']:.4f}")
         print(f"  Opacity:         {val_metrics['opacity_loss']:.4f}")
         print(f"  Scale:           {val_metrics['scale_loss']:.4f}")
@@ -1131,16 +1227,17 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
             best_epoch    = epoch
-            torch.save({
+            if accelerator.is_main_process:
+              torch.save({
                 'epoch':                epoch,
-                'model_state_dict':     gs_autoencoder.state_dict(),
+                'model_state_dict':     raw_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_l2_error':         val_metrics['avg_l2_error'],
                 **_ckpt_meta,
-            }, os.path.join(save_path, "best_model.pth"))
-            print(f"  [NEW BEST] L2={best_val_loss:.4f} saved")
+              }, os.path.join(save_path, "best_model.pth"))
+              print(f"  [NEW BEST] L2={best_val_loss:.4f} saved")
 
-    if wandb_enabled and val_metrics:
+    if wandb_enabled and val_metrics and accelerator.is_main_process:
         wandb_run.log({
             "val/l2_error":          val_metrics['avg_l2_error'],
             "val/position_loss":     val_metrics['position_loss'],
@@ -1159,10 +1256,10 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
             "train/lr":              current_lr,
         }, step=global_step)
 
-    if epoch >= 10 and epoch % 500 == 0:
+    if epoch >= 10 and epoch % 500 == 0 and accelerator.is_main_process:
         torch.save({
             'epoch':      epoch,
-            'model_state_dict':     gs_autoencoder.state_dict(),
+            'model_state_dict':     raw_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_loss': epoch_loss / nb,
             **_ckpt_meta,
@@ -1173,33 +1270,37 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training"):
 # FINAL SAVE
 # ============================================================================
 
-print(f"\n{'='*70}\nTRAINING COMPLETE\n{'='*70}")
-final_metrics = evaluate_model(gs_autoencoder, valDataLoader, device,
-                               epoch=args.num_epochs - 1)
-print(f"\nFinal L2:  {final_metrics['avg_l2_error']:.4f}")
-print(f"Best L2:   {best_val_loss:.4f} (epoch {best_epoch})")
+accelerator.wait_for_everyone()
+if accelerator.is_main_process:
+    print(f"\n{'='*70}\nTRAINING COMPLETE\n{'='*70}")
+final_metrics = evaluate_model(gs_autoencoder, raw_model, valDataLoader, device,
+                               accelerator, epoch=args.num_epochs - 1)
+if accelerator.is_main_process:
+    print(f"\nFinal L2:  {final_metrics['avg_l2_error']:.4f}")
+    print(f"Best L2:   {best_val_loss:.4f} (epoch {best_epoch})")
 
-torch.save({
+    torch.save({
     'epoch':        args.num_epochs - 1,
-    'model_state_dict':     gs_autoencoder.state_dict(),
+    'model_state_dict':     raw_model.state_dict(),
     'optimizer_state_dict': optimizer.state_dict(),
     'final_val_l2': final_metrics['avg_l2_error'],
     'best_val_l2':  best_val_loss,
     'best_epoch':   best_epoch,
     **_ckpt_meta,
     'individual_losses': {k: final_metrics[f'{k}_loss'] for k in PARAM_SLICES},
-}, os.path.join(save_path, "final.pth"))
+    }, os.path.join(save_path, "final.pth"))
 
-print(f"\nSaved: {save_path}final.pth")
-print(f"\nINFERENCE NOTE:")
-print(f"  At second-stage diffusion inference, call decode() with scaffold_token_ids=None.")
-print(f"  AnchorPredFromTokens uses fixed assignment j→j*512//40000 for DC.")
-print(f"  Decoder output positions are absolute (raw_offset + predicted_DC).")
-print(f"  Add mean_color back if color_residual=True, then save PLY directly.")
-print(f"  L_recon was trained on offsets; L_anchor trained DC separately — both are baked into weights.")
-if wandb_enabled:
+    print(f"\nSaved: {save_path}final.pth")
+    print(f"\nINFERENCE NOTE:")
+    print(f"  At second-stage diffusion inference, call decode() with scaffold_token_ids=None.")
+    print(f"  AnchorPredFromTokens uses fixed assignment j→j*512//40000 for DC.")
+    print(f"  Decoder output positions are absolute (raw_offset + predicted_DC).")
+    print(f"  Add mean_color back if color_residual=True, then save PLY directly.")
+    print(f"  L_recon was trained on offsets; L_anchor trained DC separately — both are baked into weights.")
+if wandb_enabled and accelerator.is_main_process:
     wandb_run.summary.update({
         "final_val_l2": final_metrics['avg_l2_error'],
         "best_val_l2":  best_val_loss, "best_epoch": best_epoch})
     wandb_run.finish()
-print("Done.")
+if accelerator.is_main_process:
+    print("Done.")

@@ -1,17 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=1
-#SBATCH --time=20:00:00
+#SBATCH --gpus=4
+#SBATCH --time=8:30:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=6
-#SBATCH --mem=80G
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=180G
 #SBATCH --output=logs/can3tok_%j.out
 #SBATCH --error=logs/can3tok_%j.err
 
-
-# cpus per task:9 for h100
-# mem 128G
 # ============================================================================
 # CAN3TOK — INFERENCE-FIXED + OFFSET SUPERVISION + SCALE PENALTY
 # ============================================================================
@@ -78,7 +75,7 @@ SCENE_SEMANTIC_WEIGHT=0.3
 # ── Position scaffold ─────────────────────────────────────────────────────────
 # Must be True for AnchorPredFromTokens to activate.
 # Offset supervision is applied automatically when True.
-POSITION_SCAFFOLD=True
+POSITION_SCAFFOLD=False
 ANCHOR_LOSS_WEIGHT=1.0
 
 # ── Decoder shape conditioning ────────────────────────────────────────────────
@@ -149,8 +146,8 @@ SCALE_PENALTY_WEIGHT=0.0
 SCALE_PENALTY_THRESHOLD=0.5
 
 # ── Core training ─────────────────────────────────────────────────────────────
-BATCH_SIZE=100   # max 115 on h100
-NUM_EPOCHS=3000
+BATCH_SIZE=100
+NUM_EPOCHS=2500
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-6
 EVAL_EVERY=50
@@ -163,7 +160,7 @@ LR_MIN_RATIO=0.1
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 TRAIN_SCENES=300
-VAL_SCENES=50
+VAL_SCENES=30
 SAMPLING_METHOD="opacity"
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
@@ -174,13 +171,13 @@ SCALE_NORM_MODE="linear"
 PCA_VIS_FREQ=500
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
-RECON_PLY_FREQ=50
+RECON_PLY_FREQ=100
 RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 export WANDB_API_KEY="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"
-USE_WANDB=False
+USE_WANDB=True
 
 # ============================================================================
 # VALIDATION
@@ -268,7 +265,8 @@ echo ""
 # BUILD TRAINING COMMAND
 # ============================================================================
 
-TRAIN_CMD="python gs_can3tok_2.py"
+ACCELERATE_CONFIG="/home/yli11/scratch/Hafeez_thesis/Can3Tok/job_scripts/accelerate_config.yaml"
+TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
