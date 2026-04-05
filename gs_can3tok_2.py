@@ -226,6 +226,20 @@ parser.add_argument('--seg_pred_weight', type=float, default=0.3)
 parser.add_argument('--token_cond', action='store_true', default=False)
 parser.add_argument('--token_cond_approach', type=str, default='A',
                     choices=['A', 'B', 'AB'])
+# ── NEW: ablation flags (FourierPE, AdaLN, SemanticTokenHeads) ───────────────
+parser.add_argument('--decoder_fourier_pe', action='store_true', default=False,
+    help='3D Fourier PE over 8³ voxel grid instead of learnable PE. '
+         'Takes priority over --decoder_pos_enc when both are True. '
+         'Encodes spatial neighbourhood by construction.')
+parser.add_argument('--token_cond_adaln', action='store_true', default=False,
+    help='Per-layer AdaLN-Zero conditioning in the decoder transformer. '
+         'Requires --token_cond and --token_cond_approach to include B. '
+         'Replaces once-before-stack additive bias with per-layer modulation.')
+parser.add_argument('--semantic_token_heads', action='store_true', default=False,
+    help='Run prediction heads (color/semantic/layout) on z tokens 0-15 '
+         'instead of shape_embed. Requires --latent_disentangle. '
+         'Makes the pipeline fully inference-clean: DiT generates z, '
+         'extract tokens 0-15, run heads, decode — no shape_embed needed.')
 parser.add_argument('--query_decoder', action='store_true', default=False)
 parser.add_argument('--label_input',          action='store_true', default=False)
 parser.add_argument('--no_label_input',       dest='label_input', action='store_false')
@@ -289,6 +303,16 @@ if args.token_cond and 'B' in args.token_cond_approach.upper() and not args.scen
 if args.query_decoder and not args.position_scaffold:
     print("[INFO] --query_decoder requires --position_scaffold. Enabling.")
     args.position_scaffold = True
+
+# New flag validation
+if args.semantic_token_heads and not args.latent_disentangle:
+    raise ValueError("--semantic_token_heads requires --latent_disentangle")
+if args.token_cond_adaln and not args.token_cond:
+    print("[WARNING] --token_cond_adaln requires --token_cond. AdaLN will be disabled by model.")
+if args.token_cond_adaln and 'B' not in args.token_cond_approach.upper():
+    print("[WARNING] --token_cond_adaln requires approach B. AdaLN will be disabled by model.")
+if args.decoder_fourier_pe and args.decoder_pos_enc:
+    print("[INFO] --decoder_fourier_pe takes priority over --decoder_pos_enc for PE.")
 
 need_scaffold_data = (args.position_scaffold or args.token_cond or args.query_decoder)
 
@@ -404,6 +428,9 @@ if accelerator.is_main_process:
     print(f"  decoder_pos_enc:           {args.decoder_pos_enc}")
     print(f"  predict_seg_labels:        {args.predict_seg_labels}")
     print(f"  token_cond:                {args.token_cond}  approach={args.token_cond_approach}")
+    print(f"  token_cond_adaln:          {args.token_cond_adaln}  (per-layer AdaLN-Zero)")
+    print(f"  decoder_fourier_pe:        {args.decoder_fourier_pe}  (3D Fourier PE)")
+    print(f"  semantic_token_heads:      {args.semantic_token_heads}  (heads on z tokens)")
     print(f"  query_decoder:             {args.query_decoder}")
     print(f"  scale_penalty_weight:      {args.scale_penalty_weight}  "
           f"threshold={args.scale_penalty_threshold}m  (0=disabled)")
@@ -437,6 +464,9 @@ p.predict_seg_labels         = args.predict_seg_labels
 p.token_cond                 = args.token_cond
 p.token_cond_approach        = args.token_cond_approach
 p.query_decoder              = args.query_decoder
+p.decoder_fourier_pe         = args.decoder_fourier_pe
+p.token_cond_adaln           = args.token_cond_adaln
+p.semantic_token_heads       = args.semantic_token_heads
 
 cfg_point_feats = p.point_feats
 expected_feats  = 12 if args.label_input else 11
@@ -489,6 +519,9 @@ if args.resume_checkpoint:
         ckpt.get('token_cond', False) == args.token_cond,
         ckpt.get('token_cond_approach', 'A') == args.token_cond_approach,
         ckpt.get('query_decoder', False) == args.query_decoder,
+        ckpt.get('decoder_fourier_pe', False) == args.decoder_fourier_pe,
+        ckpt.get('token_cond_adaln', False) == args.token_cond_adaln,
+        ckpt.get('semantic_token_heads', False) == args.semantic_token_heads,
     ])
     if not strict:
         print(f"  Architecture changed — loading strict=False")
@@ -616,6 +649,9 @@ _ckpt_meta = {
     'token_cond':                 args.token_cond,
     'token_cond_approach':        args.token_cond_approach,
     'query_decoder':              args.query_decoder,
+    'decoder_fourier_pe':         args.decoder_fourier_pe,
+    'token_cond_adaln':           args.token_cond_adaln,
+    'semantic_token_heads':       args.semantic_token_heads,
     'inference_fixed':            True,   # marks this checkpoint as inference-compatible
     'mean_color_weight':          args.mean_color_weight,
     'scene_semantic_weight':      args.scene_semantic_weight,
@@ -1021,14 +1057,25 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             # Background: decode() uses self.last_scene_layout_pred for TokenCond B.
             # After the main forward, this cached value is scene A's layout.
             # The cross-recon latent is z_cross=[mu_s_B, mu_g_A], so the semantic
-            # conditioning should correspond to scene B (se_shifted). Without this fix,
-            # the cross-recon decoder receives scene B's semantic latent but scene A's
-            # spatial category layout — a mismatched conditioning signal that weakens
-            # the disentanglement loss and slows convergence.
-            if (raw_model.shape_model.scene_layout_module is not None and
-                    args.token_cond and 'B' in args.token_cond_approach.upper()):
+            # conditioning should correspond to scene B.
+            #
+            # Two paths depending on where the layout head takes its input:
+            #   semantic_token_heads=False (default): layout head takes shape_embed
+            #     → use se_shifted (shape_embed of scene B) as input.
+            #   semantic_token_heads=True (new): layout head takes z semantic tokens
+            #     → use z_s_swapped tokens 1-15 as input (z_s of scene B).
+            if raw_model.shape_model.scene_layout_module is not None and args.token_cond and 'B' in args.token_cond_approach.upper():
                 with torch.no_grad():
-                    raw_model.shape_model.last_scene_layout_pred =                         raw_model.shape_model.scene_layout_module(se_shifted)
+                    if args.semantic_token_heads:
+                        # z_s_swapped is [B, semantic_dims]; tokens 1-15 are the semantic tokens
+                        _ed = raw_model.shape_model.embed_dim   # 32
+                        _sd = args.semantic_dims                 # 512
+                        z_sem_B = z_s_swapped[:, _ed:_sd]       # [B, 480]
+                        raw_model.shape_model.last_scene_layout_pred = \
+                            raw_model.shape_model.scene_layout_module(z_sem_B)
+                    else:
+                        raw_model.shape_model.last_scene_layout_pred = \
+                            raw_model.shape_model.scene_layout_module(se_shifted)
 
             # Wrap in autocast so dtype matches the main forward pass.
             # raw_model.shape_model.decode() is called outside Accelerate's

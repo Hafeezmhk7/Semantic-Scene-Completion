@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=4
-#SBATCH --time=8:30:00
+#SBATCH --gpus=2
+#SBATCH --time=8:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=9
-#SBATCH --mem=180G
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=160G
 #SBATCH --output=logs/can3tok_%j.out
 #SBATCH --error=logs/can3tok_%j.err
 
@@ -76,7 +76,7 @@ SCENE_SEMANTIC_WEIGHT=0.3
 # Must be True for AnchorPredFromTokens to activate.
 # Offset supervision is applied automatically when True.
 POSITION_SCAFFOLD=False
-ANCHOR_LOSS_WEIGHT=1.0
+ANCHOR_LOSS_WEIGHT=0.0
 
 # ── Decoder shape conditioning ────────────────────────────────────────────────
 DECODER_SHAPE_PREPEND=False
@@ -94,7 +94,7 @@ SAMPLING_STRATEGY="balanced"
 # ── Latent disentanglement ────────────────────────────────────────────────────
 LATENT_DISENTANGLE=True
 SEMANTIC_DIMS=512
-CROSS_RECON_WEIGHT=0.5
+CROSS_RECON_WEIGHT=0.3
 ORTHO_WEIGHT=0.1
 
 # ── Scene layout head ─────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ JEPA_IDEA1=False
 JEPA_IDEA1_WEIGHT=1.0
 
 # ── Idea 0: Decoder positional encoding ──────────────────────────────────────
-DECODER_POS_ENC=True
+DECODER_POS_ENC=False
 
 # ── Idea 1: Segment label prediction ─────────────────────────────────────────
 PREDICT_SEG_LABELS=False
@@ -122,6 +122,37 @@ TOKEN_COND_APPROACH="B"
 
 # ── Idea 3: Query decoder ────────────────────────────────────────────────────
 QUERY_DECODER=False
+
+# ============================================================================
+# NEW ABLATION FLAGS
+# Set all three to True together for the full new architecture.
+# Each can be enabled independently for ablation.
+# ============================================================================
+
+# ── Ablation A: 3D Fourier Positional Encoding ────────────────────────────────
+# Replaces learnable PE [512, 384] with Fourier PE over the 8³ voxel grid.
+# Nearby voxels get similar PE by construction (spatial inductive bias).
+# Consistent with the encoder's Fourier embedder (spectral continuity).
+# Takes priority over DECODER_POS_ENC=True if both are set.
+# Recommended: pair with DECODER_POS_ENC=False to avoid confusion.
+DECODER_FOURIER_PE=True
+
+# ── Ablation B: Per-layer AdaLN-Zero conditioning ────────────────────────────
+# Replaces the once-before-stack additive TokenCond B bias with per-layer
+# AdaLN-Zero modulation inside each of the 12 decoder transformer layers.
+# Zero-init → identity at start → safe to resume from any checkpoint.
+# Requires TOKEN_COND=True and TOKEN_COND_APPROACH to contain "B".
+TOKEN_COND_ADALN=True
+
+# ── Ablation C: Semantic Token Heads ─────────────────────────────────────────
+# Runs prediction heads on z token subsets instead of shape_embed:
+#   Token 0  (z[:, :32])         → MeanColorHead  → [B, 3]
+#   Tokens 1-15 (z[:, 32:512])   → SceneSemanticHead → [B, 72]
+#                                → SceneLayoutHead   → [B, 72, 3]
+# At second-stage inference: DiT generates z → extract tokens 0-15
+# → run heads → set decoder conditioning → decode. No shape_embed needed.
+# Requires LATENT_DISENTANGLE=True.
+SEMANTIC_TOKEN_HEADS=True
 
 # ── SCALE PENALTY ─────────────────────────────────────────────────────────────
 # Penalises post-exp scale values above the threshold (metres).
@@ -146,21 +177,21 @@ SCALE_PENALTY_WEIGHT=0.0
 SCALE_PENALTY_THRESHOLD=0.5
 
 # ── Core training ─────────────────────────────────────────────────────────────
-BATCH_SIZE=100
-NUM_EPOCHS=2500
+BATCH_SIZE=64
+NUM_EPOCHS=2000
 LEARNING_RATE=1e-4
-KL_WEIGHT=1e-6
+KL_WEIGHT=1e-5
 EVAL_EVERY=50
 FAILURE_THRESHOLD=100
 
 # ── LR scheduler ──────────────────────────────────────────────────────────────
 WEIGHT_DECAY=1e-2
-WARMUP_STEPS=500
+WARMUP_STEPS=300
 LR_MIN_RATIO=0.1
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 TRAIN_SCENES=300
-VAL_SCENES=30
+VAL_SCENES=50
 SAMPLING_METHOD="opacity"
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
@@ -171,13 +202,13 @@ SCALE_NORM_MODE="linear"
 PCA_VIS_FREQ=500
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
-RECON_PLY_FREQ=100
+RECON_PLY_FREQ=50
 RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 export WANDB_API_KEY="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"
-USE_WANDB=True
+USE_WANDB=False
 
 # ============================================================================
 # VALIDATION
@@ -210,18 +241,32 @@ if [ "$POSITION_SCAFFOLD" = "True" ] && [ "$POSITION_LAYOUT_RESIDUAL" = "True" ]
     exit 1
 fi
 
+if [ "$TOKEN_COND_ADALN" = "True" ] && [ "$TOKEN_COND" = "False" ]; then
+    echo "[WARNING] TOKEN_COND_ADALN requires TOKEN_COND=True. AdaLN will be disabled."
+fi
+if [ "$TOKEN_COND_ADALN" = "True" ] && ! echo "$TOKEN_COND_APPROACH" | grep -q "B"; then
+    echo "[WARNING] TOKEN_COND_ADALN requires TOKEN_COND_APPROACH to include B."
+fi
+if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; then
+    echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True."
+    exit 1
+fi
+
 echo "========================================================================"
-echo "  CAN3TOK — Run W (offset supervision + cross-recon fix + scale penalty)"
+echo "  CAN3TOK — Ablation: FourierPE / AdaLN / SemanticTokenHeads"
 echo "========================================================================"
 echo ""
-echo "  Contributions active:"
+echo "  Core contributions:"
 echo "    color_residual=$COLOR_RESIDUAL | scene_semantic=$SCENE_SEMANTIC_HEAD"
-echo "    position_scaffold=$POSITION_SCAFFOLD (OFFSET supervision ~+-2m)"
-echo "    anchor_loss_weight=$ANCHOR_LOSS_WEIGHT"
-echo "    latent_disentangle=$LATENT_DISENTANGLE (dims=$SEMANTIC_DIMS)"
+echo "    position_scaffold=$POSITION_SCAFFOLD | latent_disentangle=$LATENT_DISENTANGLE"
 echo "    scene_layout_head=$SCENE_LAYOUT_HEAD"
-echo "    decoder_pos_enc=$DECODER_POS_ENC"
 echo "    token_cond=$TOKEN_COND approach=$TOKEN_COND_APPROACH"
+echo ""
+echo "  New ablation flags:"
+echo "    decoder_fourier_pe=$DECODER_FOURIER_PE  (Fourier PE, replaces learnable)"
+echo "    decoder_pos_enc=$DECODER_POS_ENC  (learnable PE — used if fourier_pe=False)"
+echo "    token_cond_adaln=$TOKEN_COND_ADALN  (per-layer AdaLN-Zero)"
+echo "    semantic_token_heads=$SEMANTIC_TOKEN_HEADS  (heads on z tokens 0-15)"
 echo ""
 echo "  Scale penalty:"
 if [ "$SCALE_PENALTY_WEIGHT" = "0.0" ] || [ "$SCALE_PENALTY_WEIGHT" = "0" ]; then
@@ -240,6 +285,7 @@ echo ""
 # ============================================================================
 
 module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
 site-packages/torch/lib:$LD_LIBRARY_PATH"
@@ -319,6 +365,10 @@ TRAIN_CMD="$TRAIN_CMD --seg_pred_weight $SEG_PRED_WEIGHT"
 [ "$TOKEN_COND"               = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond"
 [ "$TOKEN_COND"               = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_approach $TOKEN_COND_APPROACH"
 [ "$QUERY_DECODER"            = "True" ] && TRAIN_CMD="$TRAIN_CMD --query_decoder"
+# New ablation flags
+[ "$DECODER_FOURIER_PE"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
+[ "$TOKEN_COND_ADALN"         = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_adaln"
+[ "$SEMANTIC_TOKEN_HEADS"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --semantic_token_heads"
 
 # Scale penalty flags (always passed — 0.0 means disabled)
 TRAIN_CMD="$TRAIN_CMD --scale_penalty_weight $SCALE_PENALTY_WEIGHT"
