@@ -1,0 +1,198 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_disentangle_eval
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=1:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=40G
+#SBATCH --output=logs/disentangle_eval_%j.out
+#SBATCH --error=logs/disentangle_eval_%j.err
+
+# ============================================================================
+# Can3Tok — Disentanglement Evaluation
+# ============================================================================
+# Runs three experiments to test whether z_s and z_g are properly disentangled:
+#
+#   Exp 1: Intra vs inter-class cosine distance in z_s (semantic subspace)
+#          and z_g (geometry subspace).
+#          z_s should cluster by scene category; z_g should not.
+#
+#   Exp 2: JSD between SceneSemanticHead predictions for same-category vs
+#          cross-category scene pairs.
+#
+#   Exp 3: Qualitative latent swap — decodes z_AB=[z_s^apt, z_g^coffee]
+#          and z_BA=[z_s^coffee, z_g^apt]. Saves 4 PLYs for SuperSplat.
+#
+# OUTPUT:
+#   logs/disentangle_eval_<JOB_ID>.out  — full numeric results
+#   eval_results/<RUN_TAG>/results.json — structured results
+#   eval_results/<RUN_TAG>/swap_visualisation/*.ply — 4 PLYs for Exp 3
+# ============================================================================
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# CONFIGURATION — EDIT THIS SECTION
+# ============================================================================
+
+# Path to the checkpoint to evaluate
+CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21533330_none_inferencefixed/final.pth"
+
+# Where the preprocessed SceneSplat scenes live
+DATA_ROOT="/home/yli11/scratch/datasets/gaussian_world/preprocessed/\
+interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
+
+# Metadata JSON with scene_id → category mapping
+METADATA="/home/yli11/scratch/Hafeez_thesis/Can3Tok/scene_config.json"
+
+# Output directory for this evaluation run
+RUN_TAG="eval_$(date +%Y%m%d_%H%M%S)_job_${SLURM_JOB_ID}"
+OUTPUT_DIR="/home/yli11/scratch/Hafeez_thesis/Can3Tok/disent_eval_results/${RUN_TAG}"
+
+# ── Categories for Experiment 1 + 2 ─────────────────────────────────────────
+# Use categories with ≥2 scenes for intra-class distance to be meaningful.
+# Best choices given the metadata:
+#   apartment    (5 scenes) — richest category, 10 intra-class pairs
+#   coffee_shop  (3 scenes) — 3 intra-class pairs
+#   spa_pool     (3 scenes) — 3 intra-class pairs
+CATEGORIES="apartment coffee_shop spa_pool"
+
+# ── Swap pair for Experiment 3 ───────────────────────────────────────────────
+# Choose maximally different categories for a clear qualitative result.
+SWAP_CAT_A="apartment"
+SWAP_CAT_B="coffee_shop"
+# Which scene index to use within each category (0-indexed)
+SWAP_IDX_A=0
+SWAP_IDX_B=0
+
+# ── Model flags — MUST MATCH THE CHECKPOINT ──────────────────────────────────
+# Check the checkpoint's saved metadata to confirm these are correct.
+# The checkpoint file stores these under 'color_residual', 'latent_disentangle', etc.
+COLOR_RESIDUAL=False
+SCENE_SEMANTIC_HEAD=False
+SCENE_LAYOUT_HEAD=False
+LATENT_DISENTANGLE=False
+SEMANTIC_DIMS=512
+DECODER_POS_ENC=False
+DECODER_FOURIER_PE=False
+TOKEN_COND=False
+TOKEN_COND_APPROACH="B"
+TOKEN_COND_ADALN=False
+SEMANTIC_TOKEN_HEADS=False
+POSITION_SCAFFOLD=False
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
+site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs eval_results
+
+# ── Print config ─────────────────────────────────────────────────────────────
+echo ""
+echo "========================================================================"
+echo "  DISENTANGLEMENT EVALUATION"
+echo "========================================================================"
+echo ""
+echo "  Checkpoint:  $CHECKPOINT"
+echo "  Data root:   $DATA_ROOT"
+echo "  Metadata:    $METADATA"
+echo "  Output:      $OUTPUT_DIR"
+echo ""
+echo "  Categories:  $CATEGORIES"
+echo "  Swap pair:   $SWAP_CAT_A  <->  $SWAP_CAT_B"
+echo ""
+echo "  Model flags:"
+echo "    color_residual=$COLOR_RESIDUAL | latent_disentangle=$LATENT_DISENTANGLE"
+echo "    scene_semantic_head=$SCENE_SEMANTIC_HEAD | scene_layout_head=$SCENE_LAYOUT_HEAD"
+echo "    decoder_fourier_pe=$DECODER_FOURIER_PE | token_cond=$TOKEN_COND ($TOKEN_COND_APPROACH)"
+echo "    token_cond_adaln=$TOKEN_COND_ADALN | semantic_token_heads=$SEMANTIC_TOKEN_HEADS"
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+
+CMD="python eval_disentanglement.py"
+CMD="$CMD --checkpoint $CHECKPOINT"
+CMD="$CMD --metadata $METADATA"
+CMD="$CMD --data_root $DATA_ROOT"
+CMD="$CMD --output_dir $OUTPUT_DIR"
+CMD="$CMD --categories $CATEGORIES"
+CMD="$CMD --swap_cat_a $SWAP_CAT_A"
+CMD="$CMD --swap_cat_b $SWAP_CAT_B"
+CMD="$CMD --swap_scene_idx_a $SWAP_IDX_A"
+CMD="$CMD --swap_scene_idx_b $SWAP_IDX_B"
+CMD="$CMD --semantic_dims $SEMANTIC_DIMS"
+CMD="$CMD --token_cond_approach $TOKEN_COND_APPROACH"
+
+[ "$COLOR_RESIDUAL"       = "True" ] && CMD="$CMD --color_residual"
+[ "$SCENE_SEMANTIC_HEAD"  = "True" ] && CMD="$CMD --scene_semantic_head"
+[ "$SCENE_LAYOUT_HEAD"    = "True" ] && CMD="$CMD --scene_layout_head"
+[ "$LATENT_DISENTANGLE"   = "True" ] && CMD="$CMD --latent_disentangle"
+[ "$DECODER_POS_ENC"      = "True" ] && CMD="$CMD --decoder_pos_enc"
+[ "$DECODER_FOURIER_PE"   = "True" ] && CMD="$CMD --decoder_fourier_pe"
+[ "$TOKEN_COND"           = "True" ] && CMD="$CMD --token_cond"
+[ "$TOKEN_COND_ADALN"     = "True" ] && CMD="$CMD --token_cond_adaln"
+[ "$SEMANTIC_TOKEN_HEADS" = "True" ] && CMD="$CMD --semantic_token_heads"
+[ "$POSITION_SCAFFOLD"    = "True" ] && CMD="$CMD --position_scaffold"
+
+echo "Command: $CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $CMD
+EXIT_CODE=$?
+echo ""
+echo "Duration: $((SECONDS/60))m $((SECONDS%60))s  |  Exit: $EXIT_CODE  |  End: $(date)"
+
+# ============================================================================
+# POST-RUN INSTRUCTIONS
+# ============================================================================
+
+if [ $EXIT_CODE -eq 0 ]; then
+    echo ""
+    echo "========================================================================"
+    echo "  EVALUATION COMPLETE"
+    echo "========================================================================"
+    echo ""
+    echo "  Numeric results:"
+    echo "    cat $OUTPUT_DIR/results.json"
+    echo ""
+    echo "  For Experiment 3 (swap visualisation):"
+    echo "    PLY files are in: $OUTPUT_DIR/swap_visualisation/"
+    echo ""
+    echo "    Load all 4 PLYs in SuperSplat at https://supersplat.at:"
+    echo "      A_self_*_apartment.ply        — original apartment scene"
+    echo "      B_self_*_coffee_shop.ply       — original coffee shop scene"
+    echo "      AB_semA_geoB_*.ply             — apartment semantics, coffee geometry"
+    echo "      BA_semB_geoA_*.ply             — coffee semantics, apartment geometry"
+    echo ""
+    echo "    What to look for:"
+    echo "      AB should have the room SHAPE of the coffee shop"
+    echo "      AB should have the COLOR PALETTE of the apartment (mean_color from z_s^apt)"
+    echo "      BA should have the room SHAPE of the apartment"
+    echo "      BA should have the COLOR PALETTE of the coffee shop"
+    echo ""
+    echo "  Quick result read:"
+    echo "    grep -A 5 'FINAL SUMMARY' logs/disentangle_eval_${SLURM_JOB_ID}.out"
+else
+    echo ""
+    echo "FAILED (exit $EXIT_CODE)"
+    echo "  Common causes:"
+    echo "    Wrong model flags (mismatch with checkpoint) → check checkpoint metadata"
+    echo "    Scene directory not found → check DATA_ROOT path and scene_id format"
+    echo "    CUDA OOM → not expected for eval (single GPU, no gradients)"
+    echo "  Error log: cat logs/disentangle_eval_${SLURM_JOB_ID}.err"
+fi

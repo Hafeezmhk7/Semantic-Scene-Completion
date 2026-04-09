@@ -2,7 +2,7 @@
 #SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=2
-#SBATCH --time=8:00:00
+#SBATCH --time=20:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=160G
@@ -69,7 +69,7 @@ RESUME_EPOCH=""
 COLOR_RESIDUAL=True
 MEAN_COLOR_WEIGHT=1.0
 COLOR_LOSS_WEIGHT=1.0
-SCENE_SEMANTIC_HEAD=True
+SCENE_SEMANTIC_HEAD=False
 SCENE_SEMANTIC_WEIGHT=0.3
 
 # ── Position scaffold ─────────────────────────────────────────────────────────
@@ -98,7 +98,7 @@ CROSS_RECON_WEIGHT=0.3
 ORTHO_WEIGHT=0.1
 
 # ── Scene layout head ─────────────────────────────────────────────────────────
-SCENE_LAYOUT_HEAD=True
+SCENE_LAYOUT_HEAD=False
 LAYOUT_LOSS_WEIGHT=0.3
 
 # ── Position layout residual ──────────────────────────────────────────────────
@@ -117,7 +117,7 @@ PREDICT_SEG_LABELS=False
 SEG_PRED_WEIGHT=0.3
 
 # ── Idea 2: Token centroid conditioning ──────────────────────────────────────
-TOKEN_COND=True
+TOKEN_COND=False
 TOKEN_COND_APPROACH="B"
 
 # ── Idea 3: Query decoder ────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ DECODER_FOURIER_PE=True
 # AdaLN-Zero modulation inside each of the 12 decoder transformer layers.
 # Zero-init → identity at start → safe to resume from any checkpoint.
 # Requires TOKEN_COND=True and TOKEN_COND_APPROACH to contain "B".
-TOKEN_COND_ADALN=True
+TOKEN_COND_ADALN=False
 
 # ── Ablation C: Semantic Token Heads ─────────────────────────────────────────
 # Runs prediction heads on z token subsets instead of shape_embed:
@@ -152,7 +152,7 @@ TOKEN_COND_ADALN=True
 # At second-stage inference: DiT generates z → extract tokens 0-15
 # → run heads → set decoder conditioning → decode. No shape_embed needed.
 # Requires LATENT_DISENTANGLE=True.
-SEMANTIC_TOKEN_HEADS=True
+SEMANTIC_TOKEN_HEADS=False
 
 # ── SCALE PENALTY ─────────────────────────────────────────────────────────────
 # Penalises post-exp scale values above the threshold (metres).
