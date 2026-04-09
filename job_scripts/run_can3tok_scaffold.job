@@ -66,7 +66,7 @@ RESUME_CHECKPOINT=""
 RESUME_EPOCH=""
 
 # ── Core contributions ────────────────────────────────────────────────────────
-COLOR_RESIDUAL=True
+COLOR_RESIDUAL=False
 MEAN_COLOR_WEIGHT=1.0
 COLOR_LOSS_WEIGHT=1.0
 SCENE_SEMANTIC_HEAD=False
@@ -92,7 +92,7 @@ SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
 
 # ── Latent disentanglement ────────────────────────────────────────────────────
-LATENT_DISENTANGLE=True
+LATENT_DISENTANGLE=False
 SEMANTIC_DIMS=512
 CROSS_RECON_WEIGHT=0.3
 ORTHO_WEIGHT=0.1
@@ -135,7 +135,7 @@ QUERY_DECODER=False
 # Consistent with the encoder's Fourier embedder (spectral continuity).
 # Takes priority over DECODER_POS_ENC=True if both are set.
 # Recommended: pair with DECODER_POS_ENC=False to avoid confusion.
-DECODER_FOURIER_PE=True
+DECODER_FOURIER_PE=False
 
 # ── Ablation B: Per-layer AdaLN-Zero conditioning ────────────────────────────
 # Replaces the once-before-stack additive TokenCond B bias with per-layer
@@ -177,7 +177,7 @@ SCALE_PENALTY_WEIGHT=0.0
 SCALE_PENALTY_THRESHOLD=0.5
 
 # ── Core training ─────────────────────────────────────────────────────────────
-BATCH_SIZE=64
+BATCH_SIZE=100
 NUM_EPOCHS=2000
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-5
