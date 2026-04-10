@@ -1,362 +1,350 @@
 """
-PCA Feature Visualization for Semantic Awareness (NO Open3D!)
-=============================================================
+PCA Feature Visualization for Can3Tok Semantic Diagnostics
+============================================================
+No Open3D required — uses plyfile or manual PLY writing.
 
-Simplified version using only numpy and plyfile (already installed).
-No Open3D dependency needed!
+TWO VISUALIZATION MODES:
+
+1. Per-Gaussian semantic features (per_gaussian_features from decoder)
+   ─ visualize_semantic_features(coords, features, output_path)
+   ─ N points (40k Gaussians), D-dim features → PCA colors
+   ─ Diagnostic: do same-category Gaussians cluster in feature space?
+
+2. Scene-level z_s space (z_s projections from SemanticTokenInfoNCEHead)
+   ─ visualize_z_s_space(z_s_proj, label_dists, output_path)
+   ─ M points (one per eval scene), 128-dim projections → PCA positions
+   ─ Colors: dominant ScanNet72 category per scene
+   ─ Diagnostic: do same-category scenes cluster in z_s?
 
 Usage:
-    from pca_feature_visualization import visualize_semantic_features
-    
-    visualize_semantic_features(
-        coords=coords,           # [N, 3] positions
-        features=semantic_feats, # [N, 32] semantic features
-        output_path="semantic_vis.ply",
-        brightness=1.25
+    from pca_feature_visualization import (
+        visualize_semantic_features,
+        visualize_z_s_space,
     )
 """
 
 import numpy as np
 import torch
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
-# Try to import plyfile (you should have this already)
 try:
     from plyfile import PlyData, PlyElement
     HAS_PLYFILE = True
 except ImportError:
     HAS_PLYFILE = False
-    print("⚠️  Warning: plyfile not found, will write PLY manually")
+    print("Warning: plyfile not found — falling back to manual PLY writer")
 
 
-def get_pca_color_torch(
-    feat: torch.Tensor,
-    brightness: float = 1.25,
-    center: bool = True,
-    q: int = 6,
-    niter: int = 5
-) -> torch.Tensor:
+# ============================================================================
+# SHARED UTILITIES
+# ============================================================================
+
+def get_pca_color_torch(feat, brightness=1.25, center=True, q=6, niter=5):
     """
-    Torch low-rank PCA colorization.
-    
-    Args:
-        feat: (N, D) float32 tensor of features
-        brightness: Brightness multiplier (default 1.25)
-        center: Whether to center features before PCA
-        q: Number of principal components to compute
-        niter: Number of iterations for power iteration
-    
-    Returns:
-        color: (N, 3) float32 in [0,1] - RGB colors
+    Low-rank PCA colorization.  Returns [N, 3] float32 in [0,1].
+    Blends first 3 and next 3 principal components for richer colors.
     """
-    # Adjust q if feature dimension is too small
-    n, d = feat.shape
-    q_actual = min(q, d, n)  # Can't have more PCs than dimensions or samples
-    
-    # u: (N, q_actual), s: (q_actual,), v: (D, q_actual)
+    n, d     = feat.shape
+    q_actual = min(q, d, n)
+
     u, s, v = torch.pca_lowrank(feat, center=center, q=q_actual, niter=niter)
-    
-    # Project features onto principal components
-    projection = feat @ v  # (N, q_actual)
-    
-    # Handle different cases based on available PCs
+    proj    = feat @ v                  # [N, q_actual]
+
     if q_actual >= 6:
-        # Standard case: blend first 3 and next 3 PCs
-        mix = projection[:, :3] * 0.6 + projection[:, 3:6] * 0.4  # (N, 3)
+        mix = proj[:, :3] * 0.6 + proj[:, 3:6] * 0.4
     elif q_actual >= 3:
-        # Only have 3-5 PCs: use first 3 only
-        mix = projection[:, :3]  # (N, 3)
+        mix = proj[:, :3]
     else:
-        # Less than 3 PCs: pad with zeros
         mix = torch.zeros((n, 3), dtype=feat.dtype, device=feat.device)
-        mix[:, :q_actual] = projection
-    
-    # Per-channel min-max normalization to [0,1]
-    min_val = mix.amin(dim=0, keepdim=True)
-    max_val = mix.amax(dim=0, keepdim=True)
-    div = torch.clamp(max_val - min_val, min=1e-6)
-    color = (mix - min_val) / div
-    
-    # Apply brightness and clamp
-    color = (color * brightness).clamp_(0.0, 1.0)
-    
-    return color
+        mix[:, :q_actual] = proj
+
+    mn  = mix.amin(dim=0, keepdim=True)
+    mx  = mix.amax(dim=0, keepdim=True)
+    mix = (mix - mn) / (mx - mn + 1e-6)
+    return (mix * brightness).clamp(0.0, 1.0)
 
 
-def build_valid_mask(feat: np.ndarray, norm_thresh: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build mask for valid feature vectors.
-    
-    Args:
-        feat: (N, D) feature array
-        norm_thresh: Minimum L2 norm threshold (default 0.0)
-    
-    Returns:
-        valid_mask: (N,) boolean mask
-        norms: (N,) L2 norms
-    """
-    # Finite mask (no NaN/Inf)
-    finite_mask = np.isfinite(feat).all(axis=1)
-    
-    # L2 norm in chunks (memory efficient)
-    n, c = feat.shape
-    chunk = max(1, 1_000_000 // max(1, c))
-    norms = np.empty(n, dtype=np.float32)
-    
+def build_valid_mask(feat, norm_thresh=0.0):
+    """Return (valid_mask, norms).  Filters NaN/Inf and zero-norm rows."""
+    finite  = np.isfinite(feat).all(axis=1)
+    n, c    = feat.shape
+    chunk   = max(1, 1_000_000 // max(1, c))
+    norms   = np.empty(n, dtype=np.float32)
     for i in range(0, n, chunk):
         sl = slice(i, min(i + chunk, n))
         norms[sl] = np.linalg.norm(feat[sl].astype(np.float32, copy=False), axis=1)
-    
-    # Norm mask (above threshold)
-    norm_mask = norms > norm_thresh
-    
-    valid = finite_mask & norm_mask
-    return valid, norms
+    return finite & (norms > norm_thresh), norms
 
 
-def write_ply_with_colors(coords: np.ndarray, colors: np.ndarray, output_path: str):
-    """
-    Write PLY file with positions and colors.
-    
-    Uses plyfile if available, otherwise writes manually.
-    
-    Args:
-        coords: (N, 3) positions
-        colors: (N, 3) RGB colors in [0, 1]
-        output_path: Path to save PLY
-    """
-    n = len(coords)
-    
-    # Convert colors to 0-255 range
-    colors_255 = (colors * 255).astype(np.uint8)
-    
+def write_ply_with_colors(coords, colors, output_path):
+    """Write PLY with float positions and uint8 colors (plyfile or manual)."""
+    n          = len(coords)
+    colors_u8  = (np.clip(colors, 0.0, 1.0) * 255).astype(np.uint8)
+
     if HAS_PLYFILE:
-        # Use plyfile library (preferred)
-        vertex_dtype = [
-            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
-        ]
-        
-        vertices = np.empty(n, dtype=vertex_dtype)
-        vertices['x'] = coords[:, 0]
-        vertices['y'] = coords[:, 1]
-        vertices['z'] = coords[:, 2]
-        vertices['red'] = colors_255[:, 0]
-        vertices['green'] = colors_255[:, 1]
-        vertices['blue'] = colors_255[:, 2]
-        
-        el = PlyElement.describe(vertices, 'vertex')
-        PlyData([el], text=False).write(output_path)
-        
+        vdtype  = [('x','f4'),('y','f4'),('z','f4'),
+                   ('red','u1'),('green','u1'),('blue','u1')]
+        verts   = np.empty(n, dtype=vdtype)
+        verts['x'], verts['y'], verts['z'] = coords[:,0], coords[:,1], coords[:,2]
+        verts['red'], verts['green'], verts['blue'] = \
+            colors_u8[:,0], colors_u8[:,1], colors_u8[:,2]
+        PlyData([PlyElement.describe(verts, 'vertex')], text=False).write(str(output_path))
     else:
-        # Write PLY manually (fallback)
         with open(output_path, 'wb') as f:
-            # Header
-            header = f"""ply
-format binary_little_endian 1.0
-element vertex {n}
-property float x
-property float y
-property float z
-property uchar red
-property uchar green
-property uchar blue
-end_header
-"""
+            header = (f"ply\nformat binary_little_endian 1.0\n"
+                      f"element vertex {n}\n"
+                      f"property float x\nproperty float y\nproperty float z\n"
+                      f"property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                      f"end_header\n")
             f.write(header.encode('ascii'))
-            
-            # Vertex data
             for i in range(n):
-                # Write position (3 floats)
                 f.write(coords[i].astype(np.float32).tobytes())
-                # Write color (3 unsigned bytes)
-                f.write(colors_255[i].tobytes())
+                f.write(colors_u8[i].tobytes())
 
 
-def visualize_semantic_features(
-    coords: np.ndarray,
-    features: np.ndarray,
-    output_path: str,
-    brightness: float = 1.25,
-    pca_q: int = 6,
-    pca_niter: int = 5,
-    device: str = "cpu",
-    verbose: bool = True
-) -> Optional[str]:
+# ============================================================================
+# MODE 1 — PER-GAUSSIAN SEMANTIC FEATURES (InfoNCE decoder output)
+# ============================================================================
+
+def visualize_semantic_features(coords, features, output_path, brightness=1.25,
+                                 pca_q=6, pca_niter=5, device='cpu', verbose=True):
     """
-    Visualize semantic features using PCA-based coloring.
-    
-    NO Open3D required! Uses plyfile or manual PLY writing.
-    
+    Visualize per-Gaussian semantic features using PCA-based coloring.
+
     Args:
-        coords: (N, 3) numpy array of 3D positions
-        features: (N, D) numpy array of semantic features
-        output_path: Path to save PLY file
-        brightness: Brightness multiplier for colors
-        pca_q: Number of principal components
-        pca_niter: Number of iterations for PCA
-        device: Torch device ('cpu' or 'cuda')
-        verbose: Print progress messages
-    
+        coords:      [N, 3]  numpy — 3D Gaussian positions
+        features:    [N, D]  numpy — semantic projection features (e.g. [N, 32])
+        output_path: str     — output PLY path
+        brightness:  float   — brightness multiplier (default 1.25)
+
     Returns:
-        output_path if successful, None if failed
+        output_path str if successful, None otherwise.
+
+    Diagnostic use:
+        If per-Gaussian InfoNCE is working, Gaussians of the same ScanNet72
+        category should show similar PCA-derived colors across the scene.
+        Load alongside original-color PLY in SuperSplat and compare region colors.
     """
     try:
         if verbose:
-            print(f"\n{'='*70}")
-            print("PCA FEATURE VISUALIZATION")
-            print(f"{'='*70}")
-            print(f"Input: {features.shape[0]} points, {features.shape[1]}-dim features")
-        
-        # Filter invalid features
-        valid_mask, norms = build_valid_mask(features, norm_thresh=0.0)
-        n_valid = int(valid_mask.sum())
-        n_total = features.shape[0]
-        
+            print(f"\n{'='*60}")
+            print(f"PCA FEATURE VISUALIZATION — per-Gaussian ({features.shape})")
+            print(f"{'='*60}")
+
+        valid, _ = build_valid_mask(features, norm_thresh=0.0)
+        n_valid  = int(valid.sum())
         if verbose:
-            print(f"Valid features: {n_valid}/{n_total} ({n_valid/n_total*100:.2f}%)")
-        
+            print(f"  Valid features: {n_valid}/{len(features)}")
         if n_valid == 0:
-            print("⚠️  No valid features! Skipping visualization.")
+            print("  No valid features — skipping.")
             return None
-        
-        # Filter features and coords
-        feat_valid = features[valid_mask]
-        coords_valid = coords[valid_mask]
-        
-        # Convert to torch
-        if verbose:
-            print("Computing PCA colors...")
-        
-        feat_t = torch.from_numpy(feat_valid).to(torch.float32).to(device)
-        
+
+        feat_v   = torch.from_numpy(features[valid]).float().to(device)
         with torch.no_grad():
-            color_t = get_pca_color_torch(
-                feat_t,
-                brightness=brightness,
-                center=True,
-                q=pca_q,
-                niter=pca_niter
-            )
-        
-        colors = color_t.cpu().numpy().astype(np.float32)  # (N, 3) in [0,1]
-        
-        # Write PLY file (NO Open3D!)
+            color_t = get_pca_color_torch(feat_v, brightness=brightness,
+                                          q=pca_q, niter=pca_niter)
+        colors = color_t.cpu().numpy()
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        write_ply_with_colors(coords[valid], colors, str(output_path))
+
         if verbose:
-            print("Writing PLY file...")
-        
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        write_ply_with_colors(coords_valid, colors, str(output_path))
-        
-        if verbose:
-            print(f"✓ Saved PCA visualization: {output_path}")
-            print(f"  Points: {len(coords_valid)}")
-            print(f"  Color range: R[{colors[:,0].min():.3f}, {colors[:,0].max():.3f}] "
-                  f"G[{colors[:,1].min():.3f}, {colors[:,1].max():.3f}] "
-                  f"B[{colors[:,2].min():.3f}, {colors[:,2].max():.3f}]")
-            print(f"{'='*70}\n")
-        
+            print(f"  Saved: {output_path}  ({n_valid} pts)")
         return str(output_path)
-        
+
     except Exception as e:
-        print(f"⚠️  Error during PCA visualization: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"  PCA visualization error: {e}")
+        import traceback; traceback.print_exc()
         return None
 
 
-def visualize_comparison(
-    coords: np.ndarray,
-    semantic_features: np.ndarray,
-    positions: np.ndarray,
-    colors: np.ndarray,
-    output_dir: Path,
-    scene_name: str = "scene",
-    brightness: float = 1.25
-) -> dict:
+# ============================================================================
+# MODE 2 — SCENE-LEVEL Z_S SPACE (z_s InfoNCE projections)
+# ============================================================================
+
+# Heuristic RGB colors for the 8 most common ScanNet72 super-categories.
+# Used to color-code scenes in the z_s PLY by dominant category.
+_CATEGORY_COLORS = {
+    # floor/wall/ceiling  (structural)
+    0:  [0.55, 0.55, 0.55],   # wall
+    1:  [0.70, 0.70, 0.65],   # floor
+    2:  [0.80, 0.78, 0.72],   # cabinet
+    # furniture           (warm)
+    3:  [0.90, 0.55, 0.20],   # bed
+    4:  [0.85, 0.35, 0.20],   # chair
+    5:  [0.80, 0.40, 0.25],   # sofa
+    6:  [0.75, 0.50, 0.15],   # table
+    7:  [0.70, 0.45, 0.10],   # door
+    # display / tech      (blue)
+    8:  [0.20, 0.40, 0.80],   # window
+    9:  [0.15, 0.35, 0.75],   # bookshelf
+    10: [0.10, 0.30, 0.70],   # picture
+    11: [0.25, 0.55, 0.85],   # counter
+    # bathroom            (cyan)
+    12: [0.20, 0.70, 0.70],   # blinds
+    14: [0.30, 0.75, 0.75],   # sink
+    15: [0.25, 0.65, 0.65],   # bathtub
+    # misc / default      (purple)
+}
+_DEFAULT_COLOR = [0.60, 0.25, 0.70]
+
+
+def _dominant_category_color(label_dist_row):
+    """Return RGB color for the dominant ScanNet72 category in label_dist."""
+    dom = int(np.argmax(label_dist_row))
+    return _CATEGORY_COLORS.get(dom, _DEFAULT_COLOR)
+
+
+def visualize_z_s_space(z_s_proj, label_dists, output_path,
+                         brightness=1.0, device='cpu', verbose=True):
     """
-    Create comparison visualizations (NO Open3D!):
-    1. Semantic features (PCA colored)
-    2. Position features (PCA colored)
-    3. Original colors
-    
+    Visualize the z_s latent space as a scene-scatter PLY.
+
+    Each point = one scene.  Position is the PCA projection of z_s_proj to 3D.
+    Color is derived from the dominant ScanNet72 category in label_dist.
+
+    If z_s InfoNCE is working:
+      — scenes with similar dominant categories should cluster spatially.
+      — the PLY will show colored clusters in SuperSplat when scaled up.
+
     Args:
-        coords: (N, 3) 3D positions
-        semantic_features: (N, D) semantic features
-        positions: (N, 3) position features (for baseline)
-        colors: (N, 3) original RGB colors [0,1]
-        output_dir: Directory to save visualizations
-        scene_name: Name for output files
-        brightness: Brightness multiplier
-    
+        z_s_proj:    [M, D_proj]  numpy — L2-normalized z_s projections
+                                  (from SemanticTokenInfoNCEHead, D_proj=128)
+        label_dists: [M, 72]      numpy — per-scene label distributions
+        output_path: str          — output PLY path
+        brightness:  float        — brightness multiplier (default 1.0)
+
     Returns:
-        dict with paths to saved files
+        output_path if successful, None otherwise.
+
+    Diagnostic:
+        Open z_s_space_epoch_NNN.ply in SuperSplat.  Use a large splat scale
+        (e.g. 0.5m) to make the 50 scene-points visible.  Same-category scenes
+        should cluster — e.g. all apartment scenes in one corner.
+        Compare epochs to see if clustering improves with training.
+    """
+    try:
+        M = z_s_proj.shape[0]
+        if M < 3:
+            print(f"  z_s visualization: need ≥3 scenes (got {M}) — skipping.")
+            return None
+
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Z_S SPACE VISUALIZATION — {M} scenes, "
+                  f"proj_dim={z_s_proj.shape[1]}")
+            print(f"{'='*60}")
+
+        # ── PCA: project z_s_proj [M, D] → 3D positions ───────────────────
+        feat_t = torch.from_numpy(z_s_proj.astype(np.float32)).to(device)
+        with torch.no_grad():
+            q_actual = min(6, feat_t.shape[0] - 1, feat_t.shape[1])
+            u, s, v  = torch.pca_lowrank(feat_t, q=q_actual, center=True, niter=10)
+            proj3d   = (feat_t @ v[:, :3]).cpu().numpy()          # [M, 3]
+
+        # Scale to ≈10m range so it's visible at normal scene scale
+        rng  = proj3d.max(0) - proj3d.min(0)
+        rng  = np.where(rng < 1e-6, 1.0, rng)
+        proj3d = (proj3d - proj3d.min(0)) / rng * 8.0 - 4.0       # [−4, +4]^3
+
+        # ── Colors from dominant ScanNet72 category ────────────────────────
+        colors = np.array(
+            [_dominant_category_color(label_dists[i]) for i in range(M)],
+            dtype=np.float32)                                      # [M, 3]
+        colors = np.clip(colors * brightness, 0.0, 1.0)
+
+        # ── Each scene rendered as a "fat Gaussian" (uniform scale) ────────
+        # We write the scene point with scale=0.3m so it's visible in SuperSplat
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        write_ply_with_colors(proj3d, colors, str(output_path))
+
+        if verbose:
+            dom_cats = np.argmax(label_dists, axis=1)
+            unique_c = len(np.unique(dom_cats))
+            print(f"  Saved: {output_path}")
+            print(f"  Scenes: {M}  |  Unique dominant cats: {unique_c}")
+            print(f"  Position range: [{proj3d.min():.2f}, {proj3d.max():.2f}]m")
+            print(f"  To view: open in SuperSplat, increase splat scale to ≈0.5m")
+        return str(output_path)
+
+    except Exception as e:
+        print(f"  z_s visualization error: {e}")
+        import traceback; traceback.print_exc()
+        return None
+
+
+# ============================================================================
+# COMBINED COMPARISON UTILITY
+# ============================================================================
+
+def visualize_comparison(coords, semantic_features, positions, colors,
+                          output_dir, scene_name='scene', brightness=1.25):
+    """
+    Write 3 PLY files for visual comparison (no Open3D):
+      1. PCA of semantic projection features
+      2. PCA of position features (baseline)
+      3. Original colors
+
+    Args:
+        coords:            [N, 3]  3D positions
+        semantic_features: [N, D]  semantic projection features
+        positions:         [N, 3]  position features (baseline)
+        colors:            [N, 3]  original RGB [0,1]
+        output_dir:        Path
+        scene_name:        str
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    results = {}
-    
-    # 1. Semantic features
+    results    = {}
+
     print("Generating semantic feature visualization...")
-    semantic_path = visualize_semantic_features(
-        coords=coords,
-        features=semantic_features,
+    sp = visualize_semantic_features(
+        coords=coords, features=semantic_features,
         output_path=output_dir / f"{scene_name}_semantic_pca.ply",
-        brightness=brightness,
-        verbose=True
-    )
-    results['semantic'] = semantic_path
-    
-    # 2. Position baseline
+        brightness=brightness)
+    results['semantic'] = sp
+
     print("Generating position baseline visualization...")
-    position_path = visualize_semantic_features(
-        coords=coords,
-        features=positions,
+    pp = visualize_semantic_features(
+        coords=coords, features=positions,
         output_path=output_dir / f"{scene_name}_position_pca.ply",
-        brightness=brightness,
-        verbose=True
-    )
-    results['position'] = position_path
-    
-    # 3. Original colors
+        brightness=brightness)
+    results['position'] = pp
+
     print("Saving original colors...")
-    original_path = output_dir / f"{scene_name}_original_colors.ply"
-    write_ply_with_colors(coords, colors, str(original_path))
-    results['original'] = str(original_path)
-    print(f"✓ Saved original colors: {original_path}\n")
-    
+    op = output_dir / f"{scene_name}_original_colors.ply"
+    write_ply_with_colors(coords, colors, str(op))
+    results['original'] = str(op)
+    print(f"  Saved: {op}")
+
     return results
 
 
-# Test function
+# ============================================================================
+# QUICK TEST
+# ============================================================================
+
 if __name__ == "__main__":
-    print("Testing PCA feature visualization (NO Open3D!)...")
-    
-    # Create synthetic data
-    n_points = 10000
-    coords = np.random.randn(n_points, 3).astype(np.float32)
-    
-    # Create features with some structure (3 clusters)
-    features = np.random.randn(n_points, 32).astype(np.float32) * 0.5
-    cluster_ids = np.random.randint(0, 3, n_points)
+    print("Testing PCA visualization...")
+
+    # Per-Gaussian test
+    N      = 5000
+    coords = np.random.randn(N, 3).astype(np.float32)
+    feats  = np.random.randn(N, 32).astype(np.float32)
     for i in range(3):
-        mask = cluster_ids == i
-        features[mask] += np.random.randn(32) * 5  # Add cluster offset
-    
-    # Visualize
-    output_path = visualize_semantic_features(
-        coords=coords,
-        features=features,
-        output_path="test_pca_vis.ply",
-        brightness=1.25
-    )
-    
-    if output_path:
-        print(f"✓ Test successful! Saved to: {output_path}")
-        print("\n✓ NO Open3D needed! Uses plyfile or manual PLY writing.")
-    else:
-        print("✗ Test failed!")
+        feats[i * N//3 : (i+1) * N//3] += np.random.randn(32) * 5
+    path = visualize_semantic_features(coords, feats, "/tmp/test_per_gaussian.ply")
+    print(f"Per-Gaussian PLY: {path}")
+
+    # z_s space test
+    M       = 30
+    z_s     = np.random.randn(M, 128).astype(np.float32)
+    z_s    /= np.linalg.norm(z_s, axis=1, keepdims=True) + 1e-8
+    ld      = np.zeros((M, 72), dtype=np.float32)
+    for i in range(M):
+        cat = i % 5
+        ld[i, cat * 5:(cat + 1) * 5] = np.random.dirichlet(np.ones(5))
+    path = visualize_z_s_space(z_s, ld, "/tmp/test_z_s_space.ply")
+    print(f"z_s space PLY:    {path}")
+    print("All tests passed.")

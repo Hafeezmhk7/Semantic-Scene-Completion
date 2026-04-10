@@ -10,80 +10,83 @@
 #SBATCH --error=logs/can3tok_%j.err
 
 # ============================================================================
-# CAN3TOK — INFERENCE-FIXED + OFFSET SUPERVISION + SCALE PENALTY
+# CAN3TOK — MAIN NEW IDEA: z_s cross-attention conditioning
 # ============================================================================
 #
-# CHANGES IN THIS VERSION:
-#
-#   1. AnchorPredFromTokens (inference fix):
-#      transformer_tokens -> predicted_anchors [B,512,3] inside decode()
-#      DC added to decoder positions -> output is absolute positions
-#      scaffold_token_ids=None at inference -> fixed j->j*512//40000
-#
-#   2. Offset supervision for position:
-#      Training target: OFFSETS (coord - GT_hard_anchor, range ~+-2m)
-#      L_recon and L_anchor are fully orthogonal (no overlap on DC term)
-#      PLY save: decoder output is already absolute, no post-processing needed
-#
-#   3. Cross-recon fix:
-#      decode() always outputs absolute positions (DC added inside)
-#      cross_recon now correctly uses target_abs for position
-#      CrossRecon will be numerically larger than before (was artificially
-#      small due to 5x scale mismatch). It will decrease as anchors converge.
-#
-#   4. Scale penalty (NEW):
-#      Penalises Gaussians with post-exp scale > SCALE_PENALTY_THRESHOLD (m)
-#      penalty = mean(clamp(scale - threshold, 0)^2)
-#      Set SCALE_PENALTY_WEIGHT=0.0 to disable (default, backward-compatible)
-#      Safe to add to any pre-trained checkpoint for fine-tuning
+# MAIN NEW IDEA: DECODER_ZS_CROSS_ATTN
+#   z_g [B, 496, 32] is the ONLY decoder input sequence.
+#   z_s [B,  16, 32] conditions every decoder transformer layer via cross-attention.
+#   Effect:
+#     - z_g CANNOT use z_s through the input sequence (structural enforcement)
+#     - decoder always consults z_s explicitly via attention weights
+#     - L_cross_recon gradient correctly isolates z_g (geometry-sufficiency)
+#     - At second stage: z_s → small DiT for scene type; z_g → main DiT for geometry
+#   Requires: LATENT_DISENTANGLE=True
 #
 # ABLATION HISTORY:
-#  Run | color | sem | scaf | disent | layout | PE | tc  | scale_pen | Result
-#  ----|-------|-----|------|--------|--------|----|-----|-----------|-------
-#  A   |  v    |     |      |        |        |    |     |           | L2=1.43
-#  H   |  v    | v   |      |   v    |   v    |    |     |           | L2=1.565
-#  K   |  v    | v   |      |   v    |   v    |    |     |           | L2~1.0-1.2
-#  P   |  v    | v   |      |   v    |   v    | v  |     |           | L2=1.38
-#  R   |  v    | v   | v    |   v    |   v    | v  | A   |           | L2=0.589
-#  T2  |  v    | v   | v    |   v    |   v    | v  | AB  |           | L2=0.606
-#  V   |  v    | v   | v    |   v    |   v    | v  | AB  |           | offset fix
-#  W   |  v    | v   | v    |   v    |   v    | v  | AB  | 0.1/0.5m  | <- THIS
+#  Run  | design           | L2
+#  -----|------------------|-------
+#  Old  | 512 tok → dec    | 0.79
+#  NEW  | z_g→dec, z_s→CA  | TBD
+#
 # ============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ============================================================================
-# FLAGS — EDIT THIS SECTION ONLY
+# FLAGS
 # ============================================================================
 
-# ── Checkpoint resuming ───────────────────────────────────────────────────────
-# To fine-tune an existing 2k-epoch checkpoint with scale penalty:
-#   RESUME_CHECKPOINT="/path/to/best_model.pth"
-#   RESUME_EPOCH=0        # reset counter for clean 200-epoch fine-tune run
-#   NUM_EPOCHS=200
-#   SCALE_PENALTY_WEIGHT=0.1
+# ── Checkpoint ────────────────────────────────────────────────────────────────
 RESUME_CHECKPOINT=""
 RESUME_EPOCH=""
 
+# ── MAIN NEW IDEA ─────────────────────────────────────────────────────────────
+# Set True to enable: z_g only → decoder; z_s → cross-attn conditioning.
+# Requires LATENT_DISENTANGLE=True.
+# Set False for legacy mode (all 512 tokens → decoder, backward compatible).
+DECODER_ZS_CROSS_ATTN=True
+
 # ── Core contributions ────────────────────────────────────────────────────────
-COLOR_RESIDUAL=False
+COLOR_RESIDUAL=True
 MEAN_COLOR_WEIGHT=1.0
 COLOR_LOSS_WEIGHT=1.0
 SCENE_SEMANTIC_HEAD=False
 SCENE_SEMANTIC_WEIGHT=0.3
 
-# ── Position scaffold ─────────────────────────────────────────────────────────
-# Must be True for AnchorPredFromTokens to activate.
-# Offset supervision is applied automatically when True.
-POSITION_SCAFFOLD=False
-ANCHOR_LOSS_WEIGHT=0.0
+# ── Latent disentanglement ────────────────────────────────────────────────────
+# Must be True when DECODER_ZS_CROSS_ATTN=True
+LATENT_DISENTANGLE=True
+SEMANTIC_DIMS=512           # 512/32=16 z_s tokens; 512-16=496 z_g tokens
+CROSS_RECON_WEIGHT=0.0     # Still useful: reinforces z_g geometry-sufficiency
+ORTHO_WEIGHT=0.0           # Still useful: linear independence of mu_s and mu_g
 
-# ── Decoder shape conditioning ────────────────────────────────────────────────
-DECODER_SHAPE_PREPEND=False
-DECODER_SHAPE_CROSS_ATTN=False
-DECODER_CROSS_ATTN_LAYERS=6
+# ── Scene layout head ─────────────────────────────────────────────────────────
+SCENE_LAYOUT_HEAD=False
+LAYOUT_LOSS_WEIGHT=0.3
 
-# ── InfoNCE ───────────────────────────────────────────────────────────────────
+# ── Fourier PE (for z_g decoder tokens) ──────────────────────────────────────
+# With DECODER_ZS_CROSS_ATTN=True: FourierPE applies to the 496 z_g tokens.
+DECODER_FOURIER_PE=True
+DECODER_POS_ENC=False
+
+# ── Semantic token heads ──────────────────────────────────────────────────────
+# Runs color/semantic/layout heads on z tokens 0-15 (z_s subspace).
+# Requires LATENT_DISENTANGLE=True.
+# Inference-clean: second stage needs only z, not shape_embed.
+SEMANTIC_TOKEN_HEADS=False
+
+# ── Legacy token conditioning (auto-disabled when DECODER_ZS_CROSS_ATTN=True) ─
+# When using the new design, z_s is already conditioning via cross-attention.
+# TokenCond and AdaLN are not needed and are ignored by the model.
+TOKEN_COND=False
+TOKEN_COND_APPROACH="B"
+TOKEN_COND_ADALN=False
+
+# ── Per-Gaussian InfoNCE (original, ablation only) ────────────────────────────
+# Disabled by default. Enable for ablation comparison.
+# When enabled: decoder hidden state → SemanticProjectionHead → InfoNCE
+# PCA output: scene{i}_semantic_infonce.ply (fixed to work in eval mode)
 SEMANTIC_MODE="none"
 SEGMENT_WEIGHT=0.0
 INSTANCE_WEIGHT=0.0
@@ -91,98 +94,29 @@ SEMANTIC_TEMP=0.07
 SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
 
-# ── Latent disentanglement ────────────────────────────────────────────────────
-LATENT_DISENTANGLE=False
-SEMANTIC_DIMS=512
-CROSS_RECON_WEIGHT=0.3
-ORTHO_WEIGHT=0.1
-
-# ── Scene layout head ─────────────────────────────────────────────────────────
-SCENE_LAYOUT_HEAD=False
-LAYOUT_LOSS_WEIGHT=0.3
-
-# ── Position layout residual ──────────────────────────────────────────────────
-# Must be False when POSITION_SCAFFOLD=True (mutually exclusive)
-POSITION_LAYOUT_RESIDUAL=False
-
-# ── JEPA Idea 1 ───────────────────────────────────────────────────────────────
-JEPA_IDEA1=False
-JEPA_IDEA1_WEIGHT=1.0
-
-# ── Idea 0: Decoder positional encoding ──────────────────────────────────────
-DECODER_POS_ENC=False
-
-# ── Idea 1: Segment label prediction ─────────────────────────────────────────
-PREDICT_SEG_LABELS=False
-SEG_PRED_WEIGHT=0.3
-
-# ── Idea 2: Token centroid conditioning ──────────────────────────────────────
-TOKEN_COND=False
-TOKEN_COND_APPROACH="B"
-
-# ── Idea 3: Query decoder ────────────────────────────────────────────────────
-QUERY_DECODER=False
-
-# ============================================================================
-# NEW ABLATION FLAGS
-# Set all three to True together for the full new architecture.
-# Each can be enabled independently for ablation.
-# ============================================================================
-
-# ── Ablation A: 3D Fourier Positional Encoding ────────────────────────────────
-# Replaces learnable PE [512, 384] with Fourier PE over the 8³ voxel grid.
-# Nearby voxels get similar PE by construction (spatial inductive bias).
-# Consistent with the encoder's Fourier embedder (spectral continuity).
-# Takes priority over DECODER_POS_ENC=True if both are set.
-# Recommended: pair with DECODER_POS_ENC=False to avoid confusion.
-DECODER_FOURIER_PE=False
-
-# ── Ablation B: Per-layer AdaLN-Zero conditioning ────────────────────────────
-# Replaces the once-before-stack additive TokenCond B bias with per-layer
-# AdaLN-Zero modulation inside each of the 12 decoder transformer layers.
-# Zero-init → identity at start → safe to resume from any checkpoint.
-# Requires TOKEN_COND=True and TOKEN_COND_APPROACH to contain "B".
-TOKEN_COND_ADALN=False
-
-# ── Ablation C: Semantic Token Heads ─────────────────────────────────────────
-# Runs prediction heads on z token subsets instead of shape_embed:
-#   Token 0  (z[:, :32])         → MeanColorHead  → [B, 3]
-#   Tokens 1-15 (z[:, 32:512])   → SceneSemanticHead → [B, 72]
-#                                → SceneLayoutHead   → [B, 72, 3]
-# At second-stage inference: DiT generates z → extract tokens 0-15
-# → run heads → set decoder conditioning → decode. No shape_embed needed.
+# ── Scene-level z_s InfoNCE (NEW) ─────────────────────────────────────────────
+# Operates on SemanticTokenInfoNCEHead projections [B,128].
+# Positive pairs: scenes with cosine_sim(label_dist_i, label_dist_j) > DELTA.
 # Requires LATENT_DISENTANGLE=True.
-SEMANTIC_TOKEN_HEADS=False
+# PCA output: z_s_space_epoch_NNN.ply (one point per eval scene)
+#
+# Z_S_INFONCE_WEIGHT: 0=disabled, 0.1=recommended start, 0.3=stronger
+# Z_S_INFONCE_DELTA:  min cos_sim for positive pair; 0.4 removes wall/floor noise
+# Watch: Z_sNCE= and Z_sNPos= in training output. Z_sNPos=0 → reduce DELTA.
+Z_S_INFONCE_WEIGHT=0.3
+Z_S_INFONCE_TEMPERATURE=0.07
+Z_S_INFONCE_DELTA=0.4
 
-# ── SCALE PENALTY ─────────────────────────────────────────────────────────────
-# Penalises post-exp scale values above the threshold (metres).
-# Formula: mean(clamp(scale - threshold, 0)^2) weighted by SCALE_PENALTY_WEIGHT
-#
-# SCALE_PENALTY_WEIGHT guide:
-#   0.0  = disabled, no change to training (default, backward-compatible)
-#   0.05 = gentle nudge — good starting point if scale is only slightly high
-#   0.1  = recommended for fine-tuning a trained checkpoint with Scl > 10
-#   0.2  = aggressive — use only if Scl is very large (>50) and other losses stable
-#
-# SCALE_PENALTY_THRESHOLD guide (metres):
-#   0.5  = 50cm — permissive, only penalises clearly bloated Gaussians
-#   0.3  = 30cm — recommended for indoor SceneSplat scenes
-#   0.2  = 20cm — strict, use if you want very compact Gaussians
-#
-# Check batch-0 diagnostic in log:
-#   [SCALE PENALTY] frac above threshold: XX.X%
-#   If >50%: start with weight=0.05 to avoid disrupting other losses
-#   If <20%: weight=0.1 or 0.2 is safe
+# ── Scale penalty ─────────────────────────────────────────────────────────────
 SCALE_PENALTY_WEIGHT=0.0
 SCALE_PENALTY_THRESHOLD=0.5
 
 # ── Core training ─────────────────────────────────────────────────────────────
-BATCH_SIZE=100
+BATCH_SIZE=64
 NUM_EPOCHS=2000
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-5
 EVAL_EVERY=50
-FAILURE_THRESHOLD=100
 
 # ── LR scheduler ──────────────────────────────────────────────────────────────
 WEIGHT_DECAY=1e-2
@@ -199,6 +133,11 @@ USE_CANONICAL_NORM=True
 SCALE_NORM_MODE="linear"
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
+# PCA_VIS_FREQ: how often to write PLYs.
+#   scene{i}_input.ply            — raw input features
+#   scene{i}_recon.ply            — reconstructed features
+#   scene{i}_semantic_infonce.ply — per-Gaussian InfoNCE features (eval-mode fixed)
+#   z_s_space_epoch_NNN.ply       — scene-level z_s space (one point per scene)
 PCA_VIS_FREQ=500
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
@@ -213,77 +152,53 @@ USE_WANDB=False
 # ============================================================================
 # VALIDATION
 # ============================================================================
-
-if [ "$TOKEN_COND" = "True" ] && echo "$TOKEN_COND_APPROACH" | grep -q "A"; then
-    if [ "$POSITION_SCAFFOLD" = "False" ]; then
-        echo "[INFO] TOKEN_COND approach A requires POSITION_SCAFFOLD. Enabling."
-        POSITION_SCAFFOLD=True
-    fi
-    if [ "$POSITION_LAYOUT_RESIDUAL" = "True" ]; then
-        echo "[INFO] TOKEN_COND approach A uses scaffold. Disabling POSITION_LAYOUT_RESIDUAL."
-        POSITION_LAYOUT_RESIDUAL=False
-    fi
-fi
-
-if [ "$QUERY_DECODER" = "True" ]; then
-    if [ "$POSITION_SCAFFOLD" = "False" ]; then
-        echo "[INFO] QUERY_DECODER requires POSITION_SCAFFOLD. Enabling."
-        POSITION_SCAFFOLD=True
-    fi
-    if [ "$POSITION_LAYOUT_RESIDUAL" = "True" ]; then
-        echo "[INFO] QUERY_DECODER uses scaffold. Disabling POSITION_LAYOUT_RESIDUAL."
-        POSITION_LAYOUT_RESIDUAL=False
-    fi
-fi
-
-if [ "$POSITION_SCAFFOLD" = "True" ] && [ "$POSITION_LAYOUT_RESIDUAL" = "True" ]; then
-    echo "ERROR: POSITION_SCAFFOLD and POSITION_LAYOUT_RESIDUAL are mutually exclusive."
-    exit 1
-fi
-
-if [ "$TOKEN_COND_ADALN" = "True" ] && [ "$TOKEN_COND" = "False" ]; then
-    echo "[WARNING] TOKEN_COND_ADALN requires TOKEN_COND=True. AdaLN will be disabled."
-fi
-if [ "$TOKEN_COND_ADALN" = "True" ] && ! echo "$TOKEN_COND_APPROACH" | grep -q "B"; then
-    echo "[WARNING] TOKEN_COND_ADALN requires TOKEN_COND_APPROACH to include B."
+if [ "$DECODER_ZS_CROSS_ATTN" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; then
+    echo "ERROR: DECODER_ZS_CROSS_ATTN=True requires LATENT_DISENTANGLE=True"; exit 1
 fi
 if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; then
-    echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True."
-    exit 1
+    echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True"; exit 1
+fi
+if [ "$(echo "$Z_S_INFONCE_WEIGHT > 0" | bc -l 2>/dev/null || echo 0)" = "1" ] && \
+   [ "$LATENT_DISENTANGLE" = "False" ]; then
+    echo "ERROR: Z_S_INFONCE_WEIGHT > 0 requires LATENT_DISENTANGLE=True"; exit 1
 fi
 
 echo "========================================================================"
-echo "  CAN3TOK — Ablation: FourierPE / AdaLN / SemanticTokenHeads"
+echo "  CAN3TOK — MAIN NEW IDEA"
 echo "========================================================================"
 echo ""
-echo "  Core contributions:"
-echo "    color_residual=$COLOR_RESIDUAL | scene_semantic=$SCENE_SEMANTIC_HEAD"
-echo "    position_scaffold=$POSITION_SCAFFOLD | latent_disentangle=$LATENT_DISENTANGLE"
-echo "    scene_layout_head=$SCENE_LAYOUT_HEAD"
-echo "    token_cond=$TOKEN_COND approach=$TOKEN_COND_APPROACH"
-echo ""
-echo "  New ablation flags:"
-echo "    decoder_fourier_pe=$DECODER_FOURIER_PE  (Fourier PE, replaces learnable)"
-echo "    decoder_pos_enc=$DECODER_POS_ENC  (learnable PE — used if fourier_pe=False)"
-echo "    token_cond_adaln=$TOKEN_COND_ADALN  (per-layer AdaLN-Zero)"
-echo "    semantic_token_heads=$SEMANTIC_TOKEN_HEADS  (heads on z tokens 0-15)"
-echo ""
-echo "  Scale penalty:"
-if [ "$SCALE_PENALTY_WEIGHT" = "0.0" ] || [ "$SCALE_PENALTY_WEIGHT" = "0" ]; then
-    echo "    DISABLED (SCALE_PENALTY_WEIGHT=0)"
+echo "  DECODER_ZS_CROSS_ATTN=$DECODER_ZS_CROSS_ATTN"
+if [ "$DECODER_ZS_CROSS_ATTN" = "True" ]; then
+    N_ZS=$((SEMANTIC_DIMS / 32))
+    N_ZG=$((512 - N_ZS))
+    echo "    z_s: $N_ZS tokens → cross-attn K/V (NOT in decoder sequence)"
+    echo "    z_g: $N_ZG tokens → decoder input sequence"
+    echo "    GS_decoder input: $((N_ZG * 384)) dims  (was $((512 * 384)))"
 else
-    echo "    weight=$SCALE_PENALTY_WEIGHT  threshold=${SCALE_PENALTY_THRESHOLD}m  ACTIVE"
+    echo "    LEGACY: all 512 tokens → decoder"
 fi
 echo ""
-echo "  LR: peak=$LEARNING_RATE | floor=1e-5 | warmup=$WARMUP_STEPS"
-echo "  Dataset: $TRAIN_SCENES train, $VAL_SCENES val | BS=$BATCH_SIZE | epochs=$NUM_EPOCHS"
+echo "  Disentanglement:"
+echo "    latent_disentangle=$LATENT_DISENTANGLE  semantic_dims=$SEMANTIC_DIMS"
+echo "    cross_recon=$CROSS_RECON_WEIGHT  ortho=$ORTHO_WEIGHT"
+echo ""
+echo "  Decoder:"
+echo "    fourier_pe=$DECODER_FOURIER_PE"
+echo "    semantic_token_heads=$SEMANTIC_TOKEN_HEADS"
+echo "    scene_layout_head=$SCENE_LAYOUT_HEAD"
+echo "    token_cond=$TOKEN_COND (auto-disabled with ZS_CROSS_ATTN=True)"
+echo ""
+echo "  InfoNCE:"
+echo "    Per-Gaussian: mode=$SEMANTIC_MODE  weight=$SEGMENT_WEIGHT"
+echo "    Scene z_s:    weight=$Z_S_INFONCE_WEIGHT  temp=$Z_S_INFONCE_TEMPERATURE  delta=$Z_S_INFONCE_DELTA"
+echo ""
+echo "  LR: $LEARNING_RATE | warmup=$WARMUP_STEPS | BS=$BATCH_SIZE | epochs=$NUM_EPOCHS"
 echo "========================================================================"
 echo ""
 
 # ============================================================================
 # ENVIRONMENT
 # ============================================================================
-
 module purge && module load 2023 && module load CUDA/12.1.1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
@@ -308,11 +223,11 @@ fi
 echo ""
 
 # ============================================================================
-# BUILD TRAINING COMMAND
+# BUILD COMMAND
 # ============================================================================
-
 ACCELERATE_CONFIG="/home/yli11/scratch/Hafeez_thesis/Can3Tok/job_scripts/accelerate_config.yaml"
 TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
+
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
@@ -321,25 +236,43 @@ TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY"
 TRAIN_CMD="$TRAIN_CMD --warmup_steps $WARMUP_STEPS"
 TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO"
 TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
-TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
 TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
 
-[ "$COLOR_RESIDUAL"           = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
+# Main new idea
+[ "$DECODER_ZS_CROSS_ATTN"  = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_zs_cross_attn"
+
+# Core
+[ "$COLOR_RESIDUAL"          = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
 TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
-
-[ "$SCENE_SEMANTIC_HEAD"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
+[ "$SCENE_SEMANTIC_HEAD"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
 TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
 
-[ "$POSITION_SCAFFOLD"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold"
-TRAIN_CMD="$TRAIN_CMD --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
+# Disentanglement
+[ "$LATENT_DISENTANGLE"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
+TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
+TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --ortho_weight $ORTHO_WEIGHT"
 
-[ "$DECODER_SHAPE_PREPEND"    = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_prepend"
-[ "$DECODER_SHAPE_CROSS_ATTN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_shape_cross_attn"
-TRAIN_CMD="$TRAIN_CMD --decoder_cross_attn_layers $DECODER_CROSS_ATTN_LAYERS"
+# Layout
+[ "$SCENE_LAYOUT_HEAD"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
+TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
 
+# Decoder PE
+[ "$DECODER_POS_ENC"         = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_pos_enc"
+[ "$DECODER_FOURIER_PE"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
+
+# Token conditioning (legacy, model auto-disables with ZS_CROSS_ATTN)
+[ "$TOKEN_COND"              = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond"
+[ "$TOKEN_COND"              = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_approach $TOKEN_COND_APPROACH"
+[ "$TOKEN_COND_ADALN"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_adaln"
+
+# Semantic token heads
+[ "$SEMANTIC_TOKEN_HEADS"    = "True" ] && TRAIN_CMD="$TRAIN_CMD --semantic_token_heads"
+
+# Per-Gaussian InfoNCE
 TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
 TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
@@ -347,36 +280,20 @@ TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
-[ "$LATENT_DISENTANGLE"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
-TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
-TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT"
-TRAIN_CMD="$TRAIN_CMD --ortho_weight $ORTHO_WEIGHT"
+# Scene z_s InfoNCE
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_weight $Z_S_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_temperature $Z_S_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_delta $Z_S_INFONCE_DELTA"
 
-[ "$SCENE_LAYOUT_HEAD"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
-TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
-[ "$POSITION_LAYOUT_RESIDUAL" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_layout_residual"
-
-[ "$JEPA_IDEA1"               = "True" ] && TRAIN_CMD="$TRAIN_CMD --jepa_idea1"
-TRAIN_CMD="$TRAIN_CMD --jepa_idea1_weight $JEPA_IDEA1_WEIGHT"
-
-[ "$DECODER_POS_ENC"          = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_pos_enc"
-[ "$PREDICT_SEG_LABELS"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --predict_seg_labels"
-TRAIN_CMD="$TRAIN_CMD --seg_pred_weight $SEG_PRED_WEIGHT"
-[ "$TOKEN_COND"               = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond"
-[ "$TOKEN_COND"               = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_approach $TOKEN_COND_APPROACH"
-[ "$QUERY_DECODER"            = "True" ] && TRAIN_CMD="$TRAIN_CMD --query_decoder"
-# New ablation flags
-[ "$DECODER_FOURIER_PE"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
-[ "$TOKEN_COND_ADALN"         = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_adaln"
-[ "$SEMANTIC_TOKEN_HEADS"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --semantic_token_heads"
-
-# Scale penalty flags (always passed — 0.0 means disabled)
+# Scale penalty
 TRAIN_CMD="$TRAIN_CMD --scale_penalty_weight $SCALE_PENALTY_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --scale_penalty_threshold $SCALE_PENALTY_THRESHOLD"
 
+# Normalisation
 TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
-[ "$USE_CANONICAL_NORM"       = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+[ "$USE_CANONICAL_NORM" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
 
+# Visualisation
 TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
 TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
@@ -384,12 +301,12 @@ TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
 
+# W&B
 if [ "$USE_WANDB" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --use_wandb"
-    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-SceenSplat-7K"
-    TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
+    TRAIN_CMD="$TRAIN_CMD --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC"
 fi
 
+# Checkpoint resume
 if [ -n "$RESUME_CHECKPOINT" ]; then
     TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
     [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
@@ -401,7 +318,6 @@ echo ""
 # ============================================================================
 # RUN
 # ============================================================================
-
 SECONDS=0
 eval $TRAIN_CMD
 TRAIN_EXIT=$?
@@ -411,41 +327,40 @@ echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End:
 # ============================================================================
 # POST-RUN DIAGNOSTICS
 # ============================================================================
-
 if [ $TRAIN_EXIT -eq 0 ]; then
     echo ""
-    echo "COMPLETED. Key diagnostics:"
+    echo "COMPLETED."
     echo ""
-    echo "  1. Scale penalty convergence:"
-    echo "     grep 'ScalePenalty' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
-    echo "     ScalePenalty should decrease; Scl= should drop from ~62 toward ~5-10"
-    echo "     If position/rotation spikes: reduce SCALE_PENALTY_WEIGHT (try 0.05)"
-    echo ""
-    echo "  2. Batch-0 scale diagnostic:"
-    echo "     grep 'SCALE PENALTY' logs/can3tok_${SLURM_JOB_ID}.out | head -5"
-    echo "     Shows mean/max scale and fraction above threshold at epoch start"
-    echo ""
-    echo "  3. Offset supervision check:"
-    echo "     grep 'OFFSET SUPERVISION' logs/can3tok_${SLURM_JOB_ID}.out | head -5"
-    echo "     GT offset range should be ~+-2m (5x smaller than absolute +-10m)"
-    echo ""
-    echo "  4. AnchorPredFromTokens convergence:"
-    echo "     grep 'AnchorMSE' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
-    echo "     Should fall from ~4-8m at init toward ~0.5-1m"
-    echo ""
-    echo "  5. Cross-recon (after fix):"
-    echo "     grep 'CrossRecon' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
-    echo "     Numerically larger than before (was artificially small) but trending down"
-    echo ""
-    echo "  6. Best L2:"
+    echo "  1. Best L2:"
     echo "     grep 'NEW BEST' logs/can3tok_${SLURM_JOB_ID}.out | tail -5"
+    echo ""
+    echo "  2. Reconstruction quality per component:"
+    echo "     grep 'Pos=' logs/can3tok_${SLURM_JOB_ID}.out | tail -10"
+    echo ""
+    echo "  3. Cross-recon convergence (geometry-sufficiency of z_g):"
+    echo "     grep 'CrossRecon=' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
+    echo "     CrossRecon should decrease — z_g becomes geometry-sufficient."
+    echo ""
+    echo "  4. z_s InfoNCE (if enabled):"
+    echo "     grep 'Z_sNCE=' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
+    echo "     Z_sNPos=0 → reduce Z_S_INFONCE_DELTA"
+    echo ""
+    echo "  5. z_s space PLY (if PCA enabled):"
+    echo "     ls checkpoints/*/pca_visualisations/z_s_space_epoch_*.ply"
+    echo "     Open in SuperSplat (scale 0.5m) — same-category scenes cluster."
+    echo ""
+    echo "  6. Reconstruction PLYs:"
+    echo "     ls checkpoints/*/reconstructed_gaussians/epoch_*/*.ply"
+    echo ""
+    echo "  NEW DESIGN CHECK — compare to old:"
+    echo "     grep 'z_g only in decoder' logs/can3tok_${SLURM_JOB_ID}.out | head -3"
+    echo "     (should appear in batch-0 diagnostic if DECODER_ZS_CROSS_ATTN=True)"
 else
     echo ""
     echo "FAILED (exit $TRAIN_EXIT)"
     echo "  Common causes:"
-    echo "    POSITION_SCAFFOLD and POSITION_LAYOUT_RESIDUAL both True -> mutually exclusive"
-    echo "    TOKEN_COND approach A without POSITION_SCAFFOLD -> enable scaffold"
-    echo "    TOKEN_COND approach B without SCENE_LAYOUT_HEAD -> enable layout head"
-    echo "    OOM with QUERY_DECODER -> reduce BATCH_SIZE to 32"
-    echo "  Error log: cat logs/can3tok_${SLURM_JOB_ID}.err"
+    echo "    DECODER_ZS_CROSS_ATTN=True without LATENT_DISENTANGLE=True"
+    echo "    SEMANTIC_TOKEN_HEADS=True without LATENT_DISENTANGLE=True"
+    echo "    OOM: reduce BATCH_SIZE"
+    echo "  Error: cat logs/can3tok_${SLURM_JOB_ID}.err"
 fi
