@@ -45,7 +45,7 @@ RESUME_EPOCH=""
 # Set True to enable: z_g only → decoder; z_s → cross-attn conditioning.
 # Requires LATENT_DISENTANGLE=True.
 # Set False for legacy mode (all 512 tokens → decoder, backward compatible).
-DECODER_ZS_CROSS_ATTN=True
+DECODER_ZS_CROSS_ATTN=False
 
 # ── Core contributions ────────────────────────────────────────────────────────
 COLOR_RESIDUAL=True
@@ -58,8 +58,8 @@ SCENE_SEMANTIC_WEIGHT=0.3
 # Must be True when DECODER_ZS_CROSS_ATTN=True
 LATENT_DISENTANGLE=True
 SEMANTIC_DIMS=512           # 512/32=16 z_s tokens; 512-16=496 z_g tokens
-CROSS_RECON_WEIGHT=0.0     # Still useful: reinforces z_g geometry-sufficiency
-ORTHO_WEIGHT=0.0           # Still useful: linear independence of mu_s and mu_g
+CROSS_RECON_WEIGHT=0.3    # Still useful: reinforces z_g geometry-sufficiency
+ORTHO_WEIGHT=0.2          # Still useful: linear independence of mu_s and mu_g
 
 # ── Scene layout head ─────────────────────────────────────────────────────────
 SCENE_LAYOUT_HEAD=False
@@ -125,6 +125,7 @@ LR_MIN_RATIO=0.1
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 TRAIN_SCENES=300
+
 VAL_SCENES=50
 SAMPLING_METHOD="opacity"
 
