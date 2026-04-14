@@ -32,9 +32,19 @@ from model.michelangelo.utils import instantiate_from_config
 from model.michelangelo.utils.misc import get_config_from_file
 import torch.utils.data as Data
 
-from semantic_losses import compute_semantic_loss, compute_scene_infonce_loss
+from semantic_losses import (compute_semantic_loss, compute_scene_infonce_loss,
+                             compute_zs_token_infonce_loss,
+                             compute_zs_layout_infonce_loss)
 from distribution_loss import compute_distribution_loss
 from pca_feature_visualization import visualize_semantic_features, visualize_z_s_space
+try:
+    from pca_feature_visualization import visualize_zs_tokens
+except ImportError:
+    print("[WARNING] visualize_zs_tokens not found in pca_feature_visualization.py — "
+          "please copy the updated file to your working directory. "
+          "z_s token PCA visualization will be disabled but training will continue.")
+    def visualize_zs_tokens(*args, **kwargs):
+        return None
 from gs_ply_reconstructor import save_reconstructed_gaussians
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
@@ -141,6 +151,38 @@ parser.add_argument('--sampling_strategy',    type=str,   default='balanced',
 parser.add_argument('--z_s_infonce_weight',      type=float, default=0.0)
 parser.add_argument('--z_s_infonce_temperature', type=float, default=0.07)
 parser.add_argument('--z_s_infonce_delta',       type=float, default=0.4)
+# ── Strategy B flags (new) ────────────────────────────────────────────────────────
+parser.add_argument('--decoder_layout_cross_attn', action='store_true', default=False,
+    help='Strategy B1: 512 geometry tokens in decoder + 16 layout tokens as '
+         'cross-attention K/V per transformer layer. Layout tokens from shape_embed '
+         'via Layout16Projector (SEPARATE from Z). Works with latent_disentangle=False.')
+parser.add_argument('--decoder_layout_additive', action='store_true', default=False,
+    help='Strategy B2: 512 geometry tokens in decoder + 16 layout tokens projected '
+         'to additive broadcast bias before the transformer (once, not per-layer). '
+         'Simpler than B1. Can be combined with B1 for additive+cross-attn.')
+parser.add_argument('--structured_layout_tokens', action='store_true', default=False,
+    help='Structured token split: no gradient interference between semantic and layout heads. '
+         'WITHOUT: SceneSemanticHead and SceneLayoutHead both receive tokens 1-15 flattened '
+         '[B, 480] — same floats, gradients interfere. '
+         'WITH: tokens 1-8 [B,256] → SceneSemanticHead only; '
+         'tokens 9-15 [B,224] → SceneLayoutHead only — exclusive, no cross-contamination. '
+         'Token 0 → MeanColorHead (unchanged). '
+         'Works for Strategy A (semantic_token_heads=True) and Strategy B. '
+         'Requires scene_semantic_head=True AND scene_layout_head=True to have any effect.')
+parser.add_argument('--zs_layout_infonce_weight',      type=float, default=0.0,
+    help='Weight for z_layout InfoNCE. Requires decoder_layout_cross_attn or '
+         'decoder_layout_additive. Prototype mechanism: same as per-Gaussian InfoNCE '
+         'but at scene level. Recommended start: 0.1')
+parser.add_argument('--zs_layout_infonce_temperature', type=float, default=0.07,
+    help='Temperature for z_layout InfoNCE (default 0.07).')
+# ── z_s Token InfoNCE (same mechanism as per-Gaussian, on the 16 z_s tokens) ─────
+parser.add_argument('--zs_token_infonce_weight',      type=float, default=0.0,
+    help='Weight for z_s token InfoNCE. Same cross-batch prototype mechanism as '
+         'per-Gaussian InfoNCE but on the 16 z_s tokens directly. '
+         'Each token labelled by scene dominant ScanNet72 category. '
+         'Requires latent_disentangle=True. Recommended start: 0.1')
+parser.add_argument('--zs_token_infonce_temperature', type=float, default=0.07,
+    help='Temperature for z_s token InfoNCE (default 0.07, same as per-Gaussian).')
 # ── Core ─────────────────────────────────────────────────────────────────────
 parser.add_argument('--color_residual',       action='store_true', default=False)
 parser.add_argument('--mean_color_weight',    type=float, default=1.0)
@@ -208,6 +250,17 @@ if args.ortho_weight > 0 and not args.latent_disentangle:
     args.ortho_weight = 0.0
 if args.z_s_infonce_weight > 0 and not args.latent_disentangle:
     args.z_s_infonce_weight = 0.0
+if args.zs_token_infonce_weight > 0 and not args.latent_disentangle:
+    print("[WARNING] zs_token_infonce_weight > 0 requires latent_disentangle. Setting to 0.")
+    args.zs_token_infonce_weight = 0.0
+_any_B = args.decoder_layout_cross_attn or args.decoder_layout_additive
+if args.zs_layout_infonce_weight > 0 and not _any_B:
+    print("[WARNING] zs_layout_infonce_weight > 0 requires decoder_layout_cross_attn or "
+          "decoder_layout_additive. Setting to 0.")
+    args.zs_layout_infonce_weight = 0.0
+if _any_B and args.latent_disentangle:
+    print("[INFO] decoder_layout_cross/additive=True with latent_disentangle=True: "
+          "z_layout from shape_embed is separate from Z (which has z_s in first 16 pos).")
 if args.semantic_dims % 32 != 0:
     raise ValueError("--semantic_dims must be divisible by 32")
 if args.semantic_token_heads and not args.latent_disentangle:
@@ -247,6 +300,10 @@ if args.use_wandb and accelerator.is_main_process:
             (args.scene_layout_head,          "_layout"),
             (args.semantic_token_heads,       "_semTok"),
             (args.z_s_infonce_weight > 0,     "_zsNCE"),
+    (args.zs_token_infonce_weight > 0,  "_zsTokNCE"),
+    (args.decoder_layout_cross_attn,    "_layCA"),
+    (args.decoder_layout_additive,      "_layAdd"),
+    (args.zs_layout_infonce_weight > 0, "_layNCE"),
             (enable_semantic,                 f"_pgNCE{args.segment_loss_weight}"),
         ]
         for flag, label in flags:
@@ -276,6 +333,10 @@ flags = [
     (args.scene_layout_head,          "_layout"),
     (args.semantic_token_heads,       "_semTok"),
     (args.z_s_infonce_weight > 0,     "_zsNCE"),
+    (args.zs_token_infonce_weight > 0,  "_zsTokNCE"),
+    (args.decoder_layout_cross_attn,    "_layCA"),
+    (args.decoder_layout_additive,      "_layAdd"),
+    (args.zs_layout_infonce_weight > 0, "_layNCE"),
     (enable_semantic,                 f"_pgNCE"),
 ]
 for flag, label in flags:
@@ -306,6 +367,14 @@ if accelerator.is_main_process:
     print(f"  token_cond={args.token_cond} adaln={args.token_cond_adaln}")
     print(f"  semantic_token_heads={args.semantic_token_heads}")
     print(f"  z_s InfoNCE weight={args.z_s_infonce_weight} temp={args.z_s_infonce_temperature} delta={args.z_s_infonce_delta}")
+    print(f"  z_s TOKEN InfoNCE weight={args.zs_token_infonce_weight} temp={args.zs_token_infonce_temperature}")
+    print(f"  ── Strategy B (layout conditioning) ────────────────────────────")
+    print(f"  decoder_layout_cross_attn={args.decoder_layout_cross_attn}  (B1: 512 geom + cross-attn per layer)")
+    print(f"  decoder_layout_additive  ={args.decoder_layout_additive}  (B2: 512 geom + additive bias)")
+    if args.decoder_layout_cross_attn and args.decoder_layout_additive:
+        print(f"  Strategy B3: additive + cross-attn both active")
+    print(f"  zs_layout_infonce_weight ={args.zs_layout_infonce_weight}  temp={args.zs_layout_infonce_temperature}")
+    print(f"  (z_s token InfoNCE: same prototype mechanism as per-Gaussian, direct gradient to z_s)")
     print(f"  per-Gaussian InfoNCE mode={effective_semantic_mode} weight={args.segment_loss_weight}")
     print(f"  cross_recon={args.cross_recon_weight} ortho={args.ortho_weight}")
     print(f"  Save: {save_path}")
@@ -334,8 +403,11 @@ p.query_decoder           = args.query_decoder
 p.decoder_fourier_pe      = args.decoder_fourier_pe
 p.token_cond_adaln        = args.token_cond_adaln
 p.semantic_token_heads    = args.semantic_token_heads
-p.decoder_zs_cross_attn   = args.decoder_zs_cross_attn  # MAIN NEW IDEA
-p.position_layout_residual = args.position_layout_residual
+p.decoder_zs_cross_attn       = args.decoder_zs_cross_attn  # Strategy D
+p.decoder_layout_cross_attn   = args.decoder_layout_cross_attn  # Strategy B1 NEW
+p.decoder_layout_additive     = args.decoder_layout_additive     # Strategy B2 NEW
+p.structured_layout_tokens    = args.structured_layout_tokens     # token split, no interference
+p.position_layout_residual    = args.position_layout_residual
 
 cfg_point_feats = p.point_feats
 expected_feats  = 12 if args.label_input else 11
@@ -478,6 +550,13 @@ _ckpt_meta = {
     'z_s_infonce_weight':         args.z_s_infonce_weight,
     'z_s_infonce_temperature':    args.z_s_infonce_temperature,
     'z_s_infonce_delta':          args.z_s_infonce_delta,
+    'zs_token_infonce_weight':    args.zs_token_infonce_weight,
+    'zs_token_infonce_temperature': args.zs_token_infonce_temperature,
+    'decoder_layout_cross_attn':  args.decoder_layout_cross_attn,
+    'decoder_layout_additive':    args.decoder_layout_additive,
+    'zs_layout_infonce_weight':   args.zs_layout_infonce_weight,
+    'structured_layout_tokens':   args.structured_layout_tokens,
+    'zs_layout_infonce_temperature': args.zs_layout_infonce_temperature,
     'inference_fixed':            True,
     'position_layout_residual':   args.position_layout_residual,
     'mean_color_weight':          args.mean_color_weight,
@@ -499,7 +578,7 @@ _ckpt_meta = {
 def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None):
     model.eval()
     total_l2 = total_kl = total_color = total_scene_sem = 0.0
-    total_anchor = total_layout = total_seg = total_z_s_nce = 0.0
+    total_anchor = total_layout = total_seg = total_z_s_nce = total_zs_tok_nce = total_zs_lay_nce = 0.0
     per_param    = {k: 0.0 for k in PARAM_SLICES}
     n_scenes     = 0
 
@@ -507,11 +586,17 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
     pca_input    = []; pca_recon    = []
     pca_sem_feat = []
     z_s_proj_acc = []; label_dist_acc = []
+    zs_tokens_acc  = []    # for z_s token InfoNCE visualization
+    zs_layout_acc  = []    # for z_layout visualization (Strategy B)
 
     do_recon   = (epoch is not None and epoch % args.recon_ply_freq  == 0)
     do_pca     = (epoch is not None and epoch % args.pca_vis_freq    == 0)
     do_sem_pca = (do_pca and enable_semantic)
-    do_z_s_vis = (do_pca and raw_model.shape_model.z_s_infonce_head is not None)
+    do_z_s_vis     = (do_pca and raw_model.shape_model.z_s_infonce_head is not None)
+    do_zs_tok_vis  = (do_pca and args.zs_token_infonce_weight > 0
+                      and args.latent_disentangle)
+    _any_B         = args.decoder_layout_cross_attn or args.decoder_layout_additive
+    do_zs_lay_vis  = (do_pca and _any_B)
 
     _pos_abs_min = _pos_abs_max = _pos_gt_range = 0.0
 
@@ -575,6 +660,23 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
                 total_layout += compute_layout_loss(slp, gt_c, gt_v).item() * B
             if args.predict_seg_labels and sgp is not None:
                 total_seg += compute_seg_pred_loss(sgp, batch_data['segment_labels'].long().to(device)).item() * B
+            # z_s token InfoNCE validation loss + collect tokens for visualization
+            z_s_tokens_eval = None
+            if args.latent_disentangle and args.semantic_dims > 0:
+                _n_tok = args.semantic_dims // 32   # embed_dim=32, so 512//32=16
+                z_s_tokens_eval = z.reshape(B, -1, 32)[:, :_n_tok, :].detach()  # [B,16,32]
+            if args.zs_token_infonce_weight > 0 and z_s_tokens_eval is not None:
+                zl_tok, _ = compute_zs_token_infonce_loss(
+                    z_s_tokens_eval, label_dist_v, args.zs_token_infonce_temperature)
+                total_zs_tok_nce += zl_tok.item() * B
+
+            # z_layout InfoNCE validation loss (Strategy B)
+            z_lay_proj_eval = raw_model.shape_model.last_z_layout_proj
+            if args.zs_layout_infonce_weight > 0 and z_lay_proj_eval is not None:
+                zl_lay, _ = compute_zs_layout_infonce_loss(
+                    z_lay_proj_eval, label_dist_v, args.zs_layout_infonce_temperature)
+                total_zs_lay_nce += zl_lay.item() * B
+
             if args.z_s_infonce_weight > 0 and zsp is not None:
                 zl, _ = compute_scene_infonce_loss(zsp, label_dist_v,
                                                    args.z_s_infonce_temperature,
@@ -610,6 +712,18 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
             if do_z_s_vis and zsp is not None:
                 z_s_proj_acc.append(zsp.detach().cpu().numpy())
                 label_dist_acc.append(label_dist_v.cpu().numpy())
+            if do_zs_tok_vis and z_s_tokens_eval is not None:
+                zs_tokens_acc.append(z_s_tokens_eval.cpu().numpy())
+                if not do_z_s_vis:
+                    label_dist_acc.append(label_dist_v.cpu().numpy())
+
+            # Collect z_layout tokens for visualization (Strategy B)
+            z_lay_raw_eval = raw_model.shape_model.last_z_layout
+            if do_zs_lay_vis and z_lay_raw_eval is not None:
+                zs_layout_acc.append(z_lay_raw_eval.detach().cpu().numpy())
+                # Ensure label_dist is collected for coloring
+                if not do_z_s_vis and not do_zs_tok_vis:
+                    label_dist_acc.append(label_dist_v.cpu().numpy())
 
     # PLY save
     if do_recon and recon_preds and accelerator.is_main_process:
@@ -655,6 +769,40 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
             if out: print(f"  z_s space PLY: {out}  ({len(all_z_s)} scenes)")
         except Exception as e: print(f"  z_s vis error: {e}")
 
+    # z_s token PLY (NEW — analogous to per-Gaussian semantic_infonce.ply)
+    if do_zs_tok_vis and zs_tokens_acc and accelerator.is_main_process:
+        try:
+            all_toks = np.concatenate(zs_tokens_acc, axis=0)   # [N_scenes, 16, 32]
+            all_ld   = np.concatenate(label_dist_acc, axis=0)     # [N_scenes, 72]
+            vis_dir  = Path(save_path) / "pca_visualisations"
+            vis_dir.mkdir(parents=True, exist_ok=True)
+            out_tok = visualize_zs_tokens(
+                zs_tokens=all_toks,
+                label_dists=all_ld,
+                output_path=str(vis_dir / f"zs_tokens_epoch_{epoch:03d}.ply"),
+                verbose=True)
+            if out_tok:
+                print(f"  z_s token PLY: {out_tok}  ({len(all_toks)} scenes × 16 tokens)")
+        except Exception as e:
+            print(f"  z_s token vis error: {e}")
+
+    # z_layout token PLY (Strategy B — visualize 16 layout tokens per scene)
+    if do_zs_lay_vis and zs_layout_acc and accelerator.is_main_process:
+        try:
+            all_lay = np.concatenate(zs_layout_acc, axis=0)   # [N, 16, 32]
+            all_ld  = np.concatenate(label_dist_acc, axis=0) if label_dist_acc else None
+            if all_ld is not None:
+                vis_dir = Path(save_path) / "pca_visualisations"
+                vis_dir.mkdir(parents=True, exist_ok=True)
+                out_lay = visualize_zs_tokens(
+                    zs_tokens=all_lay, label_dists=all_ld,
+                    output_path=str(vis_dir / f"zs_layout_epoch_{epoch:03d}.ply"),
+                    verbose=True)
+                if out_lay:
+                    print(f"  z_layout PLY: {out_lay}  ({len(all_lay)} scenes × 16 tokens)")
+        except Exception as e:
+            print(f"  z_layout vis error: {e}")
+
     model.train()
     n = max(n_scenes, 1)
     return {
@@ -666,6 +814,8 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
         'layout_loss':        total_layout / n,
         'seg_pred_loss':      total_seg / n,
         'z_s_infonce_loss':   total_z_s_nce / n,
+        'zs_tok_infonce_loss':  total_zs_tok_nce / n,
+        'zs_lay_infonce_loss':  total_zs_lay_nce / n,
         'pos_abs_range':      _pos_abs_max - _pos_abs_min,
         'pos_abs_min':        _pos_abs_min,
         'pos_abs_max':        _pos_abs_max,
@@ -688,6 +838,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         'loss','recon','kl','sem','color_pred','scene_sem','anchor',
         'layout','cross_recon','ortho','seg_pred','scale_pen',
         'z_s_nce','z_s_npos',
+        'zs_tok_nce','zs_tok_ncats',
+        'zs_lay_nce','zs_lay_ncats',
         'pos','col','opa','scl','rot']}
 
     for i_batch, batch_data in enumerate(trainDataLoader):
@@ -790,6 +942,23 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             z_s_nce_loss, z_s_nce_metrics = compute_scene_infonce_loss(
                 zsp, label_dist_v, args.z_s_infonce_temperature, args.z_s_infonce_delta)
 
+        # z_s token InfoNCE (NEW — same mechanism as per-Gaussian)
+        zs_tok_nce_loss    = torch.tensor(0., device=device)
+        zs_tok_nce_metrics = {'zs_tok_infonce_loss': 0., 'zs_tok_num_categories': 0}
+        if args.zs_token_infonce_weight > 0 and args.latent_disentangle:
+            _n_tok        = args.semantic_dims // 32          # 16 for semantic_dims=512
+            z_s_tokens    = z[:, :args.semantic_dims].reshape(B, _n_tok, 32)  # [B,16,32]
+            zs_tok_nce_loss, zs_tok_nce_metrics = compute_zs_token_infonce_loss(
+                z_s_tokens, label_dist_v, args.zs_token_infonce_temperature)
+
+        # z_layout InfoNCE (Strategy B — same prototype mechanism as per-Gaussian)
+        zs_lay_nce_loss    = torch.tensor(0., device=device)
+        zs_lay_nce_metrics = {'zs_layout_infonce_loss': 0., 'zs_layout_num_cats': 0}
+        z_lay_proj = raw_model.shape_model.last_z_layout_proj
+        if args.zs_layout_infonce_weight > 0 and z_lay_proj is not None:
+            zs_lay_nce_loss, zs_lay_nce_metrics = compute_zs_layout_infonce_loss(
+                z_lay_proj, label_dist_v, args.zs_layout_infonce_temperature)
+
         # Cross-reconstruction
         # With decoder_zs_cross_attn: we build z_cross = [z_s_B | z_g_A] reshaped to [B,512,32]
         # and call decode() — it will internally split into z_s (first 16 tokens) and z_g (last 496)
@@ -812,19 +981,33 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                 with torch.no_grad():
                     _ed = raw_model.shape_model.embed_dim
                     _sd = args.semantic_dims
-                    z_sem_B = z_s_swapped[:, _ed:_sd]
-                    raw_model.shape_model.last_scene_layout_pred = \
-                        raw_model.shape_model.scene_layout_module(z_sem_B)
+                    if args.structured_layout_tokens:
+                        # layout module expects tokens 9-15 only [B, 7*32=224]
+                        _n_s   = raw_model.shape_model._n_sem_tokens  # 8
+                        _start = _ed + _n_s * _ed   # 32 + 8*32 = 288
+                        z_lay_B = z_s_swapped[:, _start:_sd]  # [B, 224]
+                        raw_model.shape_model.last_scene_layout_pred =                             raw_model.shape_model.scene_layout_module(z_lay_B)
+                    else:
+                        # unstructured: layout module expects full tokens 1-15 [B, 480]
+                        z_sem_B = z_s_swapped[:, _ed:_sd]     # [B, 480]
+                        raw_model.shape_model.last_scene_layout_pred =                             raw_model.shape_model.scene_layout_module(z_sem_B)
 
             se_shifted = torch.roll(raw_model.shape_model._shape_embed_cache, shifts=1, dims=0)
             _mp = accelerator.mixed_precision
             _dtype = (torch.bfloat16 if _mp == 'bf16' else
                       torch.float16  if _mp == 'fp16' else torch.float32)
+            # For Strategy B: shift z_layout as well so cross-recon uses shifted layout
+            _z_layout_shifted = None
+            _any_B_train = args.decoder_layout_cross_attn or args.decoder_layout_additive
+            if _any_B_train and raw_model.shape_model.last_z_layout is not None:
+                _z_layout_shifted = torch.roll(
+                    raw_model.shape_model.last_z_layout, shifts=1, dims=0)
             with torch.autocast('cuda', dtype=_dtype, enabled=(_mp != 'no')):
                 UV_cross, _ = raw_model.shape_model.decode(
                     lat_cross, volume_queries=None,
                     return_semantic_features=False, shape_embed=se_shifted,
-                    scaffold_anchors=sa_gpu, scaffold_token_ids=sti_gpu)
+                    scaffold_anchors=sa_gpu, scaffold_token_ids=sti_gpu,
+                    z_layout=_z_layout_shifted)
             pred_cross_3d = UV_cross.reshape(B, -1, 14)
 
             if args.position_scaffold:
@@ -867,6 +1050,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                       + args.seg_pred_weight         * seg_pred_loss
                       + args.scale_penalty_weight    * scale_pen
                       + args.z_s_infonce_weight      * z_s_nce_loss
+                      + args.zs_token_infonce_weight * zs_tok_nce_loss
+                      + args.zs_layout_infonce_weight * zs_lay_nce_loss
                       + semantic_loss)
 
         accelerator.backward(total_loss)
@@ -888,6 +1073,10 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         e['scale_pen']  += scale_pen.item()
         e['z_s_nce']    += z_s_nce_loss.item()
         e['z_s_npos']   += z_s_nce_metrics.get('z_s_num_positives', 0.)
+        e['zs_tok_nce']   += zs_tok_nce_loss.item()
+        e['zs_tok_ncats'] += zs_tok_nce_metrics.get('zs_tok_num_categories', 0)
+        e['zs_lay_nce']   += zs_lay_nce_loss.item()
+        e['zs_lay_ncats'] += zs_lay_nce_metrics.get('zs_layout_num_cats', 0)
         e['pos'] += ind['position']; e['col'] += ind['color']
         e['opa'] += ind['opacity'];  e['scl'] += ind['scale']
         e['rot'] += ind['rotation']
@@ -904,6 +1093,13 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                 print(f"  z_s_NCE={z_s_nce_loss.item():.4f}  "
                       f"n_pos={z_s_nce_metrics.get('z_s_num_positives',0):.1f}  "
                       f"frac_anch={z_s_nce_metrics.get('z_s_frac_anchors',0):.2f}")
+            if args.zs_layout_infonce_weight > 0 and z_lay_proj is not None:
+                print(f"  ZsLayNCE={zs_lay_nce_loss.item():.4f}  "
+                      f"n_cats={zs_lay_nce_metrics.get('zs_layout_num_cats',0)}")
+                print(f"  [Strategy B] z_layout from shape_embed → layout conditioning")
+            if args.zs_token_infonce_weight > 0:
+                print(f"  ZsTokNCE={zs_tok_nce_loss.item():.4f}  "
+                      f"n_cats={zs_tok_nce_metrics.get('zs_tok_num_categories',0)}")
             if _mu_s is not None:
                 print(f"  mu_s=[{_mu_s.min().item():.3f},{_mu_s.max().item():.3f}]  "
                       f"mu_g=[{_mu_g.min().item():.3f},{_mu_g.max().item():.3f}]")
@@ -927,6 +1123,10 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
               f"ScalePen={e['scale_pen']/nb:.6f} | "
               f"Z_sNCE={e['z_s_nce']/nb:.4f} | "
               f"Z_sNPos={e['z_s_npos']/nb:.1f} | "
+              f"ZsTokNCE={e['zs_tok_nce']/nb:.4f} | "
+              f"ZsTokNCats={e['zs_tok_ncats']/nb:.1f} | "
+              f"LayNCE={e['zs_lay_nce']/nb:.4f} | "
+              f"LayNCats={e['zs_lay_ncats']/nb:.1f} | "
               f"PgNCE={e['sem']/nb:.4f} | "
               f"LR={lr_now:.2e}")
         print(f"  Pos={e['pos']/nb:.3f} | Col={e['col']/nb:.3f} | "
@@ -952,6 +1152,10 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                 print(f"  LayoutMSE={val_metrics['layout_loss']:.4f}")
             if args.z_s_infonce_weight > 0:
                 print(f"  Val Z_sNCE={val_metrics['z_s_infonce_loss']:.4f}")
+            if args.zs_token_infonce_weight > 0:
+                print(f"  Val ZsTokNCE={val_metrics['zs_tok_infonce_loss']:.4f}")
+            if args.zs_layout_infonce_weight > 0:
+                print(f"  Val LayNCE={val_metrics['zs_lay_infonce_loss']:.4f}")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
