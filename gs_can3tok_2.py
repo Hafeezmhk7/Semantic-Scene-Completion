@@ -176,6 +176,15 @@ parser.add_argument('--zs_layout_infonce_weight',      type=float, default=0.0,
 parser.add_argument('--zs_layout_infonce_temperature', type=float, default=0.07,
     help='Temperature for z_layout InfoNCE (default 0.07).')
 # ── z_s Token InfoNCE (same mechanism as per-Gaussian, on the 16 z_s tokens) ─────
+# ── z_s pool InfoNCE (new — mirrors decoder hidden InfoNCE) ───────────────────
+parser.add_argument('--zs_pool_infonce_weight',      type=float, default=0.0,
+    help='Weight for z_s/z_layout pool InfoNCE. '
+         'mean_pool(tokens [B,16,32])->linear->[B,1024]->MLP->[B,128]->NCE. '
+         'Same bottleneck and mechanism as decoder hidden InfoNCE. '
+         'Works for Strategy A (latent_disentangle) and Strategy B. '
+         'Recommended start: 0.1')
+parser.add_argument('--zs_pool_infonce_temperature', type=float, default=0.07,
+    help='Temperature for z_s pool InfoNCE (default 0.07).')
 parser.add_argument('--zs_token_infonce_weight',      type=float, default=0.0,
     help='Weight for z_s token InfoNCE. Same cross-batch prototype mechanism as '
          'per-Gaussian InfoNCE but on the 16 z_s tokens directly. '
@@ -255,9 +264,16 @@ if args.zs_token_infonce_weight > 0 and not args.latent_disentangle:
     args.zs_token_infonce_weight = 0.0
 _any_B = args.decoder_layout_cross_attn or args.decoder_layout_additive
 if args.zs_layout_infonce_weight > 0 and not _any_B:
-    print("[WARNING] zs_layout_infonce_weight > 0 requires decoder_layout_cross_attn or "
-          "decoder_layout_additive. Setting to 0.")
-    args.zs_layout_infonce_weight = 0.0
+    if args.latent_disentangle:
+        # Strategy A: z_s tokens act as layout tokens.
+        # last_z_layout_proj is routed from last_z_s_infonce_proj in model forward().
+        # z_s_infonce_head must exist — it is created when latent_disentangle=True.
+        print("[INFO] zs_layout_infonce_weight > 0 with Strategy A: "
+              "routing z_s tokens as layout tokens (last_z_s_infonce_proj -> last_z_layout_proj)")
+    else:
+        print("[WARNING] zs_layout_infonce_weight > 0 requires decoder_layout_cross_attn, "
+              "decoder_layout_additive, OR latent_disentangle. Setting to 0.")
+        args.zs_layout_infonce_weight = 0.0
 if _any_B and args.latent_disentangle:
     print("[INFO] decoder_layout_cross/additive=True with latent_disentangle=True: "
           "z_layout from shape_embed is separate from Z (which has z_s in first 16 pos).")
@@ -303,7 +319,8 @@ if args.use_wandb and accelerator.is_main_process:
     (args.zs_token_infonce_weight > 0,  "_zsTokNCE"),
     (args.decoder_layout_cross_attn,    "_layCA"),
     (args.decoder_layout_additive,      "_layAdd"),
-    (args.zs_layout_infonce_weight > 0, "_layNCE"),
+    (args.zs_layout_infonce_weight > 0,   "_layNCE"),
+    (args.zs_pool_infonce_weight > 0,      "_poolNCE"),
             (enable_semantic,                 f"_pgNCE{args.segment_loss_weight}"),
         ]
         for flag, label in flags:
@@ -336,7 +353,8 @@ flags = [
     (args.zs_token_infonce_weight > 0,  "_zsTokNCE"),
     (args.decoder_layout_cross_attn,    "_layCA"),
     (args.decoder_layout_additive,      "_layAdd"),
-    (args.zs_layout_infonce_weight > 0, "_layNCE"),
+    (args.zs_layout_infonce_weight > 0,   "_layNCE"),
+    (args.zs_pool_infonce_weight > 0,      "_poolNCE"),
     (enable_semantic,                 f"_pgNCE"),
 ]
 for flag, label in flags:
@@ -374,6 +392,8 @@ if accelerator.is_main_process:
     if args.decoder_layout_cross_attn and args.decoder_layout_additive:
         print(f"  Strategy B3: additive + cross-attn both active")
     print(f"  zs_layout_infonce_weight ={args.zs_layout_infonce_weight}  temp={args.zs_layout_infonce_temperature}")
+    print(f"  zs_pool_infonce_weight   ={args.zs_pool_infonce_weight}  temp={args.zs_pool_infonce_temperature}")
+    print(f"  (pool: mean_pool([B,16,32])->Linear->[B,1024]->MLP->[B,128]->NCE, mirrors decoder)")
     print(f"  (z_s token InfoNCE: same prototype mechanism as per-Gaussian, direct gradient to z_s)")
     print(f"  per-Gaussian InfoNCE mode={effective_semantic_mode} weight={args.segment_loss_weight}")
     print(f"  cross_recon={args.cross_recon_weight} ortho={args.ortho_weight}")
@@ -555,6 +575,8 @@ _ckpt_meta = {
     'decoder_layout_cross_attn':  args.decoder_layout_cross_attn,
     'decoder_layout_additive':    args.decoder_layout_additive,
     'zs_layout_infonce_weight':   args.zs_layout_infonce_weight,
+    'zs_pool_infonce_weight':      args.zs_pool_infonce_weight,
+    'zs_pool_infonce_temperature': args.zs_pool_infonce_temperature,
     'structured_layout_tokens':   args.structured_layout_tokens,
     'zs_layout_infonce_temperature': args.zs_layout_infonce_temperature,
     'inference_fixed':            True,
@@ -588,6 +610,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
     z_s_proj_acc = []; label_dist_acc = []
     zs_tokens_acc  = []    # for z_s token InfoNCE visualization
     zs_layout_acc  = []    # for z_layout visualization (Strategy B)
+    zs_pool_acc    = []    # for pool InfoNCE visualization (Strategy A + B)
 
     do_recon   = (epoch is not None and epoch % args.recon_ply_freq  == 0)
     do_pca     = (epoch is not None and epoch % args.pca_vis_freq    == 0)
@@ -597,6 +620,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
                       and args.latent_disentangle)
     _any_B         = args.decoder_layout_cross_attn or args.decoder_layout_additive
     do_zs_lay_vis  = (do_pca and _any_B)
+    do_zs_pool_vis = (do_pca and args.zs_pool_infonce_weight > 0)
 
     _pos_abs_min = _pos_abs_max = _pos_gt_range = 0.0
 
@@ -721,9 +745,19 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
             z_lay_raw_eval = raw_model.shape_model.last_z_layout
             if do_zs_lay_vis and z_lay_raw_eval is not None:
                 zs_layout_acc.append(z_lay_raw_eval.detach().cpu().numpy())
-                # Ensure label_dist is collected for coloring
                 if not do_z_s_vis and not do_zs_tok_vis:
                     label_dist_acc.append(label_dist_v.cpu().numpy())
+
+            # Collect pool hidden [B,1024] for PCA vis (one point per scene)
+            if do_zs_pool_vis:
+                _ph = getattr(raw_model.shape_model, 'last_zs_pool_hidden', None)
+                if _ph is None:
+                    _ph = getattr(raw_model.shape_model,
+                                  'last_z_layout_pool_hidden', None)
+                if _ph is not None:
+                    zs_pool_acc.append(_ph.detach().cpu().numpy())  # [B, 1024]
+                    if not label_dist_acc:
+                        label_dist_acc.append(label_dist_v.cpu().numpy())
 
     # PLY save
     if do_recon and recon_preds and accelerator.is_main_process:
@@ -803,6 +837,25 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
         except Exception as e:
             print(f"  z_layout vis error: {e}")
 
+    # z_s pool PLY — same style as per-Gaussian PCA, one point per scene
+    # Colors: dominant ScanNet72 category. Position: PCA of [B,1024] pool hidden states.
+    # Compare with scene{i}_semantic_infonce.ply (per-Gaussian, 40k points).
+    if do_zs_pool_vis and zs_pool_acc and accelerator.is_main_process:
+        try:
+            all_pool = np.concatenate(zs_pool_acc,  axis=0)   # [N, 128]
+            all_ld   = np.concatenate(label_dist_acc, axis=0) if label_dist_acc else None
+            if all_ld is not None:
+                vis_dir = Path(save_path) / 'pca_visualisations'
+                vis_dir.mkdir(parents=True, exist_ok=True)
+                out_pool = visualize_z_s_space(
+                    z_s_proj=all_pool, label_dists=all_ld,
+                    output_path=str(vis_dir / f'zs_pool_epoch_{epoch:03d}.ply'),
+                    verbose=True)
+                if out_pool:
+                    print(f'  z_s pool PLY: {out_pool}  ({len(all_pool)} scenes)')
+        except Exception as e:
+            print(f'  z_s pool vis error: {e}')
+
     model.train()
     n = max(n_scenes, 1)
     return {
@@ -816,6 +869,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
         'z_s_infonce_loss':   total_z_s_nce / n,
         'zs_tok_infonce_loss':  total_zs_tok_nce / n,
         'zs_lay_infonce_loss':  total_zs_lay_nce / n,
+        'zs_pool_infonce_loss': 0.0,   # computed in training loop, not eval
         'pos_abs_range':      _pos_abs_max - _pos_abs_min,
         'pos_abs_min':        _pos_abs_min,
         'pos_abs_max':        _pos_abs_max,
@@ -840,6 +894,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         'z_s_nce','z_s_npos',
         'zs_tok_nce','zs_tok_ncats',
         'zs_lay_nce','zs_lay_ncats',
+        'zs_pool_nce','zs_pool_ncats',
         'pos','col','opa','scl','rot']}
 
     for i_batch, batch_data in enumerate(trainDataLoader):
@@ -959,6 +1014,39 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             zs_lay_nce_loss, zs_lay_nce_metrics = compute_zs_layout_infonce_loss(
                 z_lay_proj, label_dist_v, args.zs_layout_infonce_temperature)
 
+        # z_s pool InfoNCE — EXACT SAME mechanism as decoder hidden InfoNCE
+        # head output: [B, 16, 32] L2-norm  (mirrors [B, 40000, 32] from decoder)
+        # labels:      [B, 16]  dominant category broadcast to all 16 positions
+        # loss:        compute_semantic_loss with same subsampling as decoder
+        zs_pool_nce_loss    = torch.tensor(0., device=device)
+        zs_pool_nce_metrics = {'zs_pool_infonce_loss': 0., 'zs_pool_num_cats': 0}
+        if args.zs_pool_infonce_weight > 0:
+            _pool_emb = raw_model.shape_model.last_zs_pool_proj
+            if _pool_emb is None:
+                _pool_emb = getattr(raw_model.shape_model,
+                                    'last_z_layout_pool_proj', None)
+            if _pool_emb is not None:
+                # _pool_emb: [B, 16, 32] — same format as pg_features [B, 40000, 32]
+                # Build labels: dominant category broadcast to all 16 positions
+                _dom_cat = label_dist_v.float().argmax(dim=1)  # [B]
+                _pool_labels = _dom_cat.unsqueeze(1).expand(
+                    -1, _pool_emb.shape[1]).long()  # [B, 16]
+                # Call EXACT same compute_semantic_loss as decoder InfoNCE
+                # subsample/sampling_strategy args are identical
+                zs_pool_nce_loss, _pool_metrics = compute_semantic_loss(
+                    embeddings=_pool_emb,
+                    segment_labels=_pool_labels,
+                    instance_labels=None,
+                    batch_size=B,
+                    segment_weight=1.0,
+                    instance_weight=0.0,
+                    temperature=args.zs_pool_infonce_temperature,
+                    subsample=_pool_emb.shape[1],   # 16 — no subsampling needed
+                    sampling_strategy=args.sampling_strategy)
+                zs_pool_nce_metrics = {
+                    'zs_pool_infonce_loss': _pool_metrics.get('segment_loss', 0.),
+                    'zs_pool_num_cats':     _pool_metrics.get('num_categories_in_batch', 0)}
+
         # Cross-reconstruction
         # With decoder_zs_cross_attn: we build z_cross = [z_s_B | z_g_A] reshaped to [B,512,32]
         # and call decode() — it will internally split into z_s (first 16 tokens) and z_g (last 496)
@@ -1052,6 +1140,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                       + args.z_s_infonce_weight      * z_s_nce_loss
                       + args.zs_token_infonce_weight * zs_tok_nce_loss
                       + args.zs_layout_infonce_weight * zs_lay_nce_loss
+                      + args.zs_pool_infonce_weight   * zs_pool_nce_loss
                       + semantic_loss)
 
         accelerator.backward(total_loss)
@@ -1075,8 +1164,10 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         e['z_s_npos']   += z_s_nce_metrics.get('z_s_num_positives', 0.)
         e['zs_tok_nce']   += zs_tok_nce_loss.item()
         e['zs_tok_ncats'] += zs_tok_nce_metrics.get('zs_tok_num_categories', 0)
-        e['zs_lay_nce']   += zs_lay_nce_loss.item()
-        e['zs_lay_ncats'] += zs_lay_nce_metrics.get('zs_layout_num_cats', 0)
+        e['zs_lay_nce']    += zs_lay_nce_loss.item()
+        e['zs_lay_ncats']  += zs_lay_nce_metrics.get('zs_layout_num_cats', 0)
+        e['zs_pool_nce']   += zs_pool_nce_loss.item()
+        e['zs_pool_ncats'] += zs_pool_nce_metrics.get('zs_pool_num_cats', 0)
         e['pos'] += ind['position']; e['col'] += ind['color']
         e['opa'] += ind['opacity'];  e['scl'] += ind['scale']
         e['rot'] += ind['rotation']
@@ -1127,6 +1218,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
               f"ZsTokNCats={e['zs_tok_ncats']/nb:.1f} | "
               f"LayNCE={e['zs_lay_nce']/nb:.4f} | "
               f"LayNCats={e['zs_lay_ncats']/nb:.1f} | "
+              f"PoolNCE={e['zs_pool_nce']/nb:.4f} | "
+              f"PoolNCats={e['zs_pool_ncats']/nb:.1f} | "
               f"PgNCE={e['sem']/nb:.4f} | "
               f"LR={lr_now:.2e}")
         print(f"  Pos={e['pos']/nb:.3f} | Col={e['col']/nb:.3f} | "
@@ -1156,6 +1249,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                 print(f"  Val ZsTokNCE={val_metrics['zs_tok_infonce_loss']:.4f}")
             if args.zs_layout_infonce_weight > 0:
                 print(f"  Val LayNCE={val_metrics['zs_lay_infonce_loss']:.4f}")
+            if args.zs_pool_infonce_weight > 0:
+                print(f"  Val PoolNCE: see PoolNCE= in epoch log")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']

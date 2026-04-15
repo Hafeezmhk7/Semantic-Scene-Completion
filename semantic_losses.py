@@ -463,3 +463,80 @@ def compute_zs_layout_infonce_loss(z_layout_proj, label_dist, temperature=0.07):
         'zs_layout_infonce_loss': loss.item(),
         'zs_layout_num_cats':     len(protos),
     }
+
+
+# ============================================================================
+# 5. Z_S TOKEN POOL INFONCE  (mirrors decoder hidden InfoNCE exactly)
+# ============================================================================
+
+def compute_zs_pool_infonce_loss(zs_pool_proj, label_dist, temperature=0.07):
+    """
+    InfoNCE on pooled z_s/z_layout projections [B, 128].
+
+    DESIGN — mirrors the decoder hidden InfoNCE path:
+      Decoder:  hidden [B, 1024] -> SemanticProjectionHead -> [B, 40000, 32]
+                -> cross-batch category prototypes -> InfoNCE
+      This:     tokens [B, 16, 32]
+                -> mean_pool -> [B, 32]
+                -> Linear(32->1024) -> [B, 1024]   (same bottleneck as decoder)
+                -> MLP -> [B, 128] L2-norm
+                -> cross-batch dominant-category prototypes -> InfoNCE
+
+    The [B, 1024] bottleneck is the structural match to decoder hidden state.
+    The prototype construction and cross-entropy loss are identical to
+    ScanNet72SemanticLoss (per-Gaussian InfoNCE).
+
+    One point per scene (vs 40,000 per scene in per-Gaussian).
+    Label: argmax(label_dist) — dominant ScanNet72 category.
+
+    Args:
+        zs_pool_proj: [B, 128]  L2-normalised (from ZSTokenPoolProjectHead)
+        label_dist:   [B, 72]   per-scene category distributions
+        temperature:  float
+
+    Returns:
+        loss, metrics dict with keys:
+          zs_pool_infonce_loss  — loss value
+          zs_pool_num_cats      — number of prototype categories in batch
+    """
+    B, D = zs_pool_proj.shape
+    missing_categories = [13, 53, 61]
+
+    if B < 2:
+        return torch.tensor(0.0, device=zs_pool_proj.device), {
+            'zs_pool_infonce_loss': 0.0, 'zs_pool_num_cats': 0}
+
+    dom_cat     = label_dist.float().argmax(dim=1)
+    unique_cats = [c for c in torch.unique(dom_cat).cpu().tolist()
+                   if c not in missing_categories]
+
+    if len(unique_cats) < 2:
+        return torch.tensor(0.0, device=zs_pool_proj.device), {
+            'zs_pool_infonce_loss': 0.0, 'zs_pool_num_cats': len(unique_cats)}
+
+    protos, proto_ids = [], []
+    for cat in unique_cats:
+        m = dom_cat == cat
+        if m.sum() > 0:
+            protos.append(F.normalize(zs_pool_proj[m].mean(0, keepdim=True), p=2, dim=-1))
+            proto_ids.append(cat)
+
+    if len(protos) < 2:
+        return torch.tensor(0.0, device=zs_pool_proj.device), {
+            'zs_pool_infonce_loss': 0.0, 'zs_pool_num_cats': len(protos)}
+
+    protos  = F.normalize(torch.cat(protos, 0), p=2, dim=-1)
+    sim_mat = zs_pool_proj @ protos.T / temperature
+
+    cat2idx = {c: i for i, c in enumerate(proto_ids)}
+    tgt     = torch.tensor([cat2idx.get(l.item(), -100) for l in dom_cat],
+                            dtype=torch.long, device=zs_pool_proj.device)
+
+    loss = F.cross_entropy(sim_mat, tgt, ignore_index=-100)
+    if torch.isnan(loss) or torch.isinf(loss):
+        loss = torch.tensor(0.0, device=zs_pool_proj.device)
+
+    return loss, {
+        'zs_pool_infonce_loss': loss.item(),
+        'zs_pool_num_cats':     len(protos),
+    }

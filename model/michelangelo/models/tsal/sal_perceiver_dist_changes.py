@@ -151,6 +151,77 @@ class SemanticTokenInfoNCEHead(nn.Module):
         return F.normalize(self.head(z_s_flat), p=2, dim=-1)
 
 
+
+# ============================================================================
+# Z_S TOKEN POOL PROJECTION HEAD
+# ============================================================================
+
+class ZSTokenPoolProjectHead(nn.Module):
+    """
+    Mean-pool 16 z_s/z_layout tokens → project through [B, 1024] bottleneck
+    → output [B, n_tokens, feature_dim] L2-normalised features.
+
+    EXACT MIRROR of the decoder InfoNCE path:
+      Decoder:
+        hidden [B, 1024]
+          -> SemanticProjectionHead(1024, num_gaussians=40000, feature_dim=32)
+          -> [B, 40000, 32]  L2-norm
+          -> compute_semantic_loss(embeddings, seg_labels [B,40000], subsample, ...)
+
+      This head:
+        tokens [B, 16, 32]
+          -> mean_pool                   -> [B, 32]
+          -> Linear(32 -> 1024)          -> [B, 1024]  <- same dim as decoder hidden
+          -> SemanticProjectionHead-style MLP
+          -> [B, 16, 32]  L2-norm
+          -> compute_semantic_loss(embeddings [B,16,32], labels [B,16], subsample, ...)
+
+    Labels for the 16 points: argmax(label_dist[b]) broadcast to all 16 positions.
+    Subsampling: same balanced/random strategy as decoder (trivial at N=16 but kept
+    for interface compatibility so compute_semantic_loss is called identically).
+
+    Visualization: PCA of mean_pool([B,16,32]) representations
+                   -> zs_pool_epoch_NNN.ply (one point per scene)
+    """
+    def __init__(self, n_tokens=16, token_dim=32, hidden_dim=1024, feature_dim=32):
+        super().__init__()
+        self.n_tokens   = n_tokens
+        self.feature_dim = feature_dim
+
+        # Pool: mean across tokens -> [B, token_dim]
+        # Expand to decoder hidden dimension
+        self.to_hidden = nn.Linear(token_dim, hidden_dim)
+
+        # SemanticProjectionHead-style: [B, 1024] -> [B, n_tokens * feature_dim]
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, 512), nn.LayerNorm(512), nn.ReLU(),
+            nn.Linear(512, 256),        nn.LayerNorm(256), nn.ReLU(),
+            nn.Linear(256, n_tokens * feature_dim))
+
+        total = sum(p.numel() for p in self.parameters())
+        print(f"[ZSTokenPoolProjectHead] [{n_tokens},{token_dim}]"
+              f"->pool->[{token_dim}]->[{hidden_dim}]->MLP->[{n_tokens},{feature_dim}] L2-norm | "
+              f"{total/1e3:.1f}K params")
+        print(f"  Mirrors: SemanticProjectionHead(1024,40000,32) on decoder hidden")
+        print(f"  Output [B,{n_tokens},{feature_dim}] used with compute_semantic_loss (same as decoder NCE)")
+
+    def forward(self, tokens):
+        """
+        tokens: [B, n_tokens, token_dim]  z_s or z_layout
+        returns:
+          embeddings: [B, n_tokens, feature_dim]  L2-normalised (same format as decoder)
+          hidden:     [B, 1024]  intermediate (for optional visualization)
+        """
+        pooled    = tokens.mean(dim=1)          # [B, 32]    mean pool
+        hidden    = self.to_hidden(pooled)       # [B, 1024]  decoder-matching bottleneck
+        proj      = self.projection(hidden)      # [B, n_tokens * feature_dim]
+        B         = tokens.shape[0]
+        embeddings = F.normalize(
+            proj.reshape(B, self.n_tokens, self.feature_dim),
+            p=2, dim=-1)                         # [B, n_tokens, feature_dim]
+        return embeddings, hidden
+
+
 # ============================================================================
 # STRATEGY B: LAYOUT CONDITIONING COMPONENTS
 # ============================================================================
@@ -822,6 +893,17 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             self.z_s_infonce_head = SemanticTokenInfoNCEHead(
                 in_dim=semantic_dims, proj_dim=128)
 
+        # ── Z_S TOKEN POOL PROJECTION HEAD (mirrors decoder InfoNCE path) ────
+        # mean_pool([B,16,32])→[B,32]→Linear→[B,1024]→MLP→[B,128] L2-norm
+        # Strategy A: z_s tokens from latent
+        # Strategy B: z_layout tokens (separate head, added in Strategy B block)
+        self.zs_pool_proj_head  = None
+        self.last_zs_pool_proj  = None   # [B, 16, 32] L2-norm embeddings
+        self.last_zs_pool_hidden= None   # [B, 1024] intermediate
+        if latent_disentangle:
+            self.zs_pool_proj_head = ZSTokenPoolProjectHead(
+                n_tokens=self._n_zs_tokens, token_dim=embed_dim)
+
         # ── ANCHOR PREDICTION ────────────────────────────────────────────────
         self.anchor_pred_from_tokens            = None
         self.last_predicted_anchors_from_tokens = None
@@ -852,9 +934,12 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.layout_additive_cond  = None   # z_layout → broadcast bias [B,width]
         self.zs_cond_decoder_B     = None   # ZSCond decoder for 512-token input
         self.GS_decoder_B          = None   # 512-token GS decoder
-        self.z_layout_infonce_head = None   # flatten(z_layout) [B,512]→[B,128] L2-norm
-        self.last_z_layout         = None   # cached [B,16,embed_dim] for losses + vis
-        self.last_z_layout_proj    = None   # cached [B,128] for InfoNCE
+        self.z_layout_infonce_head  = None   # flatten(z_layout) [B,512]→[B,128] L2-norm
+        self.z_layout_pool_head     = None   # pool(z_layout)→[B,32]→[B,1024]→[B,128]
+        self.last_z_layout          = None   # cached [B,16,embed_dim] for losses + vis
+        self.last_z_layout_proj     = None   # cached [B,128] for InfoNCE
+        self.last_z_layout_pool_proj   = None   # [B,16,32] embeddings (Strategy B)
+        self.last_z_layout_pool_hidden  = None   # [B,1024] intermediate (Strategy B)
 
         _any_B = decoder_layout_cross_attn or decoder_layout_additive
         if _any_B:
@@ -864,7 +949,11 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             _lay_flat = self._n_zs_tokens * embed_dim   # 16 * 32 = 512
             self.z_layout_infonce_head = SemanticTokenInfoNCEHead(
                 in_dim=_lay_flat, proj_dim=128)
-            print(f"  [Strategy B] Layout16Projector + InfoNCE head active")
+            # Pool projection head — mirrors decoder InfoNCE path
+            self.z_layout_pool_head = ZSTokenPoolProjectHead(
+                n_tokens=self._n_zs_tokens, token_dim=embed_dim)
+            print(f"  [Strategy B] Layout16Projector + InfoNCE heads active")
+            print(f"  z_layout pool head: pool→[{embed_dim}]→[1024]→[128] L2-norm")
             print(f"  z_layout InfoNCE: flatten [B,{_lay_flat}] → MLP → [B,128] L2-norm")
 
         if decoder_layout_cross_attn:
@@ -1191,11 +1280,20 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         shape_embed, mu, log_var, z, posterior = self.encode(pc, feats, sample_posterior)
         _se = self._shape_embed_cache
 
-        # ── STRATEGY A/D: z_s InfoNCE projection (when latent_disentangle) ────
+        # ── STRATEGY A/D: z_s InfoNCE projections ───────────────────────────
         self.last_z_s_infonce_proj = None
         if self.z_s_infonce_head is not None:
             self.last_z_s_infonce_proj = self.z_s_infonce_head(
                 z[:, :self.semantic_dims])
+
+        # Pool projection: mean_pool(z_s tokens)→[B,1024]→[B,128]
+        # Mirrors decoder hidden InfoNCE — direct gradient to z_s
+        self.last_zs_pool_proj  = None
+        self.last_zs_pool_hidden = None
+        if self.zs_pool_proj_head is not None:
+            _z_s_toks = z.reshape(z.shape[0], 512, 32)[:, :self._n_zs_tokens, :]
+            self.last_zs_pool_proj, self.last_zs_pool_hidden = \
+                self.zs_pool_proj_head(_z_s_toks)  # [B,16,32], [B,1024]
 
         # ── STRATEGY B: compute z_layout from shape_embed ────────────────────
         self.last_z_layout      = None
@@ -1203,10 +1301,28 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         _any_B = self.decoder_layout_cross_attn or self.decoder_layout_additive
         if _any_B and self.layout_projector is not None:
             self.last_z_layout = self.layout_projector(_se)   # [B, 16, 32]
-            # InfoNCE projection: flatten z_layout → [B, 512] → MLP → [B, 128]
+            # Flatten InfoNCE projection
             if self.z_layout_infonce_head is not None:
                 z_lay_flat = self.last_z_layout.reshape(z.shape[0], -1)  # [B, 512]
                 self.last_z_layout_proj = self.z_layout_infonce_head(z_lay_flat)
+            # Pool projection: mean_pool(z_layout)→[B,1024]→[B,128]
+            self.last_z_layout_pool_proj   = None
+            self.last_z_layout_pool_hidden  = None
+            if self.z_layout_pool_head is not None:
+                self.last_z_layout_pool_proj, self.last_z_layout_pool_hidden = \
+                    self.z_layout_pool_head(self.last_z_layout)  # [B,16,32], [B,1024]
+
+        # ── STRATEGY A: also populate last_z_layout_proj from z_s tokens ────
+        # In Strategy A, z_s tokens ARE the layout tokens.
+        # zs_layout_infonce_weight uses last_z_layout_proj — without this block
+        # it stays None for Strategy A and the loss silently computes 0.
+        # Fix: reuse z_s_infonce_head (same SemanticTokenInfoNCEHead architecture)
+        # to populate last_z_layout_proj from flatten(z_s tokens).
+        if (not _any_B and self.latent_disentangle
+                and self.z_s_infonce_head is not None):
+            # last_z_s_infonce_proj already computed above using z_s_infonce_head
+            # Route it to last_z_layout_proj so training loop finds it
+            self.last_z_layout_proj = self.last_z_s_infonce_proj   # [B, 128]
 
         # ── AUXILIARY HEADS ───────────────────────────────────────────────────
         # Route to z tokens (semantic_token_heads) or shape_embed (legacy)

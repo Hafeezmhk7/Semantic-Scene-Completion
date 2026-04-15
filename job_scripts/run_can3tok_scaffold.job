@@ -2,7 +2,7 @@
 #SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=2
-#SBATCH --time=20:00:00
+#SBATCH --time=28:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=160G
@@ -57,7 +57,7 @@ DECODER_LAYOUT_CROSS_ATTN=False
 DECODER_LAYOUT_ADDITIVE=False
 
 # ── Latent disentanglement ────────────────────────────────────────────────────
-LATENT_DISENTANGLE=False
+LATENT_DISENTANGLE=True
 SEMANTIC_DIMS=512
 CROSS_RECON_WEIGHT=0.3
 ORTHO_WEIGHT=0.1
@@ -74,36 +74,45 @@ COLOR_LOSS_WEIGHT=1.0
 #       tokens 9-15 [B,224] → SceneLayoutHead    (exclusive, 7×32)
 # Requires SCENE_SEMANTIC_HEAD=True AND SCENE_LAYOUT_HEAD=True.
 # Works for Strategy A (SEMANTIC_TOKEN_HEADS=True) and Strategy B.
-STRUCTURED_LAYOUT_TOKENS=False
+STRUCTURED_LAYOUT_TOKENS=True
 
 # ── Semantic / layout heads on z_layout tokens ───────────────────────────────
 # Strategy A: set SEMANTIC_TOKEN_HEADS=True to run on z tokens 0-15
 # Strategy B: heads auto-routed to z_layout tokens (no flag needed)
-SCENE_SEMANTIC_HEAD=False
+SCENE_SEMANTIC_HEAD=True
 SCENE_SEMANTIC_WEIGHT=0.3
-SCENE_LAYOUT_HEAD=False
+SCENE_LAYOUT_HEAD=True
 LAYOUT_LOSS_WEIGHT=0.3
-SEMANTIC_TOKEN_HEADS=False
+SEMANTIC_TOKEN_HEADS=True
+
+# ── z_s pool InfoNCE (new — mirrors decoder hidden InfoNCE) ─────────────────
+# mean_pool(16 tokens)→[B,32]→Linear→[B,1024]→MLP→[B,128]→cross-batch NCE
+# [B,1024] bottleneck = same dim as decoder hidden state (structural mirror)
+# Works for Strategy A (z_s tokens) and Strategy B (z_layout tokens).
+# PCA vis: zs_pool_epoch_NNN.ply  (one point per scene)
+# Log:     PoolNCE= and PoolNCats= in epoch print
+ZS_POOL_INFONCE_WEIGHT=0.3
+ZS_POOL_INFONCE_TEMPERATURE=0.07
 
 # ── z_layout InfoNCE (NEW — prototype NCE, same mechanism as per-Gaussian) ───
 # Works for all strategies. Requires DECODER_LAYOUT_* or LATENT_DISENTANGLE.
 # PCA output: zs_layout_epoch_NNN.ply
 # LayNCats in training log = # distinct dominant categories in batch (need >=2)
-ZS_LAYOUT_INFONCE_WEIGHT=0.0
+ZS_LAYOUT_INFONCE_WEIGHT=0.3
 ZS_LAYOUT_INFONCE_TEMPERATURE=0.07
 
 # ── z_s token InfoNCE (per-token prototype NCE on 16 tokens, Strategy A) ─────
-ZS_TOKEN_INFONCE_WEIGHT=0.0
+ZS_TOKEN_INFONCE_WEIGHT=0.3
 ZS_TOKEN_INFONCE_TEMPERATURE=0.07
-
+ 
 # ── Scene-level z_s InfoNCE (soft positive pairs, label_dist cosine sim) ──────
 Z_S_INFONCE_WEIGHT=0.0
 Z_S_INFONCE_TEMPERATURE=0.07
 Z_S_INFONCE_DELTA=0.4
 
 # ── Per-Gaussian InfoNCE (ablation) ──────────────────────────────────────────
-SEMANTIC_MODE="none"
-SEGMENT_WEIGHT=0.0
+SEMANTIC_MODE="hidden"
+SEGMENT_WEIGHT=0.3
 INSTANCE_WEIGHT=0.0
 SEMANTIC_TEMP=0.07
 SEMANTIC_SUBSAMPLE=10000
@@ -193,6 +202,7 @@ echo "========================================================================"
 echo "  DECODER_LAYOUT_CROSS_ATTN=$DECODER_LAYOUT_CROSS_ATTN  (B1)"
 echo "  DECODER_LAYOUT_ADDITIVE  =$DECODER_LAYOUT_ADDITIVE    (B2)"
 echo "  LATENT_DISENTANGLE=$LATENT_DISENTANGLE  SEMANTIC_DIMS=$SEMANTIC_DIMS"
+echo "  z_s pool InfoNCE: weight=$ZS_POOL_INFONCE_WEIGHT  temp=$ZS_POOL_INFONCE_TEMPERATURE"
 echo "  z_layout InfoNCE: weight=$ZS_LAYOUT_INFONCE_WEIGHT  temp=$ZS_LAYOUT_INFONCE_TEMPERATURE"
 echo "========================================================================"
 echo ""
@@ -255,6 +265,8 @@ TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
 [ "$SEMANTIC_TOKEN_HEADS"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --semantic_token_heads"
 
 # InfoNCE
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_weight $ZS_POOL_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_temperature $ZS_POOL_INFONCE_TEMPERATURE"
 TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_weight $ZS_LAYOUT_INFONCE_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_temperature $ZS_LAYOUT_INFONCE_TEMPERATURE"
 TRAIN_CMD="$TRAIN_CMD --zs_token_infonce_weight $ZS_TOKEN_INFONCE_WEIGHT"
