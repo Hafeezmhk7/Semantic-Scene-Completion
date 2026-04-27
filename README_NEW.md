@@ -166,7 +166,7 @@ flowchart TD
     CAT_MU --> REPARAM --> RESHAPE
     RESHAPE --> ZS & ZG
     ZS --> H0 & H1 & H2
-    H1 -.->|same 480 dims| H2
+    H1 -.->|"same 480 dims"| H2
     H1 & H2 --> WARN
     ZS --> CROSS
     ZG --> CROSS
@@ -176,7 +176,7 @@ flowchart TD
     ZS --> MERGE
     ZG --> MERGE
     MERGE --> POSTKL --> FOURPE --> TRANS --> FLAT --> GSMLP --> ACTS --> OUT_A
-    TRANS -.->|hidden [B,1024]| PGNCE
+    TRANS -.->|"hidden state B×1024"| PGNCE
 ```
 
 ---
@@ -208,9 +208,9 @@ flowchart TD
     end
 
     ZS --> T0 & T18 & T915
-    T0   -->|"[B, 32]"| H0S
-    T18  -->|"[B, 256]"| H1S
-    T915 -->|"[B, 224]"| H2S
+    T0   -->|"B x 32"| H0S
+    T18  -->|"B x 256"| H1S
+    T915 -->|"B x 224"| H2S
     H0S & H1S & H2S --> OK
 ```
 
@@ -301,7 +301,7 @@ flowchart TD
     L16 --> POSTKL_LAY
 
     REPARAM_B --> POSTKL_GEO --> FOURPE_B
-    POSTKL_LAY -->|"H_lay [B, 16, 384]<br/>K and V at every layer"| LAYER
+    POSTKL_LAY -->|"H_lay B×16×384 — K and V per layer"| LAYER
     FOURPE_B --> LAYER
     LAYER --> FLAT_B --> GSMLP_B --> OUT_B
 ```
@@ -415,8 +415,8 @@ flowchart LR
         PP2 --> PP3
     end
 
-    PG3 -.->|"indirect gradient<br/>through self-attn"| LN3
-    PG3 -.->|"indirect gradient<br/>through self-attn"| PN3
+    PG3 -.->|"indirect gradient"| LN3
+    PG3 -.->|"indirect gradient"| PN3
 ```
 
 **Comparison table:**
