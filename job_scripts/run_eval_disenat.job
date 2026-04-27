@@ -1,148 +1,186 @@
 #!/bin/bash
-#SBATCH --job-name=can3tok_disentangle_eval
+#SBATCH --job-name=can3tok_arch_eval
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=40G
-#SBATCH --output=logs/disentangle_eval_%j.out
-#SBATCH --error=logs/disentangle_eval_%j.err
+#SBATCH --output=logs/arch_eval_%j.out
+#SBATCH --error=logs/arch_eval_%j.err
 
 # ============================================================================
-# Can3Tok — Disentanglement Evaluation
+# Can3Tok — Architecture Evaluation
 # ============================================================================
-# Runs three experiments to test whether z_s and z_g are properly disentangled:
+# Runs 4 experiments on a single checkpoint:
 #
-#   Exp 1: Intra vs inter-class cosine distance in z_s (semantic subspace)
-#          and z_g (geometry subspace).
-#          z_s should cluster by scene category; z_g should not.
+#   Exp 1: Cosine distance clustering (z_layout vs z_geo)
+#   Exp 2: Semantic swap + geometry preservation (PLYs for SuperSplat)
+#   Exp 3: Partial observation robustness of z_layout
+#   Exp 4: Prior sampling quality (fraction of valid samples from N(0,I))
 #
-#   Exp 2: JSD between SceneSemanticHead predictions for same-category vs
-#          cross-category scene pairs.
+# Run once per strategy (A, B1, B2, C) by changing the flags below.
+# Compare results.json files across strategy output directories.
 #
-#   Exp 3: Qualitative latent swap — decodes z_AB=[z_s^apt, z_g^coffee]
-#          and z_BA=[z_s^coffee, z_g^apt]. Saves 4 PLYs for SuperSplat.
+# SCENE SELECTION (hardcoded in eval_architecture.py):
+#   Exp 1 intra/inter:  apartment(5), coffee_shop(3), spa_pool(3),
+#                       convenience_store(2), club(2)
+#   Exp 2 swap pair 1:  apartment(0221) vs convenience_store(0203)
+#   Exp 2 swap pair 2:  coffee_shop(0218) vs spa_pool(0211)
+#   Exp 3 partial obs:  all 5 apartment scenes
 #
-# OUTPUT:
-#   logs/disentangle_eval_<JOB_ID>.out  — full numeric results
-#   eval_results/<RUN_TAG>/results.json — structured results
-#   eval_results/<RUN_TAG>/swap_visualisation/*.ply — 4 PLYs for Exp 3
+# COMPARISON GUIDE:
+#   Exp 1: z_layout ratio >> z_geo ratio = disentanglement working
+#   Exp 2: l2_AB_vs_B < baseline = geometry preserved after swap
+#   Exp 3: cosine_sim > 0.7 at 40% coverage = completion viable
+#   Exp 4: frac_all_valid > 60% = latent ready for DiT
 # ============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ============================================================================
-# CONFIGURATION — EDIT THIS SECTION
+# ── EDIT THIS SECTION ────────────────────────────────────────────────────────
 # ============================================================================
 
-# Path to the checkpoint to evaluate
-CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21533330_none_inferencefixed/final.pth"
+# ── Which strategy to evaluate ──────────────────────────────────────────────
+# Copy one of the blocks below into the ACTIVE STRATEGY section.
 
-# Where the preprocessed SceneSplat scenes live
-DATA_ROOT="/home/yli11/scratch/datasets/gaussian_world/preprocessed/\
-interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
+# STRATEGY A (latent disentanglement, 16+496 in decoder sequence):
+#   LATENT_DISENTANGLE=True; SEMANTIC_TOKEN_HEADS=True
+#   DECODER_LAYOUT_CROSS_ATTN=False; DECODER_LAYOUT_ADDITIVE=False
 
-# Metadata JSON with scene_id → category mapping
-METADATA="/home/yli11/scratch/Hafeez_thesis/Can3Tok/scene_config.json"
+# STRATEGY B1 (512 geometry + cross-attention conditioning):
+#   LATENT_DISENTANGLE=False; SEMANTIC_TOKEN_HEADS=False
+#   DECODER_LAYOUT_CROSS_ATTN=True; DECODER_LAYOUT_ADDITIVE=False
 
-# Output directory for this evaluation run
-RUN_TAG="eval_$(date +%Y%m%d_%H%M%S)_job_${SLURM_JOB_ID}"
-OUTPUT_DIR="/home/yli11/scratch/Hafeez_thesis/Can3Tok/disent_eval_results/${RUN_TAG}"
+# STRATEGY B2 (512 geometry + additive bias conditioning):
+#   LATENT_DISENTANGLE=False; SEMANTIC_TOKEN_HEADS=False
+#   DECODER_LAYOUT_CROSS_ATTN=False; DECODER_LAYOUT_ADDITIVE=True
 
-# ── Categories for Experiment 1 + 2 ─────────────────────────────────────────
-# Use categories with ≥2 scenes for intra-class distance to be meaningful.
-# Best choices given the metadata:
-#   apartment    (5 scenes) — richest category, 10 intra-class pairs
-#   coffee_shop  (3 scenes) — 3 intra-class pairs
-#   spa_pool     (3 scenes) — 3 intra-class pairs
-CATEGORIES="apartment coffee_shop spa_pool"
+# STRATEGY C (baseline, geometry only):
+#   LATENT_DISENTANGLE=False; SEMANTIC_TOKEN_HEADS=False
+#   DECODER_LAYOUT_CROSS_ATTN=False; DECODER_LAYOUT_ADDITIVE=False
 
-# ── Swap pair for Experiment 3 ───────────────────────────────────────────────
-# Choose maximally different categories for a clear qualitative result.
-SWAP_CAT_A="apartment"
-SWAP_CAT_B="coffee_shop"
-# Which scene index to use within each category (0-indexed)
-SWAP_IDX_A=0
-SWAP_IDX_B=0
+# ── ACTIVE STRATEGY (change this block) ─────────────────────────────────────
+LATENT_DISENTANGLE=True
+SEMANTIC_TOKEN_HEADS=True
+DECODER_LAYOUT_CROSS_ATTN=False
+DECODER_LAYOUT_ADDITIVE=False
 
-# ── Model flags — MUST MATCH THE CHECKPOINT ──────────────────────────────────
-# Check the checkpoint's saved metadata to confirm these are correct.
-# The checkpoint file stores these under 'color_residual', 'latent_disentangle', etc.
-COLOR_RESIDUAL=False
-SCENE_SEMANTIC_HEAD=False
-SCENE_LAYOUT_HEAD=False
-LATENT_DISENTANGLE=False
-SEMANTIC_DIMS=512
+# Strategy label used in output directory name
+STRATEGY_LABEL="Strategy_A_Z_s_token_infonce_unstr"   # change to B1 / B2 / C
+
+# ── Checkpoint ───────────────────────────────────────────────────────────────
+CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21857721_none_colorresidual_disent512_fourierpe_layout_semTok_zsTokNCE_inferencefixed/best_model.pth"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+DATA_ROOT="/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
+OUTPUT_DIR="/home/yli11/scratch/Hafeez_thesis/Can3Tok/arch_eval_results/strategy_${STRATEGY_LABEL}_job_${SLURM_JOB_ID}"
+
+# ── Flags shared across all strategies ───────────────────────────────────────
+# These MUST match the checkpoint exactly.
+COLOR_RESIDUAL=True
+SCENE_SEMANTIC_HEAD=True
+SCENE_LAYOUT_HEAD=True
+STRUCTURED_LAYOUT_TOKENS=False   # set True if checkpoint was trained with it
+DECODER_FOURIER_PE=True
 DECODER_POS_ENC=False
-DECODER_FOURIER_PE=False
 TOKEN_COND=False
 TOKEN_COND_APPROACH="B"
 TOKEN_COND_ADALN=False
-SEMANTIC_TOKEN_HEADS=False
 POSITION_SCAFFOLD=False
+SEMANTIC_DIMS=512
+
+# ── Experiment controls ───────────────────────────────────────────────────────
+N_SAMPLES_PRIOR=200   # number of N(0,I) samples for Exp 4
+
+# ── Skip experiments ─────────────────────────────────────────────────────────
+# Uncomment to skip specific experiments:
+# SKIP_EXP1="--skip_exp1"
+# SKIP_EXP2="--skip_exp2"
+# SKIP_EXP3="--skip_exp3"
+# SKIP_EXP4="--skip_exp4"
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+if [ "$LATENT_DISENTANGLE" = "True" ] && [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ]; then
+    echo "WARNING: latent_disentangle + decoder_layout_cross_attn both True — unusual combination"
+fi
+if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; then
+    echo "ERROR: semantic_token_heads requires latent_disentangle"
+    exit 1
+fi
+
+echo ""
+echo "========================================================================"
+echo "  Architecture Evaluation — Strategy ${STRATEGY_LABEL}"
+echo "========================================================================"
+echo "  Checkpoint: $CHECKPOINT"
+echo "  Output:     $OUTPUT_DIR"
+echo ""
+echo "  Strategy flags:"
+echo "    latent_disentangle=${LATENT_DISENTANGLE}"
+echo "    decoder_layout_cross_attn=${DECODER_LAYOUT_CROSS_ATTN}"
+echo "    decoder_layout_additive=${DECODER_LAYOUT_ADDITIVE}"
+echo "    semantic_token_heads=${SEMANTIC_TOKEN_HEADS}"
+echo "    structured_layout_tokens=${STRUCTURED_LAYOUT_TOKENS}"
+echo ""
+echo "  Shared flags:"
+echo "    color_residual=${COLOR_RESIDUAL}"
+echo "    scene_semantic_head=${SCENE_SEMANTIC_HEAD}"
+echo "    scene_layout_head=${SCENE_LAYOUT_HEAD}"
+echo "    decoder_fourier_pe=${DECODER_FOURIER_PE}"
+echo "========================================================================"
+echo ""
 
 # ============================================================================
 # ENVIRONMENT
 # ============================================================================
 
 module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
-export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
-site-packages/torch/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
 cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
-mkdir -p logs eval_results
-
-# ── Print config ─────────────────────────────────────────────────────────────
-echo ""
-echo "========================================================================"
-echo "  DISENTANGLEMENT EVALUATION"
-echo "========================================================================"
-echo ""
-echo "  Checkpoint:  $CHECKPOINT"
-echo "  Data root:   $DATA_ROOT"
-echo "  Metadata:    $METADATA"
-echo "  Output:      $OUTPUT_DIR"
-echo ""
-echo "  Categories:  $CATEGORIES"
-echo "  Swap pair:   $SWAP_CAT_A  <->  $SWAP_CAT_B"
-echo ""
-echo "  Model flags:"
-echo "    color_residual=$COLOR_RESIDUAL | latent_disentangle=$LATENT_DISENTANGLE"
-echo "    scene_semantic_head=$SCENE_SEMANTIC_HEAD | scene_layout_head=$SCENE_LAYOUT_HEAD"
-echo "    decoder_fourier_pe=$DECODER_FOURIER_PE | token_cond=$TOKEN_COND ($TOKEN_COND_APPROACH)"
-echo "    token_cond_adaln=$TOKEN_COND_ADALN | semantic_token_heads=$SEMANTIC_TOKEN_HEADS"
-echo "========================================================================"
-echo ""
+mkdir -p logs arch_eval_results
 
 # ============================================================================
 # BUILD COMMAND
 # ============================================================================
 
-CMD="python eval_disentanglement.py"
+CMD="python eval_architecture.py"
 CMD="$CMD --checkpoint $CHECKPOINT"
-CMD="$CMD --metadata $METADATA"
 CMD="$CMD --data_root $DATA_ROOT"
 CMD="$CMD --output_dir $OUTPUT_DIR"
-CMD="$CMD --categories $CATEGORIES"
-CMD="$CMD --swap_cat_a $SWAP_CAT_A"
-CMD="$CMD --swap_cat_b $SWAP_CAT_B"
-CMD="$CMD --swap_scene_idx_a $SWAP_IDX_A"
-CMD="$CMD --swap_scene_idx_b $SWAP_IDX_B"
 CMD="$CMD --semantic_dims $SEMANTIC_DIMS"
+CMD="$CMD --n_samples_prior $N_SAMPLES_PRIOR"
 CMD="$CMD --token_cond_approach $TOKEN_COND_APPROACH"
 
-[ "$COLOR_RESIDUAL"       = "True" ] && CMD="$CMD --color_residual"
-[ "$SCENE_SEMANTIC_HEAD"  = "True" ] && CMD="$CMD --scene_semantic_head"
-[ "$SCENE_LAYOUT_HEAD"    = "True" ] && CMD="$CMD --scene_layout_head"
-[ "$LATENT_DISENTANGLE"   = "True" ] && CMD="$CMD --latent_disentangle"
-[ "$DECODER_POS_ENC"      = "True" ] && CMD="$CMD --decoder_pos_enc"
-[ "$DECODER_FOURIER_PE"   = "True" ] && CMD="$CMD --decoder_fourier_pe"
-[ "$TOKEN_COND"           = "True" ] && CMD="$CMD --token_cond"
-[ "$TOKEN_COND_ADALN"     = "True" ] && CMD="$CMD --token_cond_adaln"
-[ "$SEMANTIC_TOKEN_HEADS" = "True" ] && CMD="$CMD --semantic_token_heads"
-[ "$POSITION_SCAFFOLD"    = "True" ] && CMD="$CMD --position_scaffold"
+# Strategy flags
+[ "$LATENT_DISENTANGLE"        = "True" ] && CMD="$CMD --latent_disentangle"
+[ "$SEMANTIC_TOKEN_HEADS"      = "True" ] && CMD="$CMD --semantic_token_heads"
+[ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && CMD="$CMD --decoder_layout_cross_attn"
+[ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && CMD="$CMD --decoder_layout_additive"
+[ "$STRUCTURED_LAYOUT_TOKENS"  = "True" ] && CMD="$CMD --structured_layout_tokens"
+
+# Shared flags
+[ "$COLOR_RESIDUAL"            = "True" ] && CMD="$CMD --color_residual"
+[ "$SCENE_SEMANTIC_HEAD"       = "True" ] && CMD="$CMD --scene_semantic_head"
+[ "$SCENE_LAYOUT_HEAD"         = "True" ] && CMD="$CMD --scene_layout_head"
+[ "$DECODER_FOURIER_PE"        = "True" ] && CMD="$CMD --decoder_fourier_pe"
+[ "$DECODER_POS_ENC"           = "True" ] && CMD="$CMD --decoder_pos_enc"
+[ "$TOKEN_COND"                = "True" ] && CMD="$CMD --token_cond"
+[ "$TOKEN_COND_ADALN"          = "True" ] && CMD="$CMD --token_cond_adaln"
+[ "$POSITION_SCAFFOLD"         = "True" ] && CMD="$CMD --position_scaffold"
+
+# Optional skip flags
+[ -n "$SKIP_EXP1" ] && CMD="$CMD $SKIP_EXP1"
+[ -n "$SKIP_EXP2" ] && CMD="$CMD $SKIP_EXP2"
+[ -n "$SKIP_EXP3" ] && CMD="$CMD $SKIP_EXP3"
+[ -n "$SKIP_EXP4" ] && CMD="$CMD $SKIP_EXP4"
 
 echo "Command: $CMD"
 echo ""
@@ -155,44 +193,46 @@ SECONDS=0
 eval $CMD
 EXIT_CODE=$?
 echo ""
-echo "Duration: $((SECONDS/60))m $((SECONDS%60))s  |  Exit: $EXIT_CODE  |  End: $(date)"
+echo "Exit: $EXIT_CODE  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
 
 # ============================================================================
-# POST-RUN INSTRUCTIONS
+# POST-RUN
 # ============================================================================
 
 if [ $EXIT_CODE -eq 0 ]; then
     echo ""
     echo "========================================================================"
-    echo "  EVALUATION COMPLETE"
+    echo "  COMPLETED — Strategy ${STRATEGY_LABEL}"
     echo "========================================================================"
     echo ""
-    echo "  Numeric results:"
-    echo "    cat $OUTPUT_DIR/results.json"
+    echo "  Quick results:"
+    echo "    grep 'FINAL SUMMARY' -A 12 logs/arch_eval_${SLURM_JOB_ID}.out"
     echo ""
-    echo "  For Experiment 3 (swap visualisation):"
-    echo "    PLY files are in: $OUTPUT_DIR/swap_visualisation/"
+    echo "  Full JSON results:"
+    echo "    cat $OUTPUT_DIR/results.json | python3 -m json.tool | head -80"
     echo ""
-    echo "    Load all 4 PLYs in SuperSplat at https://supersplat.at:"
-    echo "      A_self_*_apartment.ply        — original apartment scene"
-    echo "      B_self_*_coffee_shop.ply       — original coffee shop scene"
-    echo "      AB_semA_geoB_*.ply             — apartment semantics, coffee geometry"
-    echo "      BA_semB_geoA_*.ply             — coffee semantics, apartment geometry"
+    echo "  Swap PLYs (load all 4 in SuperSplat for each pair):"
+    echo "    ls $OUTPUT_DIR/swap_visualisation/"
     echo ""
-    echo "    What to look for:"
-    echo "      AB should have the room SHAPE of the coffee shop"
-    echo "      AB should have the COLOR PALETTE of the apartment (mean_color from z_s^apt)"
-    echo "      BA should have the room SHAPE of the apartment"
-    echo "      BA should have the COLOR PALETTE of the coffee shop"
+    echo "  Compare across strategies:"
+    echo "    cat arch_eval_results/strategy_A_*/results.json | python3 -c \\"
+    echo "      'import json,sys; d=json.load(sys.stdin); \\"
+    echo "       print(d[\"strategy\"], d[\"exp1_clustering\"][\"ratio_lay\"], \\"
+    echo "             d[\"exp4_prior_sample\"][\"frac_all_valid\"])'"
     echo ""
-    echo "  Quick result read:"
-    echo "    grep -A 5 'FINAL SUMMARY' logs/disentangle_eval_${SLURM_JOB_ID}.out"
+    echo "  ── What to look for ───────────────────────────────────────────────"
+    echo "  Exp 1 ratio_lay > ratio_geo → z_layout organised by scene type"
+    echo "  Exp 2 l2_AB_vs_B / l2_B_self ≈ 1 → geometry preserved after swap"
+    echo "  Exp 3 cosine_sim > 0.7 at 40% → completion viable"
+    echo "  Exp 4 frac_all_valid > 60% → DiT can learn from this latent"
 else
     echo ""
     echo "FAILED (exit $EXIT_CODE)"
     echo "  Common causes:"
-    echo "    Wrong model flags (mismatch with checkpoint) → check checkpoint metadata"
-    echo "    Scene directory not found → check DATA_ROOT path and scene_id format"
-    echo "    CUDA OOM → not expected for eval (single GPU, no gradients)"
-    echo "  Error log: cat logs/disentangle_eval_${SLURM_JOB_ID}.err"
+    echo "    Checkpoint path wrong:  ls $CHECKPOINT"
+    echo "    Flags mismatch:         check checkpoint metadata in results.json"
+    echo "    Scene not found:        check DATA_ROOT and scene_id format"
+    echo "    OOM:                    reduce N_SAMPLES_PRIOR or use --skip_exp4"
+    echo "  Error log: cat logs/arch_eval_${SLURM_JOB_ID}.err"
 fi
+ 

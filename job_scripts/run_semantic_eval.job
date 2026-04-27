@@ -1,0 +1,130 @@
+#!/bin/bash
+#SBATCH --job-name=sem_feat_eval
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --gpus=1
+#SBATCH --mem=32G
+#SBATCH --time=01:00:00
+#SBATCH --output=logs/sem_feat_%A_%a.out
+#SBATCH --error=logs/sem_feat_%A_%a.err
+#SBATCH --array=0-1
+
+mkdir -p logs
+
+echo "========================================================"
+echo "  Semantic Feature Evaluation"
+echo "  Job: $SLURM_JOB_ID  Task: $SLURM_ARRAY_TASK_ID"
+echo "  Node: $(hostname)  Start: $(date)"
+echo "========================================================"
+
+# ── paths ─────────────────────────────────────────────────────────────────────
+WORK=/home/yli11/scratch/Hafeez_thesis/Can3Tok
+
+# Use the FULL Python path — avoids conda activate entirely.
+# This is the same Python used in your working eval_architecture jobs.
+PYTHON=/home/yli11/.conda/envs/can3tok/bin/python
+
+DATA=/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6
+OUT=$WORK/semantic_feat_results
+
+# ── checkpoint map ────────────────────────────────────────────────────────────
+CHECKPOINTS=(
+    "$WORK/checkpoints/RGB_job_21861108_hidden_colorresidual_disent512_fourierpe_layout_semTok_pgNCE_inferencefixed/best_model.pth"
+    "$WORK/checkpoints/RGB_job_21860551_hidden_colorresidual_disent512_fourierpe_layout_semTok_poolNCE_pgNCE_inferencefixed/best_model.pth"
+)
+NAMES=(
+    "pgNCE"
+    "pool_pgNCE"
+)
+
+CKPT=${CHECKPOINTS[$SLURM_ARRAY_TASK_ID]}
+NAME=${NAMES[$SLURM_ARRAY_TASK_ID]}
+
+# ── pre-flight checks (fail fast with a clear message) ───────────────────────
+echo ""
+echo "--- PRE-FLIGHT CHECKS ---"
+
+if [ ! -f "$PYTHON" ]; then
+    echo "ERROR: Python not found at $PYTHON"
+    echo "Fix: update PYTHON= in this script to the correct path."
+    echo "     Run 'which python' inside your can3tok env to find it."
+    exit 1
+fi
+echo "Python:      $PYTHON  ($($PYTHON --version 2>&1))"
+
+if [ ! -d "$WORK" ]; then
+    echo "ERROR: WORK directory missing: $WORK"
+    exit 1
+fi
+
+if [ ! -f "$CKPT" ]; then
+    echo "ERROR: Checkpoint not found: $CKPT"
+    echo "Available checkpoints:"
+    ls "$WORK/checkpoints/" 2>/dev/null | grep -i "pgNCE\|poolNCE\|pginfonce\|poolinfonce" | head -10
+    exit 1
+fi
+echo "Checkpoint:  $CKPT  [OK]"
+
+if [ ! -d "$DATA" ]; then
+    echo "ERROR: Data directory not found: $DATA"
+    exit 1
+fi
+echo "Data root:   $DATA  [OK]"
+
+SCRIPT="$WORK/eval_semantic_features.py"
+if [ ! -f "$SCRIPT" ]; then
+    echo "ERROR: eval_semantic_features.py not found at $SCRIPT"
+    echo "Copy the script there first:"
+    echo "  cp eval_semantic_features.py $WORK/"
+    exit 1
+fi
+echo "Script:      $SCRIPT  [OK]"
+
+echo "Torch/CUDA:  $($PYTHON -c 'import torch; print(torch.__version__, "CUDA:", torch.cuda.is_available())' 2>&1)"
+echo "Output dir:  $OUT/$NAME"
+echo "-------------------------"
+echo ""
+
+# ── install sklearn if missing ────────────────────────────────────────────────
+$PYTHON -c "import sklearn" 2>/dev/null || {
+    echo "Installing scikit-learn..."
+    $PYTHON -m pip install scikit-learn --quiet
+}
+
+# ── run ───────────────────────────────────────────────────────────────────────
+cd $WORK
+
+$PYTHON eval_semantic_features.py \
+    --checkpoint "$CKPT" \
+    --data_root  "$DATA" \
+    --output_dir "$OUT/$NAME" \
+    --device     cuda \
+    --n_scenes   15 \
+    --sil_subsample 2000 \
+    --lp_n_folds    5 \
+    --lp_per_scene  2000 \
+    --semantic_mode        hidden \
+    --latent_disentangle \
+    --semantic_token_heads \
+    --structured_layout_tokens \
+    --color_residual \
+    --decoder_fourier_pe \
+    --scene_semantic_head \
+    --scene_layout_head \
+    --zs_pool_infonce_weight 0.1
+
+EXIT_CODE=$?
+echo ""
+echo "--- RESULT ---"
+echo "Exit code: $EXIT_CODE"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "SUCCESS. Results at: $OUT/$NAME/semantic_feature_results.json"
+    ls -lh "$OUT/$NAME/" 2>/dev/null
+else
+    echo "FAILED with exit code $EXIT_CODE"
+    echo "Check: $OUT/$NAME/ for partial output"
+fi
+echo "End: $(date)"
+echo "========================================================"
