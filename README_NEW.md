@@ -15,7 +15,7 @@ Built on [SceneSplat-7K](https://arxiv.org/abs/2501.01895).
 3. [Strategy A — Disentangled VAE (without Structured Split)](#3-strategy-a--disentangled-vae-without-structured-split)
 4. [Strategy A — Disentangled VAE (with Structured Split)](#4-strategy-a--disentangled-vae-with-structured-split)
 5. [Strategy B1 — Cross-Attention Conditioning](#5-strategy-b1--cross-attention-conditioning)
-6. [Proposed Extension — Hybrid Strategy](#6-proposed-extension--hybrid-strategy-a-vae--b1-decoder)
+6. [Strategy D — Hybrid (A Bottleneck + B1 Decoder)](#6-strategy-d--hybrid-a-bottleneck--b1-decoder)
 7. [Strategy C — Baseline](#7-strategy-c--baseline)
 8. [InfoNCE Loss Variants](#8-infonce-loss-variants)
 9. [Training Configuration](#9-training-configuration)
@@ -36,6 +36,7 @@ Built on [SceneSplat-7K](https://arxiv.org/abs/2501.01895).
 | **A** — Disentangled | 16 layout + 496 geometry | Self-attention (all 512 together) | L_cross + L_ortho | 0.20–0.37 |
 | **B1** — Cross-Attn | 512 geometry tokens | Cross-attention K,V per layer | None (structural) | **0.761** |
 | **B2** — Additive | 512 geometry tokens | Broadcast additive bias | None | −0.06 (failed) |
+| **D** — Hybrid | 16 layout + 496 geometry | Cross-attention K,V per layer | L_cross + L_ortho | ~0.37–0.76 (expected) |
 
 All strategies share the same encoder. The decoder strategy is selected by flags.
 
@@ -330,23 +331,30 @@ flowchart TD
 
 ---
 
-## 6. Proposed Extension — Hybrid Strategy (A VAE + B1 Decoder)
+## 6. Strategy D — Hybrid (A Bottleneck + B1 Decoder)
 
-**Flags:** `--latent_disentangle --semantic_token_heads --decoder_zs_cross_attn`
+**Flags:** `--latent_disentangle --decoder_zs_cross_attn --semantic_token_heads --structured_layout_tokens`
 
-> **Note:** the current codebase labels this `decoder_zs_cross_attn=True` and marks it as
-> "Strategy D (failed)". The failure was due to insufficient InfoNCE supervision on z_s in
-> early experiments. With LayNCE and PoolNCE now active, this architecture is worth revisiting.
-> It is supported by EncDiff (NeurIPS 2024 Spotlight), which shows that cross-attention
-> between concept tokens and geometry is itself a strong disentanglement inductive bias.
+Strategy D combines the two best properties across all strategies:
 
-This hybrid combines the best property of each strategy:
-
-- **From Strategy A:** both z_s and z_g pass through the VAE bottleneck and are KL-regularised.
-  A single generative model (flow matching DiT on Z [B, 512, 32]) can generate both from scratch.
-- **From Strategy B1:** z_g tokens [B, 496, 32] are the decoder sequence input; z_s tokens
-  [B, 16, 32] condition every decoder layer via cross-attention K, V.
+- **From Strategy A:** both z_s and z_g pass through the VAE bottleneck (KL-regularised toward
+  N(0,I)). The full Z [B, 512, 32] has a generative path — a single Stage-2 DiT can generate
+  both z_s and z_g from scratch for unconditional scene generation.
+- **From Strategy B1:** z_g tokens [B, 496, 32] are the only decoder sequence input; z_s tokens
+  [B, 16, 32] condition every decoder layer as cross-attention K, V via `ZSCondTransformerDecoder`.
   The architectural separation is harder than the soft self-attention mixing in Strategy A.
+
+**Why the original run failed, and why it should work now:**
+An early experiment with `decoder_zs_cross_attn=True` produced near-zero disentanglement.
+The cause: z_s received gradient only through the cross-attention path during reconstruction —
+indirect and too weak without explicit semantic targets. z_s degenerated to near-constant noise
+and cross-attention weights collapsed toward zero.
+
+The fix is LayNCE and PoolNCE, which give **direct** gradients to all 16 z_s tokens every step,
+independent of the decoder. These force z_s to organise by scene type before reconstruction
+sees it. EncDiff (NeurIPS 2024 Spotlight) provides theoretical support: cross-attention between
+concept tokens and geometry is itself a strong disentanglement inductive bias, provided the
+concept tokens carry meaningful signal.
 
 ```mermaid
 flowchart TD
@@ -533,6 +541,10 @@ flowchart LR
 #   Strategy B1: geom_tokens → Linear(8192→16384) → 512 tokens
 #                shape_embed → Layout16Projector → z_layout [B, 16, 32]  (separate)
 #   Strategy C:  geom_tokens → Linear(8192→16384) → 512 tokens
+#   Strategy D:  shape_embed → mu_s_proj → 16 tokens (z_s)  [same as A]
+#                geom_tokens → Linear(8192→15872) → 496 tokens (z_g)  [same as A]
+#                decoder: z_g in sequence + z_s as cross-attn K/V per layer
+#                flags: --latent_disentangle --decoder_zs_cross_attn
 # ─────────────────────────────────────────────────────────────────────────
 num_latents:       256    # geometry encoder queries (total encoder = 257 with shape_embed)
 embed_dim:         32     # token dimension in Z; Z always [B, 512, 32]
@@ -591,11 +603,26 @@ L_total = L_recon                              (pos + color + opacity + scale + 
 
 ## 11. Second-Stage Generation Pipeline
 
-Requires Strategy A (both z_s and z_g are KL-regularised toward N(0,I)).
+Stage 2 learns to transform Gaussian noise into the latent Z that the frozen Stage 1
+decoder can decode into a coherent 3DGS scene. The key constraint: every tensor the
+decoder depends on must have a generative path from noise.
+
+| | Strategy A | Strategy B1 | Strategy D |
+|---|---|---|---|
+| Z fully KL-regularised? | Yes | Z yes, z_layout **no** | Yes |
+| Unconditional generation | Yes | **No** | Yes |
+| Scene completion | Yes, moderate | Yes, **excellent** | Yes, moderate |
+| Stage 2a (layout tokens) | Layout DiT on z_s [B,16,32] | N/A | Layout DiT on z_s [B,16,32] |
+| Stage 2b (geometry tokens) | Flat DiT, z_s concatenated | Inpainting DiT, z_layout fixed | Cross-attn DiT, z_s as K,V |
+| Architecture mirrors VAE decoder? | Partial | Strong | **Strong** |
+
+---
+
+### Strategy A — Stage 2
 
 ```mermaid
 flowchart TD
-    subgraph GEN["TEXT-CONDITIONED SCENE GENERATION"]
+    subgraph GEN["STRATEGY A — TEXT-CONDITIONED GENERATION"]
         direction TB
         TEXT["Text / scene-class token"]
         N1["noise [B, 16, 32]  ~  N(0, I)"]
@@ -633,6 +660,83 @@ flowchart TD
         PARTIAL --> ENC_P --> MASK --> INPAINT --> FULL
     end
 ```
+
+---
+
+### Strategy B1 — Stage 2 (Scene Completion Only)
+
+Because z_layout is deterministic (Layout16Projector, not KL-regularised), there is no
+distribution P(z_layout) to sample from. Stage 2 for B1 is therefore **completion only**,
+never unconditional generation.
+
+```mermaid
+flowchart TD
+    subgraph B1_COMP["STRATEGY B1 — SCENE COMPLETION"]
+        direction TB
+        PARTIAL_B["Partial scan (30–80% of Gaussians)"]
+        ENC_B["<b>Can3Tok Encoder</b><br/>shape_embed → Layout16Projector → z_layout [B,16,32]<br/>DETERMINISTIC: cos_sim = 1.000000 even at 40% coverage<br/>geom_tokens → Z [B, 512, 32]  (partial geometry)"]
+        MASK_B["<b>Construct noisy Z_geo</b><br/>Observed voxels: Z from encoder (held fixed)<br/>Unobserved voxels: Gaussian noise"]
+        INPAINT_B["<b>Completion DiT</b><br/>Architecture: ZSCondTransformerDecoder (mirrors VAE decoder exactly)<br/>z_layout [B,16,32] as cross-attn K/V — same as VAE decoder<br/>Only unobserved Z tokens denoised; observed tokens fixed<br/>Loss: flow matching on unobserved tokens only"]
+        FULL_B["<b>VAE Decoder (frozen B1)</b><br/>ZSCondTransformerDecoder(Z_complete, z_layout) → scene"]
+        NOTE_B["<b>Why B1 is ideal for completion:</b><br/>z_layout stable from 30% partial scan (0.761 @40%)<br/>No sampling noise — same partial scan always produces<br/>identical z_layout conditioning"]
+        PARTIAL_B --> ENC_B --> MASK_B --> INPAINT_B --> FULL_B
+        NOTE_B -.-> INPAINT_B
+    end
+```
+
+---
+
+### Strategy D — Stage 2 (Generation + Completion)
+
+Same two-stage structure as Strategy A. The difference is Stage 2b uses cross-attention
+conditioning — a structural mirror of the VAE decoder.
+
+```mermaid
+flowchart TD
+    subgraph D_GEN["STRATEGY D — HIERARCHICAL GENERATION"]
+        direction TB
+        TEXT_D["Text / scene-class token"]
+        N1_D["noise [B, 16, 32]  ~  N(0, I)"]
+
+        D1_D["<b>Stage 2a — Layout DiT  (~6 layers)</b><br/>Identical to Strategy A Stage 2a<br/>Flow matching: N(0,I) → P(z_s | text)<br/>Train target: Z[:, 0:16, :] from frozen Stage 1 encoder<br/>─────────────────────────────────<br/>Output: z_s [B, 16, 32]<br/>Encodes: scene type, colour, spatial layout"]
+
+        ZS_D["z_s  [B, 16, 32]"]
+        N2_D["noise [B, 496, 32]  ~  N(0, I)"]
+
+        D2_D["<b>Stage 2b — Geometry DiT  (~16–24 layers)</b><br/>Architecture: ZSCondTransformerBlock (mirrors VAE decoder)<br/>  z_g [B, 496, 32] = denoising sequence<br/>  z_s [B, 16, 32]  = cross-attn K/V at every layer<br/>Flow matching: N(0,I) → P(z_g | z_s)<br/>Train target: Z[:, 16:, :] from frozen Stage 1 encoder<br/>─────────────────────────────────<br/>Output: z_g [B, 496, 32]"]
+
+        ZG_D["z_g  [B, 496, 32]"]
+
+        DEC_D["<b>VAE Decoder (frozen Strategy D)</b><br/>Z = concat(z_s, z_g)  [B, 512, 32]<br/>post_kl_s(z_s) → H_s [B, 16, 384]  (cross-attn K/V)<br/>post_kl_g(z_g) → H_g [B, 496, 384] (sequence)<br/>ZSCondTransformerDecoder(H_g, H_s) → GS_decoder_new → scene"]
+
+        PLY_D["<b>Generated Scene PLY</b><br/>[B, 40000, 14]"]
+
+        TEXT_D --> D1_D
+        N1_D   --> D1_D
+        D1_D   --> ZS_D --> D2_D
+        N2_D   --> D2_D
+        D2_D   --> ZG_D
+        ZS_D   --> DEC_D
+        ZG_D   --> DEC_D
+        DEC_D  --> PLY_D
+    end
+
+    subgraph D_COMP["STRATEGY D — SCENE COMPLETION"]
+        direction TB
+        PARTIAL_D["Partial scan (30–80% of Gaussians)"]
+        ENC_D["<b>Can3Tok Encoder</b><br/>z_s [B,16,32] from VAE posterior (stochastic — sampling noise)<br/>z_g [B,496,32] from partial geometry"]
+        MASK_D["<b>Construct noisy z_g</b><br/>Observed voxels: z_g from encoder (held fixed)<br/>Unobserved voxels: Gaussian noise"]
+        INPAINT_D["<b>Stage 2b DiT — Inpainting</b><br/>z_s from partial encoder (fixed conditioning)<br/>Denoise only unobserved z_g tokens"]
+        FULL_D["<b>VAE Decoder (frozen)</b><br/>concat(z_s, z_g_complete) → scene"]
+        PARTIAL_D --> ENC_D --> MASK_D --> INPAINT_D --> FULL_D
+    end
+```
+
+**Key difference from Strategy A in Stage 2b:** Strategy A concatenates z_s into the DiT
+sequence (all 512 tokens together). Strategy D uses z_s as cross-attention K,V, which mirrors
+the VAE decoder architecture exactly. This structural consistency means the DiT is learning
+to invert the same conditioning structure the VAE decoder uses — the representations are
+already aligned in the right space.
 
 ---
 
@@ -692,6 +796,7 @@ Preprocessing pipeline (implemented in `gs_dataset_scenesplat.py`):
 | `--semantic_dims` | 512 | z\_s dims; token count = 512÷32 = 16 tokens |
 | `--decoder_layout_cross_attn` | False | Strategy B1: 512 geom + z\_layout as cross-attn K,V per layer |
 | `--decoder_layout_additive` | False | Strategy B2: 512 geom + z\_layout as broadcast additive bias |
+| `--decoder_zs_cross_attn` | False | Strategy D: z\_g [B,496,32] in sequence + z\_s [B,16,32] as cross-attn K,V; requires `--latent_disentangle` |
 | `--structured_layout_tokens` | False | Exclusive split: tokens 1–8 → semantic, 9–15 → layout |
 | `--color_residual` | False | DC/AC color; MeanColorHead on z\_s token 0 |
 | `--semantic_token_heads` | False | Heads on z tokens (inference-clean; requires latent\_disentangle) |
@@ -730,6 +835,12 @@ Preprocessing pipeline (implemented in `gs_dataset_scenesplat.py`):
         │   ├── SceneLayoutHead            [B,224/480] → centroids [B,72,3]
         │   ├── SemanticTokenInfoNCEHead   flatten(z_s)→[B,128]  (LayNCE)
         │   └── ZSTokenPoolProjectHead     pool(z_s)→[B,1024]→[B,16,32]  (PoolNCE)
+        │
+        ├── Strategy D components  (shares bottleneck with A, decoder with B1)
+        │   ├── post_kl_g                  z_g [B,496,32] → [B,496,384]
+        │   ├── post_kl_s                  z_s [B,16,32]  → [B,16,384]
+        │   ├── ZSCondTransformerDecoder   12× self_attn(z_g) + cross_attn(z_g,z_s)
+        │   └── GS_decoder_new             flat MLP 496×384=190464 → [B,40000,14]
         │
         ├── Strategy B1 components
         │   ├── Layout16Projector          shape_embed→z_layout [B,16,32]

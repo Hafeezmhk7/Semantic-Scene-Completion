@@ -1,0 +1,361 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_stratD
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=2
+#SBATCH --time=28:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=160G
+#SBATCH --output=logs/can3tok_stratD_%j.out
+#SBATCH --error=logs/can3tok_stratD_%j.err
+
+# ============================================================================
+# CAN3TOK — STRATEGY D (Hybrid: A bottleneck + B1 decoder)
+# ============================================================================
+#
+# ARCHITECTURE
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  ENCODER (identical to all strategies)
+#    257 queries: query 0 → shape_embed [B,384]
+#                 queries 1-256 → geom_tokens [B,256,384]
+#
+#  BOTTLENECK — same as Strategy A
+#    shape_embed → mu_s_proj_mean/var → μ_s [B,512]
+#    geom_tokens → pre_kl → flatten [B,8192] → kl_emb_proj_mean_g → μ_g [B,15872]
+#    concat + reparameterise → Z [B, 512, 32]
+#    z_s = Z[:, 0:16, :]  [B, 16, 32]   KL-regularised → N(0,I)
+#    z_g = Z[:, 16:,  :]  [B, 496, 32]  KL-regularised → N(0,I)
+#    Both KL-regularised → full Stage-2 DiT generative path exists
+#
+#  DECODER — same as Strategy B1 (ZSCondTransformerDecoder)
+#    post_kl_g(z_g) → H_g [B, 496, 384]  (sequence — geometry only)
+#    post_kl_s(z_s) → H_s [B,  16, 384]  (cross-attn K/V)
+#    12 × ZSCondTransformerBlock:
+#      self_attn(H_g, H_g, H_g)            — geometry attends to geometry
+#      cross_attn(Q=H_g, K=H_s, V=H_s)    — geometry reads z_s every layer
+#      FFN
+#    GS_decoder_new: 496×384 = 190,464 → [B, 40000, 14]
+#
+# WHY THE ORIGINAL RUN FAILED AND WHY IT SHOULD WORK NOW
+# ─────────────────────────────────────────────────────────────────────────────
+#  Previous failure: z_s received gradient only through cross-attention during
+#    reconstruction — an indirect path that is too weak without explicit
+#    semantic targets. z_s degenerated to near-constant noise and cross-attn
+#    weights collapsed toward zero.
+#
+#  Fix: LayNCE + PoolNCE give DIRECT gradients to z_s tokens every step,
+#    independent of the decoder. This forces z_s to organise by scene type
+#    before the reconstruction path ever sees it.
+#
+# ============================================================================
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# CHECKPOINT RESUME
+# ============================================================================
+
+RESUME_CHECKPOINT=""
+RESUME_EPOCH=""
+
+# ============================================================================
+# STRATEGY D FLAGS
+# ============================================================================
+
+# ── Core Strategy D ───────────────────────────────────────────────────────────
+LATENT_DISENTANGLE=True
+DECODER_ZS_CROSS_ATTN=True
+
+# ── Strategy B flags — must remain False ─────────────────────────────────────
+# Strategy D uses z_s from Z (KL-regularised, first 16 tokens).
+# Strategy B uses z_layout from Layout16Projector (deterministic, separate).
+# These are different decoder paths — cannot be combined.
+DECODER_LAYOUT_CROSS_ATTN=False
+DECODER_LAYOUT_ADDITIVE=False
+
+# ── Disentanglement ───────────────────────────────────────────────────────────
+SEMANTIC_DIMS=512
+CROSS_RECON_WEIGHT=0.3
+ORTHO_WEIGHT=0.1
+
+# ── Heads on z tokens ─────────────────────────────────────────────────────────
+SEMANTIC_TOKEN_HEADS=True
+STRUCTURED_LAYOUT_TOKENS=True   # tok0→color  tok1-8→semantic  tok9-15→layout
+
+# ── Semantic and layout supervision ───────────────────────────────────────────
+SCENE_SEMANTIC_HEAD=True
+SCENE_SEMANTIC_WEIGHT=0.3
+SCENE_LAYOUT_HEAD=True
+LAYOUT_LOSS_WEIGHT=0.3
+
+# ── Color ─────────────────────────────────────────────────────────────────────
+COLOR_RESIDUAL=True
+MEAN_COLOR_WEIGHT=1.0
+COLOR_LOSS_WEIGHT=1.0
+
+# ── InfoNCE — CRITICAL FIX vs previous failed run ────────────────────────────
+#
+#  PoolNCE: mean_pool(z_s [B,16,32]) → Linear(32→1024) → MLP → [B,128] → NCE
+#           DIRECT gradient to all 16 z_s tokens.
+#           [B,1024] bottleneck mirrors decoder hidden dimension exactly.
+#  LayNCE:  flatten(z_s [B,512]) → MLP → [B,128] → prototype NCE
+#           DIRECT gradient to all 16 z_s tokens via flatten path.
+#  pgNCE:   decoder hidden [B,1024] → SemanticProjectionHead → [B,40000,32] → NCE
+#           INDIRECT gradient to z_s through cross-attention, per-Gaussian labels.
+#           With decoder_zs_cross_attn=True, GS_decoder_new hidden [B,1024] is used.
+#
+#  Setting PoolNCE + LayNCE weights lower than Strategy A (0.1 vs 0.3) because
+#  cross-attention already provides architectural pressure on z_s.
+
+ZS_POOL_INFONCE_WEIGHT=0.1
+ZS_POOL_INFONCE_TEMPERATURE=0.07
+ZS_LAYOUT_INFONCE_WEIGHT=0.1
+ZS_LAYOUT_INFONCE_TEMPERATURE=0.07
+ZS_TOKEN_INFONCE_WEIGHT=0.0     # start at 0; raise to 0.1 if convergence is slow
+ZS_TOKEN_INFONCE_TEMPERATURE=0.07
+Z_S_INFONCE_WEIGHT=0.0
+Z_S_INFONCE_TEMPERATURE=0.07
+Z_S_INFONCE_DELTA=0.4
+
+# ── Per-Gaussian InfoNCE (pgNCE) ──────────────────────────────────────────────
+SEMANTIC_MODE="hidden"
+SEGMENT_WEIGHT=0.1
+INSTANCE_WEIGHT=0.0
+SEMANTIC_TEMP=0.07
+SEMANTIC_SUBSAMPLE=10000
+SAMPLING_STRATEGY="balanced"
+
+# ── Decoder PE ────────────────────────────────────────────────────────────────
+# With decoder_zs_cross_attn=True, FourierDecoderPE automatically uses
+# num_tokens=496 (skips first 16 z_s voxels). No manual change needed.
+DECODER_FOURIER_PE=True
+DECODER_POS_ENC=False
+
+# ── Scale penalty ─────────────────────────────────────────────────────────────
+SCALE_PENALTY_WEIGHT=0.0
+SCALE_PENALTY_THRESHOLD=0.5
+
+# ── Core training ─────────────────────────────────────────────────────────────
+BATCH_SIZE=64
+NUM_EPOCHS=2000
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-5
+EVAL_EVERY=50
+WEIGHT_DECAY=1e-2
+WARMUP_STEPS=300
+LR_MIN_RATIO=0.1
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+TRAIN_SCENES=300
+VAL_SCENES=50
+SAMPLING_METHOD="opacity"
+USE_CANONICAL_NORM=True
+SCALE_NORM_MODE="linear"
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+# PLYs written every PCA_VIS_FREQ epochs:
+#   scene{i}_input.ply / scene{i}_recon.ply           — always
+#   scene{i}_semantic_infonce.ply                     — pgNCE per-Gaussian
+#   zs_layout_epoch_NNN.ply  (B pts, dom-cat colour)  — LayNCE z_s projection
+#   zs_pool_epoch_NNN.ply    (B pts, dom-cat colour)  — PoolNCE pool hidden
+#   zs_tokens_epoch_NNN.ply  (B×16 pts, dom-cat)     — z_s tokens in PCA space
+#
+# Compare zs_layout and zs_pool PLYs with Strategy A checkpoints.
+# Same-colour points should cluster spatially — if they do, z_s is learning.
+PCA_VIS_FREQ=500
+PCA_NUM_SCENES=3
+PCA_BRIGHTNESS=1.25
+RECON_PLY_FREQ=50
+RECON_PLY_NUM_SCENES=3
+RECON_PLY_MAX_SH=3
+
+# ── W&B ───────────────────────────────────────────────────────────────────────
+USE_WANDB=False
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+if [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] || [ "$DECODER_LAYOUT_ADDITIVE" = "True" ]; then
+    echo "ERROR: Strategy D cannot have DECODER_LAYOUT_* flags set."
+    echo "  Strategy D: --decoder_zs_cross_attn  (z_s from Z, KL-regularised)"
+    echo "  Strategy B: --decoder_layout_cross_attn  (z_layout from projector, separate)"
+    exit 1
+fi
+
+[ "$LATENT_DISENTANGLE" != "True" ] && \
+    echo "ERROR: LATENT_DISENTANGLE must be True for Strategy D." && exit 1
+
+[ "$DECODER_ZS_CROSS_ATTN" != "True" ] && \
+    echo "ERROR: DECODER_ZS_CROSS_ATTN must be True for this job." && exit 1
+
+echo "========================================================================"
+echo "  CAN3TOK — Strategy D (Hybrid: A bottleneck + B1 cross-attn decoder)"
+echo "========================================================================"
+echo ""
+echo "  Bottleneck:"
+echo "    z_s [B, 16, 32]  KL → N(0,I)  (semantic — cross-attn conditioning)"
+echo "    z_g [B, 496, 32] KL → N(0,I)  (geometry — decoder sequence)"
+echo "    Z [B, 512, 32] — full Stage-2 generative path"
+echo ""
+echo "  Decoder: ZSCondTransformerDecoder (12 layers)"
+echo "    H_g [B, 496, 384] = post_kl_g(z_g)  ← sequence input"
+echo "    H_s [B,  16, 384] = post_kl_s(z_s)  ← K/V per layer"
+echo "    GS_decoder_new: 496×384 = 190,464 input dims"
+echo ""
+echo "  InfoNCE fix:  PoolNCE=$ZS_POOL_INFONCE_WEIGHT  LayNCE=$ZS_LAYOUT_INFONCE_WEIGHT"
+echo "                pgNCE=$SEGMENT_WEIGHT  cross_recon=$CROSS_RECON_WEIGHT"
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs checkpoints
+
+YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+if [ -f "$YAML_PATH" ]; then
+    POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
+    [ "$POINT_FEATS" != "11" ] && echo "ERROR: point_feats=$POINT_FEATS, expected 11" && exit 1
+    echo "  point_feats=11 confirmed"
+fi
+echo ""
+
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+
+ACCELERATE_CONFIG="/home/yli11/scratch/Hafeez_thesis/Can3Tok/job_scripts/accelerate_config.yaml"
+TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
+
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE --kl_weight $KL_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY --warmup_steps $WARMUP_STEPS"
+TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
+TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+
+# Strategy D core flags
+TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
+TRAIN_CMD="$TRAIN_CMD --decoder_zs_cross_attn"
+
+# Disentanglement
+TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
+TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --ortho_weight $ORTHO_WEIGHT"
+
+# Heads
+[ "$SEMANTIC_TOKEN_HEADS"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --semantic_token_heads"
+[ "$STRUCTURED_LAYOUT_TOKENS" = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_layout_tokens"
+[ "$SCENE_SEMANTIC_HEAD"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
+TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
+[ "$SCENE_LAYOUT_HEAD"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
+TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
+
+# Color
+[ "$COLOR_RESIDUAL" = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
+TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
+
+# InfoNCE
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_weight $ZS_POOL_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_temperature $ZS_POOL_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_weight $ZS_LAYOUT_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_temperature $ZS_LAYOUT_INFONCE_TEMPERATURE"
+[ "$(awk "BEGIN{print ($ZS_TOKEN_INFONCE_WEIGHT>0)?1:0}")" = "1" ] && \
+    TRAIN_CMD="$TRAIN_CMD --zs_token_infonce_weight $ZS_TOKEN_INFONCE_WEIGHT \
+               --zs_token_infonce_temperature $ZS_TOKEN_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_weight $Z_S_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_temperature $Z_S_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_delta $Z_S_INFONCE_DELTA"
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
+TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
+TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
+
+# Decoder PE
+[ "$DECODER_FOURIER_PE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
+
+# Scale penalty
+TRAIN_CMD="$TRAIN_CMD --scale_penalty_weight $SCALE_PENALTY_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scale_penalty_threshold $SCALE_PENALTY_THRESHOLD"
+
+# Normalisation
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+[ "$USE_CANONICAL_NORM" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+
+# Visualisation
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ --pca_num_scenes $PCA_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+
+[ "$USE_WANDB" = "True" ] && \
+    TRAIN_CMD="$TRAIN_CMD --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC"
+
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
+    [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
+fi
+
+echo "Command: $TRAIN_CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $TRAIN_CMD
+TRAIN_EXIT=$?
+echo ""
+echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+# ============================================================================
+# POST-RUN DIAGNOSTICS
+# ============================================================================
+
+if [ $TRAIN_EXIT -eq 0 ]; then
+    echo ""
+    echo "COMPLETED — Strategy D"
+    echo ""
+    echo "  1. Did z_s cluster? (LayNCE + PoolNCE should decrease over epochs)"
+    echo "     grep 'LayNCE=\|PoolNCE=' logs/can3tok_stratD_${SLURM_JOB_ID}.out | head -40"
+    echo "     LayNCats and PoolNCats must be >=2 for loss to be non-zero."
+    echo ""
+    echo "  2. Reconstruction vs Strategy A best (~0.229-0.250 L2):"
+    echo "     grep 'L2=' logs/can3tok_stratD_${SLURM_JOB_ID}.out | tail -10"
+    echo ""
+    echo "  3. Cross-recon (z_g geometry independence):"
+    echo "     grep 'CrossRecon=' logs/can3tok_stratD_${SLURM_JOB_ID}.out | tail -10"
+    echo ""
+    echo "  4. PCA visualisations:"
+    echo "     ls checkpoints/*/pca_visualisations/"
+    echo "     zs_layout/pool PLYs: same-colour points should cluster spatially"
+    echo ""
+    echo "  5. After training, run eval_architecture.py with --decoder_zs_cross_attn"
+    echo "     Target Exp2 swap ratio: <0.08%  (better than Strategy A Pool+pgNCE)"
+    echo "     Target Exp3 @40%:       0.37-0.76  (between A and B1)"
+    echo ""
+    echo "  Best checkpoint:"
+    ls checkpoints/*/best_model.pth 2>/dev/null | grep "zsCA" | tail -3
+else
+    echo "FAILED (exit $TRAIN_EXIT)"
+    echo "  cat logs/can3tok_stratD_${SLURM_JOB_ID}.err | tail -50"
+    echo ""
+    echo "  Common causes:"
+    echo "    1. point_feats mismatch (check shapevae-256.yaml, needs point_feats=11)"
+    echo "    2. GS_decoder_new input mismatch (n_zg_tokens should be 496)"
+    echo "    3. CUDA OOM — reduce BATCH_SIZE to 32"
+fi
