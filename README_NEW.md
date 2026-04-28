@@ -15,13 +15,16 @@ Built on [SceneSplat-7K](https://arxiv.org/abs/2501.01895).
 3. [Strategy A — Disentangled VAE (without Structured Split)](#3-strategy-a--disentangled-vae-without-structured-split)
 4. [Strategy A — Disentangled VAE (with Structured Split)](#4-strategy-a--disentangled-vae-with-structured-split)
 5. [Strategy B1 — Cross-Attention Conditioning](#5-strategy-b1--cross-attention-conditioning)
-6. [Strategy C — Baseline](#6-strategy-c--baseline)
-7. [InfoNCE Loss Variants](#7-infonce-loss-variants)
-8. [Loss Function Summary](#8-loss-function-summary)
-9. [Second-Stage Generation Pipeline](#9-second-stage-generation-pipeline)
-10. [Ablation Results](#10-ablation-results)
-11. [Key Flags Reference](#11-key-flags-reference)
-12. [Code Structure](#12-code-structure)
+6. [Proposed Extension — Hybrid Strategy](#6-proposed-extension--hybrid-strategy-a-vae--b1-decoder)
+7. [Strategy C — Baseline](#7-strategy-c--baseline)
+8. [InfoNCE Loss Variants](#8-infonce-loss-variants)
+9. [Training Configuration](#9-training-configuration)
+10. [Loss Function Summary](#10-loss-function-summary)
+11. [Second-Stage Generation Pipeline](#11-second-stage-generation-pipeline)
+12. [Dataset](#12-dataset)
+13. [Ablation Results](#13-ablation-results)
+14. [Key Flags Reference](#14-key-flags-reference)
+15. [Code Structure](#15-code-structure)
 
 ---
 
@@ -35,6 +38,14 @@ Built on [SceneSplat-7K](https://arxiv.org/abs/2501.01895).
 | **B2** — Additive | 512 geometry tokens | Broadcast additive bias | None | −0.06 (failed) |
 
 All strategies share the same encoder. The decoder strategy is selected by flags.
+
+> **Original Can3Tok vs this work.** The published Can3Tok (ICCV 2025) uses a single-stream
+> Strategy C baseline: 256 encoder geom queries → projected to 512 decoder tokens, standard
+> self-attention, no z_s / z_g split. shape_embed feeds only auxiliary heads — it is **not**
+> part of the generative latent Z. Our contribution is (1) routing shape_embed into a dedicated
+> z_s subspace of Z via `mu_s_proj_mean` (Strategy A), (2) enforcing disentanglement with
+> L_cross + L_ortho + InfoNCE, and (3) the cross-attention conditioning decoder (Strategy B1)
+> which extracts z_layout deterministically from shape_embed without entering Z.
 
 ---
 
@@ -62,17 +73,17 @@ flowchart TD
 
     PROJ["<b>input_proj  Linear(110 → 384)</b><br/>[B, 40000, 384]"]
 
-    QRY["<b>512 learned queries</b><br/>[512, 384]  ← random init, trained"]
+    QRY["<b>256 + 1 = 257 learned queries</b><br/>[257, 384]  ← random init, trained<br/>1 global query (→ shape_embed)<br/>256 geometry queries (→ geom_tokens)"]
 
-    CA["<b>Cross-Attention</b><br/>queries [512, 384]  attend to  data [40000, 384]<br/>→  [B, 513, 384]"]
+    CA["<b>Cross-Attention</b><br/>queries [257, 384]  attend to  data [40000, 384]<br/>→  [B, 257, 384]"]
 
-    SA["<b>6 × Self-Attention layers</b><br/>on latent queries only<br/>[B, 513, 384]  →  [B, 513, 384]"]
+    SA["<b>6 × Self-Attention layers</b><br/>on latent queries only<br/>[B, 257, 384]  →  [B, 257, 384]"]
 
-    SPLIT["<b>Split token 0 vs tokens 1:512</b>"]
+    SPLIT["<b>Split token 0 vs tokens 1:256</b>"]
 
-    SE["<b>shape_embed</b><br/>[B, 384]<br/>token 0 — global scene summary<br/>used by: MeanColorHead, Layout16Projector"]
+    SE["<b>shape_embed</b><br/>[B, 384]<br/>query 0 — global scene summary<br/>─────────────────────────────────<br/>Strategy A: routed into z_s via mu_s_proj<br/>Strategy B1: routed into z_layout via Layout16Projector<br/>Strategy C: feeds auxiliary heads ONLY — NOT in Z"]
 
-    GT["<b>geom_tokens</b><br/>[B, 512, 384]<br/>tokens 1–512 — per-region geometry<br/>used by: VAE bottleneck"]
+    GT["<b>geom_tokens</b><br/>[B, 256, 384]<br/>queries 1–256 — per-region geometry<br/>─────────────────────────────────<br/>All strategies: goes into VAE bottleneck<br/>256 encoder queries → upsampled to 496 or 512 latent token positions"]
 
     IN --> SAMPLE --> NORM --> FEAT
     FEAT --> FE1
@@ -101,16 +112,16 @@ concatenated and passed through the decoder together via self-attention.
 ```mermaid
 flowchart TD
     SE["shape_embed  [B, 384]"]
-    GT["geom_tokens  [B, 512, 384]"]
+    GT["geom_tokens  [B, 256, 384]"]
 
     subgraph BOTTLENECK["VAE BOTTLENECK — Disentangled Split"]
         direction TB
 
         MUS_PROJ["<b>mu_s_proj_mean / var</b><br/>Linear(384 → 512)<br/>─────────────────<br/>μ_s  [B, 512]<br/>σ²_s [B, 512]"]
 
-        PREKL["<b>pre_kl  Linear(384 → 64)</b><br/>applied to geom_tokens [B, 512, 384]<br/>→ moments [B, 512, 64]<br/>→ sample → kl_embed [B, 512, 32]<br/>→ flatten → [B, 16384]"]
+        PREKL["<b>pre_kl  Linear(384 → 64)</b><br/>applied to geom_tokens [B, 256, 384]<br/>→ moments [B, 256, 64]<br/>→ sample → kl_embed [B, 256, 32]<br/>→ flatten → [B, 8192]"]
 
-        MUG_PROJ["<b>kl_emb_proj_mean_g / var_g</b><br/>Linear(16384 → 15872)<br/>geom_dims = 64×64×4 − 512 = 15872<br/>─────────────────<br/>μ_g  [B, 15872]<br/>σ²_g [B, 15872]"]
+        MUG_PROJ["<b>kl_emb_proj_mean_g / var_g</b><br/>Linear(8192 → 15872)<br/>input: 256 geom tokens × 32 dims = 8192<br/>output: geom_dims = 64×64×4 − 512 = 15872<br/>─────────────────────────────────<br/>μ_g  [B, 15872]<br/>σ²_g [B, 15872]<br/>↑ 256 encoder queries upsampled to 496 latent positions"]
 
         CAT_MU["<b>Concat</b><br/>μ = [μ_s | μ_g]      [B, 16384]<br/>σ² = [σ²_s | σ²_g]  [B, 16384]"]
 
@@ -251,8 +262,8 @@ flowchart TD
 
     subgraph BOT_B["VAE BOTTLENECK — Geometry Only (no split)"]
         direction TB
-        PREKL_B["<b>pre_kl  Linear(384 → 64)</b><br/>geom_tokens [B, 512, 384]<br/>→ moments [B, 512, 64]<br/>→ sample → kl_embed [B, 512, 32]<br/>→ flatten → [B, 16384]"]
-        MU_B["<b>kl_emb_proj_mean / var</b><br/>Linear(16384 → 16384)<br/>μ [B, 16384]   σ² [B, 16384]"]
+        PREKL_B["<b>pre_kl  Linear(384 → 64)</b><br/>geom_tokens [B, 256, 384]<br/>→ moments [B, 256, 64]<br/>→ sample → kl_embed [B, 256, 32]<br/>→ flatten → [B, 8192]"]
+        MU_B["<b>kl_emb_proj_mean / var</b><br/>Linear(8192 → 16384)<br/>256 geom tokens upsampled to 512 latent positions<br/>μ [B, 16384]   σ² [B, 16384]"]
         REPARAM_B["<b>Reparameterisation</b><br/>z = μ + σ · ε<br/>z [B, 16384]  →  Z [B, 512, 32]<br/>512 pure geometry tokens<br/>KL-regularised → N(0, I)"]
     end
 
@@ -319,7 +330,83 @@ flowchart TD
 
 ---
 
-## 6. Strategy C — Baseline
+## 6. Proposed Extension — Hybrid Strategy (A VAE + B1 Decoder)
+
+**Flags:** `--latent_disentangle --semantic_token_heads --decoder_zs_cross_attn`
+
+> **Note:** the current codebase labels this `decoder_zs_cross_attn=True` and marks it as
+> "Strategy D (failed)". The failure was due to insufficient InfoNCE supervision on z_s in
+> early experiments. With LayNCE and PoolNCE now active, this architecture is worth revisiting.
+> It is supported by EncDiff (NeurIPS 2024 Spotlight), which shows that cross-attention
+> between concept tokens and geometry is itself a strong disentanglement inductive bias.
+
+This hybrid combines the best property of each strategy:
+
+- **From Strategy A:** both z_s and z_g pass through the VAE bottleneck and are KL-regularised.
+  A single generative model (flow matching DiT on Z [B, 512, 32]) can generate both from scratch.
+- **From Strategy B1:** z_g tokens [B, 496, 32] are the decoder sequence input; z_s tokens
+  [B, 16, 32] condition every decoder layer via cross-attention K, V.
+  The architectural separation is harder than the soft self-attention mixing in Strategy A.
+
+```mermaid
+flowchart TD
+    SE["shape_embed  [B, 384]"]
+    GT["geom_tokens  [B, 256, 384]"]
+
+    subgraph BOT_H["VAE BOTTLENECK — Disentangled (same as Strategy A)"]
+        direction TB
+        MUS_H["<b>mu_s_proj_mean / var</b><br/>Linear(384 → 512)<br/>μ_s [B, 512]  σ²_s [B, 512]"]
+        PREKL_H["<b>pre_kl  Linear(384 → 64)</b><br/>geom_tokens [B, 256, 384]<br/>→ flatten [B, 8192]<br/>→ kl_emb_proj_mean_g: Linear(8192 → 15872)"]
+        CAT_H["<b>Concat and reparameterise</b><br/>z_s [B, 512]  +  z_g [B, 15872]<br/>→ Z [B, 512, 32]<br/>Both KL-regularised → N(0,I)"]
+        ZS_H["<b>z_s = Z[:, 0:16, :]</b><br/>[B, 16, 32]  ← semantic tokens<br/>KL-regularised → generative path exists"]
+        ZG_H["<b>z_g = Z[:, 16:, :]</b><br/>[B, 496, 32]  ← geometry tokens<br/>KL-regularised → generative path exists"]
+    end
+
+    subgraph DEC_H["DECODER — Cross-Attention Conditioning (same as Strategy B1)"]
+        direction TB
+        POSTKL_GEO_H["<b>post_kl_g  Linear(32 → 384)</b><br/>z_g [B, 496, 32]  →  H_g [B, 496, 384]<br/>ONLY geometry tokens in decoder sequence"]
+        POSTKL_S_H["<b>post_kl_s  Linear(32 → 384)</b><br/>z_s [B, 16, 32]  →  H_s [B, 16, 384]"]
+        FOURPE_H["<b>FourierDecoderPE</b><br/>496-token scaffold PE added to H_g"]
+        LAYER_H["<b>12 × ZSCondTransformerBlock</b><br/>Self-Attention: H_g attends to H_g only<br/>Cross-Attention: Q=H_g, K=H_s, V=H_s<br/>→ geometry reads z_s at EVERY layer<br/>H_g [B, 496, 384]"]
+        GSD_H["<b>GS_decoder MLP</b><br/>[B, 496 × 384]  →  [B, 40000, 14]"]
+        OUT_H["<b>Reconstructed Gaussians  [B, 40000, 14]</b>"]
+    end
+
+    subgraph COMP_H["COMPARISON WITH STRATEGIES A AND B1"]
+        direction TB
+        R1["Strategy A: z_s in self-attention → soft mixing → stochastic partial obs (0.365 @40%)"]
+        R2["Strategy B1: z_layout deterministic → perfect stability → cos_sim=1.000000"]
+        R3["Hybrid: z_s stochastic but cross-attention → harder architectural separation<br/>Expected: better disentanglement than A, better generation than B1"]
+    end
+
+    SE --> MUS_H
+    GT --> PREKL_H
+    MUS_H --> CAT_H
+    PREKL_H --> CAT_H
+    CAT_H --> ZS_H & ZG_H
+    ZS_H --> POSTKL_S_H
+    ZG_H --> POSTKL_GEO_H
+    POSTKL_GEO_H --> FOURPE_H
+    POSTKL_S_H -->|"H_s B×16×384 — K and V per layer"| LAYER_H
+    FOURPE_H --> LAYER_H
+    LAYER_H --> GSD_H --> OUT_H
+```
+
+**Key difference from Strategy A:**
+
+| Property | Strategy A | Strategy B1 | Hybrid |
+|---|---|---|---|
+| z_s source | VAE posterior | Layout16Projector | VAE posterior |
+| z_s in Z? | Yes (tokens 0–15) | No (separate) | Yes (tokens 0–15) |
+| KL on z_s | Yes | No | Yes |
+| Decoder sequence | all 512 tokens | 512 geo tokens | 496 geo tokens only |
+| z_s decoder role | One of 512 self-attn tokens | K, V in cross-attn | K, V in cross-attn |
+| Generation possible? | Yes (Z is full) | Only conditioned | Yes (Z is full) |
+| Partial obs expected | ~0.37 @40% | 0.761 @40% | Between A and B1 |
+
+---
+
+## 7. Strategy C — Baseline
 
 **Flags:** none (all strategy flags `False`)
 
@@ -333,13 +420,13 @@ flowchart TD
 
     subgraph BOT_C["VAE BOTTLENECK — No Split"]
         direction TB
-        PREKL_C["<b>pre_kl  Linear(384 → 64)</b><br/>geom_tokens [B, 512, 384]<br/>→ kl_embed [B, 512, 32]<br/>→ flatten  [B, 16384]"]
-        MU_C["<b>kl_emb_proj_mean / var</b><br/>Linear(16384 → 16384)<br/>μ [B, 16384]   σ² [B, 16384]"]
+        PREKL_C["<b>pre_kl  Linear(384 → 64)</b><br/>geom_tokens [B, 256, 384]<br/>→ kl_embed [B, 256, 32]<br/>→ flatten  [B, 8192]"]
+        MU_C["<b>kl_emb_proj_mean / var</b><br/>Linear(8192 → 16384)<br/>256 geom tokens upsampled to 512 latent positions<br/>μ [B, 16384]   σ² [B, 16384]"]
         Z_C["<b>z = μ + σ · ε  →  Z [B, 512, 32]</b><br/>512 undifferentiated tokens<br/>No semantic / geometry split<br/>KL-regularised → N(0, I)"]
     end
 
     subgraph HEAD_C["AUXILIARY HEAD  (shape_embed, legacy path)"]
-        HC_C["<b>MeanColorHead</b><br/>shape_embed [B, 384]<br/>→ mean_color [B, 3]<br/><i>L_color = MSE(pred, GT mean RGB)</i><br/>Token 0 of Z still influenced by this loss<br/>because all 512 tokens attend to each other"]
+        HC_C["<b>MeanColorHead</b><br/>shape_embed [B, 384]<br/>→ mean_color [B, 3]<br/><i>L_color = MSE(pred, GT mean RGB)</i><br/>shape_embed is NOT part of Z in Strategy C<br/>The MeanColorHead gradient reaches Z only<br/>indirectly through decoder self-attention"]
     end
 
     subgraph DEC_C["DECODER — Standard Self-Attention"]
@@ -365,7 +452,7 @@ flowchart TD
 
 ---
 
-## 7. InfoNCE Loss Variants
+## 8. InfoNCE Loss Variants
 
 All variants use **cross-batch dominant-category prototype InfoNCE**:
 `dom_cat(b) = argmax(label_dist[b])`. They differ in *what* is supervised and whether
@@ -430,7 +517,47 @@ flowchart LR
 
 ---
 
-## 8. Loss Function Summary
+## 9. Training Configuration
+
+```yaml
+# Architecture (shapevae-256.yaml)
+# ─────────────────────────────────────────────────────────────────────────
+# IMPORTANT: num_latents=256 refers to the number of GEOMETRY encoder queries.
+# The encoder has 1 + 256 = 257 total queries:
+#   query 0 → shape_embed [B, 384]   (global scene summary)
+#   queries 1–256 → geom_tokens [B, 256, 384]   (per-region geometry)
+# The 512-token decoder latent Z is produced by upsampling:
+#   Strategy A:  shape_embed → mu_s_proj → 16 tokens (z_s)
+#                geom_tokens → Linear(8192→15872) → 496 tokens (z_g)
+#                concat → Z [B, 512, 32]
+#   Strategy B1: geom_tokens → Linear(8192→16384) → 512 tokens
+#                shape_embed → Layout16Projector → z_layout [B, 16, 32]  (separate)
+#   Strategy C:  geom_tokens → Linear(8192→16384) → 512 tokens
+# ─────────────────────────────────────────────────────────────────────────
+num_latents:       256    # geometry encoder queries (total encoder = 257 with shape_embed)
+embed_dim:         32     # token dimension in Z; Z always [B, 512, 32]
+width:             384    # transformer hidden width throughout
+encoder_layers:    6      # CrossAttentionEncoder self-attention layers
+decoder_layers:    12     # transformer decoder layers
+heads:             12     # attention heads
+num_freqs:         8      # Fourier embedding frequencies
+
+# Training (gs_can3tok_2.py)
+batch_size:        64     # per GPU × 2 H100s = 128 effective
+learning_rate:     1e-4   # cosine decay to lr × lr_min_ratio
+lr_min_ratio:      0.1    # floor = 1e-5
+warmup_steps:      300
+kl_weight:         1e-5   # deliberately small — allows large σ for better reconstruction
+semantic_dims:     512    # z_s spans first 512 dims of z = 16 tokens × 32 dims
+cross_recon_weight: 0.3
+ortho_weight:       0.1
+layout_loss_weight: 0.3
+scene_semantic_weight: 0.3
+```
+
+---
+
+## 10. Loss Function Summary
 
 ```
 L_total = L_recon                              (pos + color + opacity + scale + quat)
@@ -462,7 +589,7 @@ L_total = L_recon                              (pos + color + opacity + scale + 
 
 ---
 
-## 9. Second-Stage Generation Pipeline
+## 11. Second-Stage Generation Pipeline
 
 Requires Strategy A (both z_s and z_g are KL-regularised toward N(0,I)).
 
@@ -509,7 +636,21 @@ flowchart TD
 
 ---
 
-## 10. Ablation Results
+## 12. Dataset
+
+**SceneSplat-7K** — 7,916 indoor 3DGS scenes from ScanNet, ScanNet++, Replica,
+Hypersim, 3RScan, ARKitScenes, and Matterport3D. Per-Gaussian ScanNet72 semantic labels.
+
+Preprocessing pipeline (implemented in `gs_dataset_scenesplat.py`):
+- Positions normalised to 10 m radius canonical sphere using `normalize_to_canonical_sphere`
+- Top-40,000 Gaussians sampled deterministically by opacity per epoch
+- Color: per-scene mean subtracted → residuals ∈ [−0.5, +0.5] when `color_residual=True`
+- Encoder voxelisation: FNV hash on 40³ grid → `voxel_centers [N,3]` and `voxel_id [N]`
+- Layout: per-category centroid computed per scene for `SceneLayoutHead`
+
+---
+
+## 13. Ablation Results
 
 ### Architecture Evaluation (9 models, 4 experiments)
 
@@ -543,7 +684,7 @@ flowchart TD
 
 ---
 
-## 11. Key Flags Reference
+## 14. Key Flags Reference
 
 | Flag | Default | Description |
 |---|---|---|
@@ -567,7 +708,7 @@ flowchart TD
 
 ---
 
-## 12. Code Structure
+## 15. Code Structure
 
 ```
 .
