@@ -1,0 +1,140 @@
+#!/bin/bash
+#SBATCH --job-name=stage2_B1
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=2
+#SBATCH --time=20:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=120G
+#SBATCH --output=logs/stage2_B1_%j.out
+#SBATCH --error=logs/stage2_B1_%j.err
+
+# ============================================================================
+# CAN3TOK STAGE 2 — Strategy B1 (Scene Completion)
+# ============================================================================
+#
+# Strategy B1 has a SINGLE Stage 2 model — CompletionDiT.
+# There is no Layout DiT step because z_layout comes from the deterministic
+# Layout16Projector (not a learned generative model).
+#
+# What CompletionDiT learns
+# -------------------------
+#   Given a partial scan (30–80% of voxel tokens observed), complete the
+#   missing geometry tokens conditioned on z_layout.
+#
+#   At each training step:
+#     1. Encode full scene  →  Z [B, 512, 32]  +  z_layout [B, 16, 32]
+#     2. Sample random obs_mask (30–80% coverage)
+#     3. Observed tokens stay clean; unobserved tokens receive flow matching noise
+#     4. MSE loss computed only on unobserved token positions
+#
+# Why B1 excels at completion
+# ----------------------------
+#   z_layout is deterministic (cos_sim = 1.000 at 40% coverage).
+#   The conditioning signal is always accurate, even from sparse observations.
+#
+# ============================================================================
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# ── Stage 1 checkpoint (Strategy B1 — must have --decoder_layout_cross_attn) ─
+STAGE1_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/<YOUR_STRATEGY_B1_RUN>/best_model.pth"
+STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+
+# ── Resume (optional) ────────────────────────────────────────────────────────
+RESUME_CHECKPOINT=""
+
+# ── Model size ────────────────────────────────────────────────────────────────
+MODEL_SIZE="B"
+
+# ── Training ─────────────────────────────────────────────────────────────────
+BATCH_SIZE=48          # slightly smaller: full-Z flow matching is heavier than z_s or z_g alone
+NUM_EPOCHS=500
+LR=1e-4
+WEIGHT_DECAY=1e-2
+WARMUP_STEPS=200
+LR_MIN_RATIO=0.1
+EVAL_EVERY=25
+TRAIN_SCENES=300
+VAL_SCENES=50
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+if [ -z "$STAGE1_CHECKPOINT" ] || [[ "$STAGE1_CHECKPOINT" == *"<YOUR"* ]]; then
+    echo "ERROR: Set STAGE1_CHECKPOINT to your Strategy B1 Stage 1 best_model.pth"
+    echo "       The B1 Stage 1 checkpoint must have been trained with --decoder_layout_cross_attn"
+    exit 1
+fi
+
+echo "========================================================================"
+echo "  Stage 2 — Strategy B1 — Scene Completion"
+echo "  Stage 1: $STAGE1_CHECKPOINT"
+echo "  Model size: $MODEL_SIZE"
+echo "========================================================================"
+
+# ============================================================================
+# COMMAND
+# ============================================================================
+
+ACCELERATE_CONFIG="./job_scripts/accelerate_config.yaml"
+
+CMD="accelerate launch --config_file $ACCELERATE_CONFIG stage2/train_stage2.py"
+CMD="$CMD --strategy B1 --stage completion"
+CMD="$CMD --stage1_checkpoint $STAGE1_CHECKPOINT"
+CMD="$CMD --stage1_config $STAGE1_CONFIG"
+CMD="$CMD --model_size $MODEL_SIZE"
+CMD="$CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+CMD="$CMD --lr $LR --weight_decay $WEIGHT_DECAY"
+CMD="$CMD --warmup_steps $WARMUP_STEPS --lr_min_ratio $LR_MIN_RATIO"
+CMD="$CMD --eval_every $EVAL_EVERY"
+CMD="$CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
+
+[ -n "$RESUME_CHECKPOINT" ] && CMD="$CMD --resume_checkpoint $RESUME_CHECKPOINT"
+
+echo "Command: $CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $CMD
+EXIT=$?
+echo ""
+echo "Exit: $EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+if [ $EXIT -eq 0 ]; then
+    echo ""
+    echo "COMPLETED — Strategy B1 Completion DiT"
+    echo ""
+    echo "  Run completion on a partial scan:"
+    echo "    python stage2/sample_stage2.py \\"
+    echo "      --strategy B1 \\"
+    echo "      --stage1_checkpoint $STAGE1_CHECKPOINT \\"
+    echo "      --completion_checkpoint checkpoints_stage2/stage2_B1_completion_B_${SLURM_JOB_ID}/best_model.pth \\"
+    echo "      --partial_scan /path/to/partial_scene/ \\"
+    echo "      --coverage 0.4 \\"
+    echo "      --num_steps 50 --output_dir ./completed_scenes/"
+else
+    echo "FAILED (exit $EXIT)"
+    echo "  cat logs/stage2_B1_${SLURM_JOB_ID}.err | tail -30"
+fi

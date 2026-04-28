@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=can3tok_stratD
-#SBATCH --partition=gpu_a100
+#SBATCH --partition=gpu_h100
 #SBATCH --gpus=2
 #SBATCH --time=28:00:00
 #SBATCH --ntasks=1

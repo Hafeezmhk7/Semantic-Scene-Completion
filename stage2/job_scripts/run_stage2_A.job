@@ -1,0 +1,151 @@
+#!/bin/bash
+#SBATCH --job-name=stage2_A
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=2
+#SBATCH --time=20:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=120G
+#SBATCH --output=logs/stage2_A_%j.out
+#SBATCH --error=logs/stage2_A_%j.err
+
+# ============================================================================
+# CAN3TOK STAGE 2 — Strategy A
+# ============================================================================
+#
+# Run in TWO sequential steps. Submit step 1 first.
+# After step 1 converges (~200 epochs), check the val_loss, then submit step 2.
+#
+#  STEP 1 — Layout DiT (shared with Strategy D):
+#    Learns P(z_s) — the distribution of semantic layout tokens [B, 16, 32].
+#    Use the checkpoint from this step as LAYOUT_CKPT in Step 2 and in
+#    run_stage2_D.job.
+#
+#  STEP 2 — Geometry DiT A (prefix conditioning):
+#    Learns P(z_g | z_s) — geometry conditioned on a clean z_s prefix.
+#    All 512 tokens attend to each other (z_s as first 16 prefix tokens).
+#
+# ============================================================================
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# ── Stage 1 checkpoint (REQUIRED — set before submitting) ────────────────────
+STAGE1_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/<YOUR_RUN>/best_model.pth"
+STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+
+# ── Step selection: set to "layout" for Step 1, "geometry" for Step 2 ────────
+STAGE="layout"           # layout | geometry
+
+# ── For Step 2 only: path to the completed layout checkpoint ─────────────────
+LAYOUT_CKPT=""           # e.g. .../checkpoints_stage2/stage2_A_layout_B_JID/best_model.pth
+
+# ── Resume (optional) ────────────────────────────────────────────────────────
+RESUME_CHECKPOINT=""
+
+# ── Model size: S (fast test) | B (default) | L (best quality) ───────────────
+MODEL_SIZE="B"
+
+# ── Training ─────────────────────────────────────────────────────────────────
+BATCH_SIZE=64
+NUM_EPOCHS=500
+LR=1e-4
+WEIGHT_DECAY=1e-2
+WARMUP_STEPS=200
+LR_MIN_RATIO=0.1
+EVAL_EVERY=25
+TRAIN_SCENES=300
+VAL_SCENES=50
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+if [ -z "$STAGE1_CHECKPOINT" ] || [ "$STAGE1_CHECKPOINT" = "/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/<YOUR_RUN>/best_model.pth" ]; then
+    echo "ERROR: Set STAGE1_CHECKPOINT to your Stage 1 best_model.pth"
+    exit 1
+fi
+
+if [ "$STAGE" = "geometry" ] && [ -z "$LAYOUT_CKPT" ]; then
+    echo "ERROR: LAYOUT_CKPT must be set for --stage geometry"
+    exit 1
+fi
+
+echo "========================================================================"
+echo "  Stage 2 — Strategy A — Stage: $STAGE"
+echo "  Stage 1: $STAGE1_CHECKPOINT"
+echo "  Model size: $MODEL_SIZE"
+echo "========================================================================"
+
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+
+ACCELERATE_CONFIG="./job_scripts/accelerate_config.yaml"
+
+CMD="accelerate launch --config_file $ACCELERATE_CONFIG stage2/train_stage2.py"
+CMD="$CMD --strategy A --stage $STAGE"
+CMD="$CMD --stage1_checkpoint $STAGE1_CHECKPOINT"
+CMD="$CMD --stage1_config $STAGE1_CONFIG"
+CMD="$CMD --model_size $MODEL_SIZE"
+CMD="$CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+CMD="$CMD --lr $LR --weight_decay $WEIGHT_DECAY"
+CMD="$CMD --warmup_steps $WARMUP_STEPS --lr_min_ratio $LR_MIN_RATIO"
+CMD="$CMD --eval_every $EVAL_EVERY"
+CMD="$CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
+
+[ -n "$RESUME_CHECKPOINT" ] && CMD="$CMD --resume_checkpoint $RESUME_CHECKPOINT"
+
+echo "Command: $CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $CMD
+EXIT=$?
+echo ""
+echo "Exit: $EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+if [ $EXIT -eq 0 ]; then
+    echo ""
+    echo "COMPLETED — Strategy A, stage=$STAGE"
+    echo ""
+    if [ "$STAGE" = "layout" ]; then
+        echo "  Next step:"
+        echo "    1. Set LAYOUT_CKPT in run_stage2_A.job to the best_model.pth from this run"
+        echo "    2. Set STAGE=geometry"
+        echo "    3. sbatch run_stage2_A.job"
+        echo ""
+        echo "  Note: The same layout checkpoint can also be used for Strategy D!"
+        echo "    Copy LAYOUT_CKPT to run_stage2_D.job"
+    else
+        echo "  Stage 2 A complete. Generate scenes:"
+        echo "    python stage2/sample_stage2.py \\"
+        echo "      --strategy A \\"
+        echo "      --stage1_checkpoint $STAGE1_CHECKPOINT \\"
+        echo "      --layout_checkpoint $LAYOUT_CKPT \\"
+        echo "      --geometry_checkpoint checkpoints_stage2/stage2_A_geometry_B_${SLURM_JOB_ID}/best_model.pth \\"
+        echo "      --num_samples 8 --num_steps 50 --output_dir ./generated_A/"
+    fi
+else
+    echo "FAILED (exit $EXIT)"
+    echo "  cat logs/stage2_A_${SLURM_JOB_ID}.err | tail -30"
+fi
