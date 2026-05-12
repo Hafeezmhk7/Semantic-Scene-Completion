@@ -2,7 +2,7 @@
 #SBATCH --job-name=stage2_D
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=2
-#SBATCH --time=20:00:00
+#SBATCH --time=48:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=120G
@@ -13,52 +13,64 @@
 # CAN3TOK STAGE 2 — Strategy D
 # ============================================================================
 #
-# Strategy D uses TWO Stage 2 models:
+# Run in TWO sequential submissions:
 #
-#   Stage 2a — LayoutDiT (SHARED with Strategy A)
-#     If you already trained Strategy A Stage 2a, just set LAYOUT_CKPT below
-#     and skip to Stage 2b.  No need to retrain.
+#   Submission 1 — Layout DiT (STAGE=layout):
+#       SHARED with Strategy A — if you already trained Strategy A Stage 2a,
+#       set LAYOUT_CKPT and skip directly to Submission 2.
 #
-#   Stage 2b — GeometryDiTD (cross-attention conditioning)
-#     z_g [B, 496, 32] is denoised; z_s [B, 16, 32] conditions every layer
-#     via cross-attention.  This mirrors the ZSCondTransformerDecoder used in
-#     Strategy D's Stage 1 decoder — same conditioning structure in both stages.
+#   Submission 2 — Geometry DiT D (STAGE=geometry):
+#       Learns P(z_g | z_s_clean) using GeometryDiTD.
+#       Architecture mirrors Stage 1 ZSCondTransformerDecoder exactly:
+#       z_g [B,496] sequence, z_s [B,16] as cross-attention K/V per block.
+#
+#       Ablation: set ZS_CONDITIONING=adaLN to test pooled conditioning.
+#
+# Checkpoint sharing between strategies:
+#   The Layout DiT checkpoint is identical for Strategy A and D
+#   (same target: Z[:, 0:16, :] = z_s from Stage 1 encoder).
+#   Train it once, reuse across both strategies.
 #
 # ============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION  — edit these before submitting
 # ============================================================================
 
-# ── Stage 1 checkpoint (Strategy D — must have --decoder_zs_cross_attn) ─────
+# ── Stage 1 checkpoint (Strategy D — decoder_zs_cross_attn=True) ─────────────
 STAGE1_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/<YOUR_STRATEGY_D_RUN>/best_model.pth"
 STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 
-# ── Step: layout (Stage 2a) or geometry (Stage 2b) ───────────────────────────
-STAGE="layout"           # layout | geometry
+# ── Step: layout (Submission 1) | geometry (Submission 2) ────────────────────
+STAGE="layout"
 
-# ── If STAGE=layout was already done for Strategy A, reuse that checkpoint ───
-# LAYOUT_CKPT="/path/to/stage2_A_layout_B_JID/best_model.pth"
-LAYOUT_CKPT=""
+# ── Layout checkpoint — required for STAGE=geometry ──────────────────────────
+# Can reuse Strategy A layout checkpoint — same target latent.
+LAYOUT_CKPT=""           # e.g. checkpoints_stage2/stage2_A_layout_B_JOBID/best_model.pth
 
-# ── Resume (optional) ────────────────────────────────────────────────────────
+# ── z_s conditioning — only applies to STAGE=geometry ────────────────────────
+# cross_attn : dedicated cross-attention per block   ← default, recommended
+# adaLN      : pooled z_s added to t_embed           ← ablation
+ZS_CONDITIONING="cross_attn"
+
+# ── Resume (optional) ─────────────────────────────────────────────────────────
 RESUME_CHECKPOINT=""
 
 # ── Model size ────────────────────────────────────────────────────────────────
 MODEL_SIZE="B"
 
-# ── Training ─────────────────────────────────────────────────────────────────
+# ── Training ──────────────────────────────────────────────────────────────────
 BATCH_SIZE=64
-NUM_EPOCHS=500
+NUM_EPOCHS=2000
 LR=1e-4
 WEIGHT_DECAY=1e-2
-WARMUP_STEPS=200
-LR_MIN_RATIO=0.1
-EVAL_EVERY=25
+WARMUP_STEPS=500
+LR_MIN_RATIO=0.05
+EVAL_EVERY=50
 TRAIN_SCENES=300
-VAL_SCENES=50
+VAL_SCENES=20
 
 # ============================================================================
 # ENVIRONMENT
@@ -76,22 +88,22 @@ mkdir -p logs
 # VALIDATION
 # ============================================================================
 
-if [ -z "$STAGE1_CHECKPOINT" ] || [[ "$STAGE1_CHECKPOINT" == *"<YOUR"* ]]; then
+if [[ "$STAGE1_CHECKPOINT" == *"<YOUR"* ]]; then
     echo "ERROR: Set STAGE1_CHECKPOINT to your Strategy D Stage 1 best_model.pth"
     exit 1
 fi
-
 if [ "$STAGE" = "geometry" ] && [ -z "$LAYOUT_CKPT" ]; then
-    echo "ERROR: Set LAYOUT_CKPT for --stage geometry (can reuse Strategy A layout checkpoint)"
+    echo "ERROR: Set LAYOUT_CKPT (can reuse Strategy A layout checkpoint)"
     exit 1
 fi
 
 echo "========================================================================"
 echo "  Stage 2 — Strategy D — Stage: $STAGE"
-echo "  Stage 1: $STAGE1_CHECKPOINT"
-if [ -n "$LAYOUT_CKPT" ]; then
-    echo "  Layout:  $LAYOUT_CKPT (reusing from Strategy A)"
+if [ "$STAGE" = "geometry" ]; then
+    echo "  z_s conditioning: $ZS_CONDITIONING"
+    [ -n "$LAYOUT_CKPT" ] && echo "  Layout ckpt: $LAYOUT_CKPT (reusing from Strategy A)"
 fi
+echo "  Stage 1: $STAGE1_CHECKPOINT"
 echo "  Model size: $MODEL_SIZE"
 echo "========================================================================"
 
@@ -111,7 +123,12 @@ CMD="$CMD --lr $LR --weight_decay $WEIGHT_DECAY"
 CMD="$CMD --warmup_steps $WARMUP_STEPS --lr_min_ratio $LR_MIN_RATIO"
 CMD="$CMD --eval_every $EVAL_EVERY"
 CMD="$CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
+CMD="$CMD --vis_freq $VIS_FREQ --vis_num_scenes $VIS_NUM_SCENES --vis_num_steps $VIS_NUM_STEPS"
+CMD="$CMD --flow_diag_freq $FLOW_DIAG_FREQ"
 
+if [ "$STAGE" = "geometry" ]; then
+    CMD="$CMD --zs_conditioning $ZS_CONDITIONING"
+fi
 [ -n "$RESUME_CHECKPOINT" ] && CMD="$CMD --resume_checkpoint $RESUME_CHECKPOINT"
 
 echo "Command: $CMD"
@@ -132,19 +149,21 @@ if [ $EXIT -eq 0 ]; then
     echo "COMPLETED — Strategy D, stage=$STAGE"
     if [ "$STAGE" = "layout" ]; then
         echo ""
-        echo "  Layout DiT done. Note: this checkpoint is interchangeable with Strategy A's layout."
-        echo "  Next step:"
-        echo "    1. Set LAYOUT_CKPT in run_stage2_D.job to the best_model.pth from this run"
+        echo "  Layout DiT done."
+        echo "  Next steps:"
+        echo "    1. Set LAYOUT_CKPT to the best_model.pth from this run"
         echo "    2. Set STAGE=geometry"
-        echo "    3. sbatch run_stage2_D.job"
+        echo "    3. Submit twice: ZS_CONDITIONING=cross_attn and ZS_CONDITIONING=adaLN"
+        echo ""
+        echo "  Or if Strategy A layout already exists, reuse that checkpoint directly."
     else
-        echo "  Stage 2 D complete. Generate scenes:"
+        echo "  Generation command:"
         echo "    python stage2/sample_stage2.py \\"
         echo "      --strategy D \\"
         echo "      --stage1_checkpoint $STAGE1_CHECKPOINT \\"
         echo "      --layout_checkpoint $LAYOUT_CKPT \\"
-        echo "      --geometry_checkpoint checkpoints_stage2/stage2_D_geometry_B_${SLURM_JOB_ID}/best_model.pth \\"
-        echo "      --num_samples 8 --num_steps 50 --output_dir ./generated_D/"
+        echo "      --geometry_checkpoint checkpoints_stage2/stage2_D_geometry_${ZS_CONDITIONING}_B_${SLURM_JOB_ID}/best_model.pth \\"
+        echo "      --num_samples 8 --num_steps 50 --output_dir ./generated_D_${ZS_CONDITIONING}/"
     fi
 else
     echo "FAILED (exit $EXIT)"

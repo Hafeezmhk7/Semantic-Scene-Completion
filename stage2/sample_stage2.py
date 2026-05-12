@@ -41,7 +41,7 @@ from gs_ply_reconstructor import save_reconstructed_gaussians
 
 from stage2.external.transport import create_transport
 from stage2.models.layout_dit     import LayoutDiT_models
-from stage2.models.geometry_dit   import GeometryDiT_models
+from stage2.models.geometry_dit   import GeometryDiT_models, GeometryDiT_adaLN_models
 from stage2.models.completion_dit import CompletionDiT_models, sample_voxel_mask
 
 
@@ -116,16 +116,20 @@ def load_stage1(checkpoint_path: str, config_path: str, device: torch.device):
 
 def load_stage2_model(checkpoint_path: str, device: torch.device):
     """Load a Stage 2 model from a checkpoint, auto-detecting model type."""
-    ckpt     = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    strategy = ckpt["strategy"]
-    stage    = ckpt["stage"]
-    size     = ckpt["model_size"]
+    ckpt            = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    strategy        = ckpt["strategy"]
+    stage           = ckpt["stage"]
+    size            = ckpt["model_size"]
+    zs_conditioning = ckpt.get("zs_conditioning", "cross_attn")   # default for old checkpoints
 
     if stage == "layout":
         model = LayoutDiT_models[f"LayoutDiT-{size}"]()
     elif stage == "geometry":
-        suffix = "A" if strategy == "A" else "D"
-        model  = GeometryDiT_models[f"GeometryDiT{suffix}-{size}"]()
+        if zs_conditioning == "adaLN":
+            model = GeometryDiT_adaLN_models[f"GeometryDiT_adaLN-{size}"]()
+        else:
+            suffix = "A" if strategy == "A" else "D"
+            model  = GeometryDiT_models[f"GeometryDiT{suffix}-{size}"]()
     elif stage == "completion":
         model = CompletionDiT_models[f"CompletionDiT-{size}"]()
     else:

@@ -7,8 +7,14 @@
 import torch as th
 import numpy as np
 import torch.nn as nn
-from torchdiffeq import odeint
 from tqdm import tqdm
+
+# torchdiffeq is only needed inside ode.sample() at inference time.
+# Import lazily so training works without it installed.
+try:
+    from torchdiffeq import odeint
+except ImportError:
+    odeint = None
 
 
 class sde:
@@ -76,6 +82,13 @@ class ode:
         self.sampler_type = sampler_type
 
     def sample(self, x, model, **model_kwargs):
+        if odeint is None:
+            raise ImportError(
+                "torchdiffeq is required for ode.sample(). "
+                "Install it with: pip install torchdiffeq\n"
+                "For inference you can use euler_sample() in sample_stage2.py instead, "
+                "which has no extra dependencies."
+            )
         device = x[0].device if isinstance(x, tuple) else x.device
 
         def _fn(t, x):
