@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=120G
-#SBATCH --output=logs/stage2_B1_2k%j.out
-#SBATCH --error=logs/stage2_B1_2k%j.err
+#SBATCH --output=log_ss2/stage2_B1_2k%j.out
+#SBATCH --error=log_ss2/stage2_B1_2k%j.err
 
 # ============================================================================
 # CAN3TOK STAGE 2 — Strategy B1 (Scene Completion)
@@ -54,7 +54,7 @@ MODEL_SIZE="B"
 
 # ── Training ─────────────────────────────────────────────────────────────────
 BATCH_SIZE=64          # slightly smaller: full-Z flow matching is heavier than z_s or z_g alone
-NUM_EPOCHS=2000
+NUM_EPOCHS=3000
 LR=1e-4
 WEIGHT_DECAY=1e-2
 WARMUP_STEPS=500
@@ -81,6 +81,9 @@ export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-pack
 
 cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
 mkdir -p logs
+
+# Create log directories BEFORE anything writes to them
+mkdir -p log_ss2
 
 # ============================================================================
 # VALIDATION

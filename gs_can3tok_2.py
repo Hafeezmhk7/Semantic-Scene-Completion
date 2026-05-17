@@ -361,7 +361,7 @@ for flag, label in flags:
     if flag: tag += label
 tag += "_inferencefixed"
 
-save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{tag}/"
+save_path = f"/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage1/{tag}/"
 os.makedirs(save_path, exist_ok=True)
 
 # ============================================================================

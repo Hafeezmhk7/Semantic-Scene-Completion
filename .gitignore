@@ -37,4 +37,5 @@ logs/
 *.jpeg
 
 #Pdfs
-*.pdf
+*.pdflog_ss2/
+logs_ss1/

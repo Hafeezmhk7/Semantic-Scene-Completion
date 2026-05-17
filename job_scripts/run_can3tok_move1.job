@@ -1,274 +1,281 @@
 #!/bin/bash
-#SBATCH --job-name=can3tok_move1
+#SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=1
-#SBATCH --time=48:00:00
+#SBATCH --gpus=4
+#SBATCH --time=90:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=9
-#SBATCH --mem=128G
-#SBATCH --output=logs/can3tok_move1_%j.out
-#SBATCH --error=logs/can3tok_move1_%j.err
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=160G
+#SBATCH --output=logs_ss1/can3tok_mkl%j.out
+#SBATCH --error=logs_ss1/can3tok_mkl%j.err
 
 # ============================================================================
-# CAN3TOK — MOVE 1: SCENE SEMANTIC HEAD + JEPA IDEA 1: SPATIAL SEMANTIC HEAD
+# CAN3TOK — DECODER STRATEGIES
 # ============================================================================
 #
-# What this script covers (four ablation runs via flag changes):
+# STRATEGY A  [LATENT_DISENTANGLE=True, all DECODER_LAYOUT_*=False]  ← BEST
+#   Z = [z_layout(0:16) | z_geo(16:512)] → all 512 tokens to decoder sequence
+#   Self-attention mixes layout & geometry freely at every layer
 #
-#   Run C: color_residual + scene_semantic                (SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=False)
-#   Run D: color_residual + scene_semantic + InfoNCE      (SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=False, SEMANTIC_MODE=hidden)
-#   Run E: color_residual + scene_semantic + jepa_idea1   (SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=True)  ← NEW default
-#   Run F: color_residual + jepa_idea1 (no SceneSemHead)  (SCENE_SEMANTIC_HEAD=False, JEPA_IDEA1=True)
+# STRATEGY B1 [DECODER_LAYOUT_CROSS_ATTN=True]  ← NEW
+#   Z [B,512,32] = full geometry
+#   z_layout [B,16,32] from Layout16Projector(shape_embed) — SEPARATE from Z
+#   Decoder: 512 geometry in sequence + z_layout as cross-attn K/V per layer
+#   Key: geometry = FULL 512 (unlike failed decoder_zs_cross_attn which used 496)
 #
-# JEPA Idea 1 summary:
-#   Extends Move 1 (global label dist) to spatial: for each occupied voxel
-#   in the scene, predict its ScanNet72 label distribution from shape_embed
-#   and the voxel's 3D position.  Supervision from segment.npy aggregated in
-#   DataLoader workers — zero GPU overhead.
+# STRATEGY B2 [DECODER_LAYOUT_ADDITIVE=True]  ← NEW, simpler
+#   Same z_layout as B1
+#   Conditioning: flatten(z_layout)→MLP→[B,384] as broadcast additive bias
 #
-#   gradient path: KL_spatial -> SpatialSemanticHead -> shape_embed -> encoder
-#   independent of MeanColorHead, SceneSemanticHead, and InfoNCE paths.
+# STRATEGY B3 [both B1 + B2]  ← additive bias + cross-attn combined
 #
-#   Diagnostic to watch:
-#     SpatialKL  in validation output — should decrease across training
-#     Compare val/l2_error against Run C (no JEPA) and Run A (no Move1 either)
+# STRATEGY C  [all False]  ← original Can3Tok baseline
 #
-# Prior results for comparison:
-#   Run A (color_residual only):             L2=1.43
-#   Run B (color_residual + InfoNCE):        L2=1.99
+# z_layout InfoNCE (all B strategies, optional for A):
+#   flatten(z_layout)→[B,512]→MLP→[B,128]→cross-batch dominant-cat prototype NCE
+#   Identical mechanism to per-Gaussian InfoNCE, same PCA visualization style
+#   Output: zs_layout_epoch_NNN.ply  (B×16 points, colored by dominant category)
 # ============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ============================================================================
-# CHECKPOINT RESUMING
+# FLAGS
 # ============================================================================
 
-RESUME_CHECKPOINT=""   # path to .pth to resume; empty = fresh start
-RESUME_EPOCH=""        # override epoch counter; empty = auto (saved epoch + 1)
+RESUME_CHECKPOINT=""
+RESUME_EPOCH=""
 
-# ============================================================================
-# CORE TRAINING FLAGS
-# ============================================================================
+# ── STRATEGY SELECTION ────────────────────────────────────────────────────────
+# Strategy A (best): LATENT_DISENTANGLE=True, both DECODER_LAYOUT_*=False
+# Strategy B1:       DECODER_LAYOUT_CROSS_ATTN=True, LATENT_DISENTANGLE=False
+# Strategy B2:       DECODER_LAYOUT_ADDITIVE=True, LATENT_DISENTANGLE=False
+# Strategy B3:       both DECODER_LAYOUT_*=True, LATENT_DISENTANGLE=False
+# Strategy C:        all layout flags False, LATENT_DISENTANGLE=False
 
-BATCH_SIZE=64
-NUM_EPOCHS=1500
-LEARNING_RATE=1e-4
-KL_WEIGHT=1e-6
-EVAL_EVERY=50
-FAILURE_THRESHOLD=100
+DECODER_LAYOUT_CROSS_ATTN=False
+DECODER_LAYOUT_ADDITIVE=False
 
-# ============================================================================
-# STEP 1: COLOR RESIDUAL FLAGS
-# ============================================================================
+# ── Latent disentanglement ────────────────────────────────────────────────────
+LATENT_DISENTANGLE=True
+SEMANTIC_DIMS=512
+CROSS_RECON_WEIGHT=0.3
+ORTHO_WEIGHT=0.1
 
+# ── Color ─────────────────────────────────────────────────────────────────────
 COLOR_RESIDUAL=True
 MEAN_COLOR_WEIGHT=1.0
 COLOR_LOSS_WEIGHT=1.0
 
-# ============================================================================
-# MOVE 1: SCENE SEMANTIC HEAD FLAGS
-# ============================================================================
+# ── Structured token split ───────────────────────────────────────────────────
+# WITHOUT (default): both SceneSemanticHead and SceneLayoutHead receive
+#   tokens 1-15 flattened [B,480] — same floats, gradient interference.
+# WITH: tokens 1-8  [B,256] → SceneSemanticHead  (exclusive, 8×32)
+#       tokens 9-15 [B,224] → SceneLayoutHead    (exclusive, 7×32)
+# Requires SCENE_SEMANTIC_HEAD=True AND SCENE_LAYOUT_HEAD=True.
+# Works for Strategy A (SEMANTIC_TOKEN_HEADS=True) and Strategy B.
+STRUCTURED_LAYOUT_TOKENS=True
 
+# ── Semantic / layout heads on z_layout tokens ───────────────────────────────
+# Strategy A: set SEMANTIC_TOKEN_HEADS=True to run on z tokens 0-15
+# Strategy B: heads auto-routed to z_layout tokens (no flag needed)
 SCENE_SEMANTIC_HEAD=True
-# Adds SceneSemanticHead: shape_embed -> MLP(128->128) -> [B,72] softmax.
-# Loss: KL(p_s || p_hat). Independent gradient path into shape_embed.
-# Set False to isolate JEPA Idea 1 without Move 1.
-
 SCENE_SEMANTIC_WEIGHT=0.3
+SCENE_LAYOUT_HEAD=True
+LAYOUT_LOSS_WEIGHT=0.3
+SEMANTIC_TOKEN_HEADS=True
 
-# ============================================================================
-# JEPA IDEA 1: SPATIAL SEMANTIC HEAD FLAGS  ← NEW
-# ============================================================================
+# ── z_s pool InfoNCE (new — mirrors decoder hidden InfoNCE) ─────────────────
+# mean_pool(16 tokens)→[B,32]→Linear→[B,1024]→MLP→[B,128]→cross-batch NCE
+# [B,1024] bottleneck = same dim as decoder hidden state (structural mirror)
+# Works for Strategy A (z_s tokens) and Strategy B (z_layout tokens).
+# PCA vis: zs_pool_epoch_NNN.ply  (one point per scene)
+# Log:     PoolNCE= and PoolNCats= in epoch print
+ZS_POOL_INFONCE_WEIGHT=0.3
+ZS_POOL_INFONCE_TEMPERATURE=0.07
 
-JEPA_IDEA1=True
-# Adds SpatialSemanticHead: (shape_embed + voxel_center) -> [B,K,72] softmax.
-# Loss: mean KL(p_k || p_hat_k) over all occupied voxels per scene.
-# Forces shape_embed to encode WHERE categories are (spatially-resolved),
-# not just WHAT categories exist globally (Move 1).
-#
-# Dataset side: activates per-voxel label distribution computation in
-# gs_dataset_scenesplat.py (reuses the existing voxelization — no extra IO).
-# Returns voxel_centers_jepa [B,512,3], voxel_dists_jepa [B,512,72],
-# num_voxels_jepa [B] in each batch.
-#
-# Model side: instantiates SpatialSemanticHead in AlignedShapeLatentPerceiver.
-# NOT called inside forward() — training loop calls it directly after
-# forward() using _shape_embed_cache.  Forward() signature unchanged.
-#
-# Set False to reproduce Run C exactly (color_residual + scene_semantic only).
+# ── z_layout InfoNCE (NEW — prototype NCE, same mechanism as per-Gaussian) ───
+# Works for all strategies. Requires DECODER_LAYOUT_* or LATENT_DISENTANGLE.
+# PCA output: zs_layout_epoch_NNN.ply
+# LayNCats in training log = # distinct dominant categories in batch (need >=2)
+ZS_LAYOUT_INFONCE_WEIGHT=0.0
+ZS_LAYOUT_INFONCE_TEMPERATURE=0.07
 
-JEPA_IDEA1_WEIGHT=1.0
-# Weight on spatial KL loss.
-# total_loss += jepa_idea1_weight * mean_KL(p_k || p_hat_k)
-# Start with 1.0 (same order of magnitude as scene_semantic_weight=0.3
-# because spatial KL is averaged over ~300 voxels which naturally makes
-# it smaller per-batch than the global 72-dim KL).
-# Increase if SpatialKL stays high and doesn't drive useful gradients.
-# Decrease if reconstruction L2 degrades.
+# ── z_s token InfoNCE (per-token prototype NCE on 16 tokens, Strategy A) ─────
+ZS_TOKEN_INFONCE_WEIGHT=0.0
+ZS_TOKEN_INFONCE_TEMPERATURE=0.07
+ 
+# ── Scene-level z_s InfoNCE (soft positive pairs, label_dist cosine sim) ──────
+Z_S_INFONCE_WEIGHT=0.0
+Z_S_INFONCE_TEMPERATURE=0.07
+Z_S_INFONCE_DELTA=0.4
 
-# ============================================================================
-# SEMANTIC (HIDDEN INFONCE) FLAGS
-# ============================================================================
-
+# ── Per-Gaussian InfoNCE (ablation) ──────────────────────────────────────────
 SEMANTIC_MODE="hidden"
-# "none"   = Run C/E: isolates shape_embed heads without InfoNCE.
-# "hidden" = Run D:   adds InfoNCE on GS_decoder hidden state.
-
 SEGMENT_WEIGHT=0.3
 INSTANCE_WEIGHT=0.0
 SEMANTIC_TEMP=0.07
 SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
 
-# ============================================================================
-# DATASET FLAGS
-# ============================================================================
+# ── Decoder PE ────────────────────────────────────────────────────────────────
+DECODER_FOURIER_PE=True
+DECODER_POS_ENC=False
 
+# ── Legacy token conditioning ─────────────────────────────────────────────────
+TOKEN_COND=False
+TOKEN_COND_APPROACH="B"
+TOKEN_COND_ADALN=False
+
+# ── Scale penalty ─────────────────────────────────────────────────────────────
+SCALE_PENALTY_WEIGHT=0.0
+SCALE_PENALTY_THRESHOLD=0.5
+
+# ── Core training ─────────────────────────────────────────────────────────────
+BATCH_SIZE=64
+NUM_EPOCHS=2000
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-4
+EVAL_EVERY=50
+WEIGHT_DECAY=1e-2
+WARMUP_STEPS=300
+LR_MIN_RATIO=0.1
+FAILURE_THRESHOLD=100
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
 TRAIN_SCENES=300
 VAL_SCENES=50
 SAMPLING_METHOD="opacity"
-
-# ============================================================================
-# NORMALIZATION FLAGS
-# ============================================================================
-
 USE_CANONICAL_NORM=True
 SCALE_NORM_MODE="linear"
 
-# ============================================================================
-# VISUALIZATION FLAGS
-# ============================================================================
-
-PCA_VIS_FREQ=50
+# ── Visualisation ─────────────────────────────────────────────────────────────
+# PLY outputs per PCA_VIS_FREQ epochs:
+#   scene{i}_input.ply, scene{i}_recon.ply   — always
+#   scene{i}_semantic_infonce.ply            — if semantic_mode != none
+#   zs_layout_epoch_NNN.ply                  — Strategy B or LATENT_DISENTANGLE (NEW)
+#   zs_tokens_epoch_NNN.ply                  — ZS_TOKEN_INFONCE_WEIGHT > 0
+#   z_s_space_epoch_NNN.ply                  — Z_S_INFONCE_WEIGHT > 0
+PCA_VIS_FREQ=500
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
 RECON_PLY_FREQ=50
 RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
-# ============================================================================
-# W&B
-# ============================================================================
-
+# ── W&B ───────────────────────────────────────────────────────────────────────
 export WANDB_API_KEY="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"
 USE_WANDB=True
 
 # ============================================================================
-# CONFIGURATION SUMMARY
+# VALIDATION
 # ============================================================================
 
+_any_B=false
+[ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && _any_B=true
+[ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && _any_B=true
+
+if [ "$(echo "$ZS_LAYOUT_INFONCE_WEIGHT > 0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+    if [ "$_any_B" = "false" ] && [ "$LATENT_DISENTANGLE" = "False" ]; then
+        echo "ERROR: ZS_LAYOUT_INFONCE_WEIGHT > 0 requires DECODER_LAYOUT_* or LATENT_DISENTANGLE"
+        exit 1
+    fi
+fi
+if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; then
+    echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True"; exit 1
+fi
+
+ACTIVE_STRATEGY="C (baseline)"
+if [ "$LATENT_DISENTANGLE" = "True" ] && [ "$_any_B" = "false" ]; then
+    ACTIVE_STRATEGY="A — 16+496 in sequence (BEST)"
+elif [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && [ "$DECODER_LAYOUT_ADDITIVE" = "True" ]; then
+    ACTIVE_STRATEGY="B3 — 512 geom + additive + cross-attn"
+elif [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ]; then
+    ACTIVE_STRATEGY="B1 — 512 geom + cross-attn per layer"
+elif [ "$DECODER_LAYOUT_ADDITIVE" = "True" ]; then
+    ACTIVE_STRATEGY="B2 — 512 geom + additive bias"
+fi
+
 echo "========================================================================"
-echo "  CAN3TOK: STEP 1 + MOVE 1 + JEPA IDEA 1"
+echo "  CAN3TOK — Active Strategy: $ACTIVE_STRATEGY"
 echo "========================================================================"
-echo "  color_residual:        $COLOR_RESIDUAL  (Step 1 — MeanColorHead)"
-echo "  mean_color_weight:     $MEAN_COLOR_WEIGHT"
-echo "  scene_semantic_head:   $SCENE_SEMANTIC_HEAD  (Move 1 — SceneSemanticHead)"
-echo "  scene_semantic_weight: $SCENE_SEMANTIC_WEIGHT"
-echo "  jepa_idea1:            $JEPA_IDEA1  (JEPA Idea 1 — SpatialSemanticHead)"
-echo "  jepa_idea1_weight:     $JEPA_IDEA1_WEIGHT"
-echo "  semantic_mode:         $SEMANTIC_MODE"
-echo "  segment_weight:        $SEGMENT_WEIGHT"
-echo "  train_scenes:          $TRAIN_SCENES"
-echo "  val_scenes:            $VAL_SCENES"
-echo "  epochs:                $NUM_EPOCHS"
-echo "  batch_size:            $BATCH_SIZE"
-echo "  lr:                    $LEARNING_RATE"
-echo "  kl_weight:             $KL_WEIGHT"
-echo ""
-echo "  Gradient paths active into shape_embed:"
-echo "    Step 1:      MSE_color  -> MeanColorHead      -> shape_embed"
-if [ "$SCENE_SEMANTIC_HEAD" = "True" ]; then
-echo "    Move 1:      KL_sem     -> SceneSemanticHead   -> shape_embed"
-fi
-if [ "$JEPA_IDEA1" = "True" ]; then
-echo "    JEPA Idea 1: KL_spatial -> SpatialSemanticHead -> shape_embed"
-echo "                 (spatially-resolved: position + shape_embed -> voxel label dist)"
-fi
-if [ "$SEMANTIC_MODE" != "none" ] && [ "$SEGMENT_WEIGHT" != "0.0" ]; then
-echo "    InfoNCE:     InfoNCE    -> SemanticHead        -> GS_decoder hidden -> mu"
-fi
-echo "    (all paths are independent)"
-echo ""
-echo "  Prior results to beat:"
-echo "    Run A (color_residual only):             L2=1.43"
-echo "    Run B (color_residual + InfoNCE):        L2=1.99"
+echo "  DECODER_LAYOUT_CROSS_ATTN=$DECODER_LAYOUT_CROSS_ATTN  (B1)"
+echo "  DECODER_LAYOUT_ADDITIVE  =$DECODER_LAYOUT_ADDITIVE    (B2)"
+echo "  LATENT_DISENTANGLE=$LATENT_DISENTANGLE  SEMANTIC_DIMS=$SEMANTIC_DIMS"
+echo "  z_s pool InfoNCE: weight=$ZS_POOL_INFONCE_WEIGHT  temp=$ZS_POOL_INFONCE_TEMPERATURE"
+echo "  z_layout InfoNCE: weight=$ZS_LAYOUT_INFONCE_WEIGHT  temp=$ZS_LAYOUT_INFONCE_TEMPERATURE"
 echo "========================================================================"
 echo ""
 
 # ============================================================================
-# ENVIRONMENT SETUP
+# ENVIRONMENT
 # ============================================================================
 
 module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
-export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/\
-site-packages/torch/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
-cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
-mkdir -p logs checkpoints
+cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
+mkdir -p logs_ss1 checkpoints_stage1
 
-if [ "$USE_WANDB" = "True" ]; then
-    wandb login $WANDB_API_KEY --relogin 2>/dev/null
-fi
-
-# ============================================================================
-# PRE-FLIGHT: point_feats must be 11 (label_input=False)
-# ============================================================================
+[ "$USE_WANDB" = "True" ] && wandb login $WANDB_API_KEY --relogin 2>/dev/null
 
 YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 if [ -f "$YAML_PATH" ]; then
     POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
-    if [ "$POINT_FEATS" != "11" ]; then
-        echo "ERROR: point_feats=$POINT_FEATS in yaml, expected 11 (label_input=False)"
-        echo "       Reset point_feats to 11 in $YAML_PATH before submitting."
-        exit 1
-    fi
-    echo "  point_feats=11 confirmed in $YAML_PATH"
-else
-    echo "  WARNING: $YAML_PATH not found — skipping point_feats check"
+    [ "$POINT_FEATS" != "11" ] && echo "ERROR: point_feats=$POINT_FEATS, expected 11" && exit 1
+    echo "  point_feats=11 confirmed"
 fi
 echo ""
 
 # ============================================================================
-# BUILD TRAINING COMMAND
+# BUILD COMMAND
 # ============================================================================
 
-TRAIN_CMD="python gs_can3tok_2.py"
+ACCELERATE_CONFIG="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/job_scripts/accelerate_config.yaml"
+TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
 
-# Core
-TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
-TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
-TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
-TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
-TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
-TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
-
-# Dataset
-TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
-TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE --kl_weight $KL_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY --warmup_steps $WARMUP_STEPS"
+TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
 
-# Step 1
-if [ "$COLOR_RESIDUAL" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --color_residual"
-fi
-TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT"
-TRAIN_CMD="$TRAIN_CMD --color_loss_weight $COLOR_LOSS_WEIGHT"
+# Strategy flags
+[ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_cross_attn"
+[ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_additive"
 
-# Move 1
-if [ "$SCENE_SEMANTIC_HEAD" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
-fi
+# Latent disentanglement
+[ "$LATENT_DISENTANGLE"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
+TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
+TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT --ortho_weight $ORTHO_WEIGHT"
+
+# Color
+[ "$COLOR_RESIDUAL"            = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
+TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT --color_loss_weight $COLOR_LOSS_WEIGHT"
+
+# Semantic/layout heads
+[ "$SCENE_SEMANTIC_HEAD"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
 TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
-
-# JEPA Idea 1  ← NEW
-if [ "$JEPA_IDEA1" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --jepa_idea1"
-fi
-TRAIN_CMD="$TRAIN_CMD --jepa_idea1_weight $JEPA_IDEA1_WEIGHT"
+[ "$SCENE_LAYOUT_HEAD"         = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
+[ "$STRUCTURED_LAYOUT_TOKENS"  = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_layout_tokens"
+TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
+[ "$SEMANTIC_TOKEN_HEADS"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --semantic_token_heads"
 
 # InfoNCE
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_weight $ZS_POOL_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_temperature $ZS_POOL_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_weight $ZS_LAYOUT_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_temperature $ZS_LAYOUT_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --zs_token_infonce_weight $ZS_TOKEN_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_token_infonce_temperature $ZS_TOKEN_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_weight $Z_S_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_temperature $Z_S_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_delta $Z_S_INFONCE_DELTA"
+
+# Per-Gaussian InfoNCE
 TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
 TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
@@ -276,28 +283,32 @@ TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
-# Normalization
-TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
-if [ "$USE_CANONICAL_NORM" = "False" ]; then
-    TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
-fi
+# Decoder PE
+[ "$DECODER_POS_ENC"           = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_pos_enc"
+[ "$DECODER_FOURIER_PE"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
 
-# Visualization
-TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ"
-TRAIN_CMD="$TRAIN_CMD --pca_num_scenes $PCA_NUM_SCENES"
+# Token conditioning (legacy)
+[ "$TOKEN_COND"                = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond --token_cond_approach $TOKEN_COND_APPROACH"
+[ "$TOKEN_COND_ADALN"          = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_adaln"
+
+# Scale penalty
+TRAIN_CMD="$TRAIN_CMD --scale_penalty_weight $SCALE_PENALTY_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scale_penalty_threshold $SCALE_PENALTY_THRESHOLD"
+
+# Normalisation
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+[ "$USE_CANONICAL_NORM" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+
+# Visualisation
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ --pca_num_scenes $PCA_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
-TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ"
-TRAIN_CMD="$TRAIN_CMD --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
 
 # W&B
-if [ "$USE_WANDB" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --use_wandb"
-    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-SceenSplat-7K"
-    TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
-fi
+[ "$USE_WANDB" = "True" ] && TRAIN_CMD="$TRAIN_CMD --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC"
 
-# Checkpoint resuming
+# Checkpoint
 if [ -n "$RESUME_CHECKPOINT" ]; then
     TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
     [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
@@ -316,46 +327,27 @@ TRAIN_EXIT=$?
 echo ""
 echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
 
-# Build expected checkpoint dir name (mirrors tag logic in gs_can3tok_2.py)
-CKPT_DIR="checkpoints/RGB_job_${SLURM_JOB_ID}_${SEMANTIC_MODE}"
-[ "$COLOR_RESIDUAL"      = "True"  ] && CKPT_DIR="${CKPT_DIR}_colorresidual"
-[ "$SCENE_SEMANTIC_HEAD" = "True"  ] && CKPT_DIR="${CKPT_DIR}_scenesemantic"
-[ "$JEPA_IDEA1"          = "True"  ] && CKPT_DIR="${CKPT_DIR}_jepa1"
-[ "$SEGMENT_WEIGHT"     != "0.0"   ] && CKPT_DIR="${CKPT_DIR}_beta${SEGMENT_WEIGHT}"
+# ============================================================================
+# POST-RUN
+# ============================================================================
 
 if [ $TRAIN_EXIT -eq 0 ]; then
     echo ""
-    echo "Checkpoints: $CKPT_DIR"
+    echo "COMPLETED. Strategy: $ACTIVE_STRATEGY"
     echo ""
-    echo "NEXT STEPS:"
-    echo "  1. Check key metrics:"
-    echo "       grep -E 'SpatialKL|SceneSem|L2' logs/can3tok_move1_${SLURM_JOB_ID}.out | tail -30"
-    echo "       SpatialKL  — should decrease (shape_embed learning spatial structure)"
-    echo "       SceneSemKL — should decrease (shape_embed learning global categories)"
-    echo "       val/l2_error — target: better than Run A (1.43)"
+    echo "  Best L2:  grep 'NEW BEST' logs_ss1/can3tok_${SLURM_JOB_ID}.out | tail -5"
     echo ""
-    echo "  2. Run probe to measure shape_embed encoding quality:"
-    echo "       Set CKPT_SEMANTIC=$CKPT_DIR/best_model.pth in run_probe_label_distribution.sh"
-    echo "       sbatch run_probe_label_distribution.sh"
-    echo "       Target: dominant_acc > 32%  (Run A baseline)"
+    echo "  z_layout InfoNCE (Strategy B):"
+    echo "    grep 'LayNCE=' logs_ss1/can3tok_${SLURM_JOB_ID}.out | head -20"
+    echo "    LayNCats>=2 needed. Decreasing LayNCE = scene-type clustering."
     echo ""
-    echo "  3. JEPA Idea 1 ablation — compare:"
-    echo "       Run C: SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=False  (Move 1 only)"
-    echo "       Run E: SCENE_SEMANTIC_HEAD=True,  JEPA_IDEA1=True   (this run)"
-    echo "       Run F: SCENE_SEMANTIC_HEAD=False, JEPA_IDEA1=True   (spatial only)"
-    echo "       Run A: both False                                    (baseline)"
+    echo "  z_layout PLY (B×16 points, colored by dominant category):"
+    echo "    ls checkpoints_stage1/*/pca_visualisations/zs_layout_epoch_*.ply"
+    echo "    Same-color points should cluster — compare with semantic_infonce.ply"
     echo ""
-    echo "  4. Resume if time limit hit:"
-    echo "       RESUME_CHECKPOINT=$CKPT_DIR/best_model.pth"
-    echo "       (resume verifies jepa_idea1 matches checkpoint — uses strict=False if changed)"
+    echo "  Reconstruction PLYs:"
+    echo "    ls checkpoints_stage1/*/reconstructed_gaussians/epoch_*/*.ply"
 else
-    echo ""
-    echo "FAILED. Common fixes:"
-    echo "  point_feats wrong:      grep point_feats $YAML_PATH  (must be 11)"
-    echo "  missing dataset keys:   ensure gs_dataset returns voxel_centers_jepa,"
-    echo "                          voxel_dists_jepa, num_voxels_jepa when jepa_idea1=True"
-    echo "  missing model attr:     ensure sal_perceiver has SpatialSemanticHead class"
-    echo "                          and AlignedShapeLatentPerceiver accepts jepa_idea1 param"
-    echo "  OOM:                    reduce BATCH_SIZE to 32 or SEMANTIC_SUBSAMPLE to 5000"
-    echo "  Error log:              cat logs/can3tok_move1_${SLURM_JOB_ID}.err"
+    echo "FAILED (exit $TRAIN_EXIT)"
+    echo "  Error: cat logs/can3tok_${SLURM_JOB_ID}.err"
 fi

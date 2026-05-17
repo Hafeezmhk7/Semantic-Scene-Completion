@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=120G
-#SBATCH --output=logs/stage2_A_2k_2nd_step%j.out
-#SBATCH --error=logs/stage2_A_2k_2nd_step%j.err
+#SBATCH --output=log_ss2/stage2_A_2k_2nd_step%j.out
+#SBATCH --error=log_ss2/stage2_A_2k_2nd_step%j.err
 
 # ============================================================================
 # CAN3TOK STAGE 2 — Strategy A
@@ -41,14 +41,14 @@ echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 # ============================================================================
 
 # ── Stage 1 checkpoint (Strategy A — latent_disentangle=True) ─────────────────
-STAGE1_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21860551_hidden_colorresidual_disent512_fourierpe_layout_semTok_poolNCE_pgNCE_inferencefixed/best_model.pth"
+STAGE1_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21860551_hidden_colorresidual_disent512_fourierpe_layout_semTok_poolNCE_pgNCE_inferencefixed/best_model.pth"
 STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 
 # ── Step: layout (Submission 1) | geometry (Submission 2) ────────────────────
 STAGE="geometry"           # layout | geometry
 
 # ── Layout checkpoint — required for STAGE=geometry ──────────────────────────
-LAYOUT_CKPT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints_stage2/stage2_A_layout_B_22414639"           # e.g. checkpoints_stage2/stage2_A_layout_B_JOBID/best_model.pth
+LAYOUT_CKPT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage2/stage2_A_layout_B_22414639"           # e.g. checkpoints_stage2/stage2_A_layout_B_JOBID/best_model.pth
 
 # ── z_s conditioning — only applies to STAGE=geometry ────────────────────────
 # cross_attn : dedicated cross-attention per block   ← default, recommended
@@ -63,7 +63,7 @@ MODEL_SIZE="B"
 
 # ── Training ──────────────────────────────────────────────────────────────────
 BATCH_SIZE=64
-NUM_EPOCHS=2000
+NUM_EPOCHS=5000
 LR=1e-4
 WEIGHT_DECAY=1e-2
 WARMUP_STEPS=500        # longer warmup for longer run
@@ -91,8 +91,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
-cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
 mkdir -p logs
+
+# Create log directories BEFORE anything writes to them
+mkdir -p log_ss2
+
+
 
 # ============================================================================
 # VALIDATION

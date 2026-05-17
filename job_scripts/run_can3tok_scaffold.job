@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=2
-#SBATCH --time=28:00:00
+#SBATCH --gpus=4
+#SBATCH --time=90:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=160G
-#SBATCH --output=logs/can3tok_%j.out
-#SBATCH --error=logs/can3tok_%j.err
+#SBATCH --output=logs_ss1/can3tok_3kscene%j.out
+#SBATCH --error=logs_ss1/can3tok_3kscene%j.err
 
 # ============================================================================
 # CAN3TOK — DECODER STRATEGIES
@@ -98,11 +98,11 @@ ZS_POOL_INFONCE_TEMPERATURE=0.07
 # Works for all strategies. Requires DECODER_LAYOUT_* or LATENT_DISENTANGLE.
 # PCA output: zs_layout_epoch_NNN.ply
 # LayNCats in training log = # distinct dominant categories in batch (need >=2)
-ZS_LAYOUT_INFONCE_WEIGHT=0.3
+ZS_LAYOUT_INFONCE_WEIGHT=0.0
 ZS_LAYOUT_INFONCE_TEMPERATURE=0.07
 
 # ── z_s token InfoNCE (per-token prototype NCE on 16 tokens, Strategy A) ─────
-ZS_TOKEN_INFONCE_WEIGHT=0.3
+ZS_TOKEN_INFONCE_WEIGHT=0.0
 ZS_TOKEN_INFONCE_TEMPERATURE=0.07
  
 # ── Scene-level z_s InfoNCE (soft positive pairs, label_dist cosine sim) ──────
@@ -135,7 +135,7 @@ SCALE_PENALTY_THRESHOLD=0.5
 BATCH_SIZE=64
 NUM_EPOCHS=2000
 LEARNING_RATE=1e-4
-KL_WEIGHT=1e-5
+KL_WEIGHT=1e-4
 EVAL_EVERY=50
 WEIGHT_DECAY=1e-2
 WARMUP_STEPS=300
@@ -143,7 +143,7 @@ LR_MIN_RATIO=0.1
 FAILURE_THRESHOLD=100
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
-TRAIN_SCENES=300
+TRAIN_SCENES=1500
 VAL_SCENES=50
 SAMPLING_METHOD="opacity"
 USE_CANONICAL_NORM=True
@@ -165,7 +165,7 @@ RECON_PLY_MAX_SH=3
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 export WANDB_API_KEY="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"
-USE_WANDB=False
+USE_WANDB=True
 
 # ============================================================================
 # VALIDATION
@@ -216,8 +216,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
-cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
-mkdir -p logs checkpoints
+cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
+mkdir -p logs_ss1 checkpoints_stage1
 
 [ "$USE_WANDB" = "True" ] && wandb login $WANDB_API_KEY --relogin 2>/dev/null
 
@@ -233,7 +233,7 @@ echo ""
 # BUILD COMMAND
 # ============================================================================
 
-ACCELERATE_CONFIG="/home/yli11/scratch/Hafeez_thesis/Can3Tok/job_scripts/accelerate_config.yaml"
+ACCELERATE_CONFIG="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/job_scripts/accelerate_config.yaml"
 TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
 
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
@@ -335,18 +335,18 @@ if [ $TRAIN_EXIT -eq 0 ]; then
     echo ""
     echo "COMPLETED. Strategy: $ACTIVE_STRATEGY"
     echo ""
-    echo "  Best L2:  grep 'NEW BEST' logs/can3tok_${SLURM_JOB_ID}.out | tail -5"
+    echo "  Best L2:  grep 'NEW BEST' logs_ss1/can3tok_${SLURM_JOB_ID}.out | tail -5"
     echo ""
     echo "  z_layout InfoNCE (Strategy B):"
-    echo "    grep 'LayNCE=' logs/can3tok_${SLURM_JOB_ID}.out | head -20"
+    echo "    grep 'LayNCE=' logs_ss1/can3tok_${SLURM_JOB_ID}.out | head -20"
     echo "    LayNCats>=2 needed. Decreasing LayNCE = scene-type clustering."
     echo ""
     echo "  z_layout PLY (B×16 points, colored by dominant category):"
-    echo "    ls checkpoints/*/pca_visualisations/zs_layout_epoch_*.ply"
+    echo "    ls checkpoints_stage1/*/pca_visualisations/zs_layout_epoch_*.ply"
     echo "    Same-color points should cluster — compare with semantic_infonce.ply"
     echo ""
     echo "  Reconstruction PLYs:"
-    echo "    ls checkpoints/*/reconstructed_gaussians/epoch_*/*.ply"
+    echo "    ls checkpoints_stage1/*/reconstructed_gaussians/epoch_*/*.ply"
 else
     echo "FAILED (exit $TRAIN_EXIT)"
     echo "  Error: cat logs/can3tok_${SLURM_JOB_ID}.err"
