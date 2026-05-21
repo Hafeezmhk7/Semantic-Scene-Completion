@@ -521,6 +521,7 @@ def parse_args():
     p.add_argument("--flow_diag_freq",     type=int, default=0)
     p.add_argument("--stage1_config",      type=str,
                    default="./model/configs/aligned_shape_latents/shapevae-256.yaml")
+
     return p.parse_args()
 
 
@@ -565,8 +566,6 @@ def main():
     if accelerator.is_main_process:
         print(f"\n{'='*70}")
         print(f"  CAN3TOK STAGE 2 — Strategy {args.strategy} | Stage {args.stage}")
-        if args.stage == "geometry":
-            print(f"  z_s conditioning: {args.zs_conditioning}")
         print(f"  Model size: {args.model_size}   Save: {save_path}")
         print(f"  PLY saved every {args.eval_every} epochs (at each eval step)")
         if args.flow_diag_freq > 0:
@@ -634,6 +633,7 @@ def main():
         "zs_conditioning": args.zs_conditioning, "model_size": args.model_size,
         "path_type": args.path_type, "prediction": args.prediction,
         "stage1_checkpoint": args.stage1_checkpoint,
+        "lpl_weight": args.lpl_weight,
         "s1_latent_disentangle":        s1_meta["latent_disentangle"],
         "s1_semantic_dims":             s1_meta["semantic_dims"],
         "s1_color_residual":            s1_meta["color_residual"],
@@ -643,12 +643,10 @@ def main():
 
     print(f"Starting training — epoch {start_epoch} → {args.num_epochs - 1}\n")
 
-    for epoch in tqdm(range(start_epoch, args.num_epochs),
-                      disable=not accelerator.is_main_process):
+    for epoch in tqdm(range(start_epoch, args.num_epochs), disable=not accelerator.is_main_process):
         model.train()
-        epoch_loss      = 0.0
-        epoch_vpred_std = 0.0
-        n_batches       = 0
+        epoch_loss = 0.0
+        n_batches  = 0
 
         for batch in train_loader:
             features = batch["features"].float().to(device)
@@ -664,12 +662,12 @@ def main():
                 epoch_vpred_std += terms["pred"].std().item()
 
             elif args.stage == "geometry":
+                # Target: z_g [B, 496, 32], conditioned on z_s
                 terms = transport.training_losses(
                     raw_model, z_g_clean,
                     model_kwargs={"z_s_clean": z_s_clean},
                 )
                 loss = terms["loss"].mean()
-                epoch_vpred_std += terms["pred"].std().item()
 
             elif args.stage == "completion":
                 loss = completion_training_step(
@@ -687,41 +685,9 @@ def main():
         lr_now   = scheduler.get_last_lr()[0]
 
         if accelerator.is_main_process:
-            print(f"Epoch {epoch:04d} | Loss={avg_loss:.5f} | LR={lr_now:.2e}", end="")
-            if args.stage != "completion":
-                print(f" | v_pred_std={epoch_vpred_std/max(n_batches,1):.4f}", end="")
-            print()
+            print(f"Epoch {epoch:04d} | Loss={avg_loss:.5f} | LR={lr_now:.2e}")
 
-        # ── Flow diagnostics ────────────────────────────────────────────────
-        if (args.flow_diag_freq > 0 and epoch % args.flow_diag_freq == 0
-                and accelerator.is_main_process and args.stage != "completion"):
-            model.eval()
-            try:
-                db = next(iter(val_loader))
-                df = db["features"].float().to(device)
-                with torch.no_grad():
-                    zs, zg, zc, zl = encode_batch(shape_model, df, args.strategy, s1_meta)
-                target = zg if args.stage == "geometry" else zs
-                mkw    = {"z_s_clean": zs} if args.stage == "geometry" else {}
-                diag   = compute_flow_diagnostics(raw_model, target, mkw)
-                print(f"  [FLOW DIAG epoch {epoch}]")
-                print(f"    t:       mean={diag['t_mean']:.3f}  std={diag['t_std']:.3f}  "
-                      f"(expect ~0.500/~0.289)")
-                print(f"    vtarget: mean={diag['vtarget_mean']:+.4f}  "
-                      f"std={diag['vtarget_std']:.4f}  (expect ~0/~1.41)")
-                print(f"    vpred:   mean={diag['vpred_mean']:+.4f}  "
-                      f"std={diag['vpred_std']:.4f}")
-                print(f"    cosine(vpred,vtarget) = {diag['vpred_vtarget_cosine']:.4f}  "
-                      f"(0=random → 1=perfect)")
-                for i in range(4):
-                    k = f"loss_t{i}"
-                    if k in diag:
-                        print(f"    t_bin_{i} [{i/4:.2f},{(i+1)/4:.2f}]: {diag[k]:.5f}")
-            except Exception as e:
-                print(f"  [FLOW DIAG] Failed: {e}")
-            model.train()
-
-        # ── Validation + PLY saving ──────────────────────────────────────────
+        # ── Validation ─────────────────────────────────────────────────────
         if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
             model.eval()
             val_loss = 0.0;  n_val = 0

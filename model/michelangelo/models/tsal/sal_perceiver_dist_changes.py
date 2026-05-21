@@ -2,75 +2,18 @@
 """
 sal_perceiver_dist_changes.py  —  Can3Tok VAE
 ==============================================
-
 DECODER STRATEGIES (controlled by flags, all backward-compatible):
 
   A  latent_disentangle=True, decoder_zs_cross_attn=False  [BEST PERFORMANCE]
-       Z = [z_layout(0:16) | z_geo(16:512)] → all 512 tokens in decoder sequence
-       Self-attention mixes layout & geometry freely at every layer
-
   B1 decoder_layout_cross_attn=True   [NEW — 512 geom + cross-attn conditioning]
-       Z [B,512,32] = full geometry  (latent_disentangle not required)
-       z_layout [B,16,32] from Layout16Projector(shape_embed) — SEPARATE from Z
-       Decoder: 512 geometry tokens in sequence
-       Conditioning: z_layout as cross-attn K/V at every transformer layer
-       Key difference from failed decoder_zs_cross_attn: geometry = FULL 512 not 496
-
-  B2 decoder_layout_additive=True   [NEW — 512 geom + additive bias conditioning]
-       Same z_layout as B1
-       Conditioning: flatten(z_layout) → MLP → [B,384] added as broadcast bias
-       before the transformer (once, not per-layer)
-       Simpler than B1; lower capacity but faster and more stable
-
-  B3 Both B1+B2 simultaneously: additive bias before stack + cross-attn per layer
-       Strongest conditioning; test if additive + cross-attn compound
-
-  C  baseline (no flags): 512 geometry tokens, no layout conditioning
-
+  B2 decoder_layout_additive=True     [NEW — 512 geom + additive bias conditioning]
+  B3 Both B1+B2 simultaneously
+  C  baseline (no flags)
   D  decoder_zs_cross_attn=True [FAILED — kept for reference]
-       496 geom tokens + 16 z_s as cross-attn K/V → worst performance
 
-ALL B strategies:
-  z_layout [B,16,32] gets structure losses: MeanColorHead, SemanticHead, LayoutHead
-  InfoNCE: flatten(z_layout) [B,512] → MLP → [B,128] L2-norm → prototype NCE
-  PCA vis: zs_tokens_epoch_NNN.ply  (B×16 points, colored by dominant category)
-
-MAIN NEW IDEA: --decoder_zs_cross_attn
-  z_g tokens [B, 496, 32] are the ONLY decoder input sequence.
-  z_s tokens [B,  16, 32] condition every decoder transformer layer via cross-attention.
-
-  OLD DESIGN (decoder_zs_cross_attn=False, backward compatible):
-    Z [B, 512, 32] → post_kl → transformer(self-attn only) → GS_decoder(512×384)
-
-  NEW DESIGN (decoder_zs_cross_attn=True):
-    z_g [B, 496, 32] → post_kl_g [B, 496, 384] → FourierPE
-    z_s [B,  16, 32] → post_kl_s [B,  16, 384]
-    For each of the 12 transformer layers:
-        H = self_attn(H_g)                           z_g attends to z_g
-        H = cross_attn(Q=H, K=H_s, V=H_s)           z_g reads from z_s
-        H = FFN(H)
-    GS_decoder(flatten(H))  — input dim 496×384 = 190,464
-
-  WHY CROSS-ATTN NOT ADALN:
-    AdaLN makes every affine in the decoder depend on z_s → Run 1 showed >400× swap ratio.
-    Cross-attention is a soft gate: if z_g is self-sufficient, attention weights → 0.
-    The decoder consults z_s when helpful; it is never forced to depend on it for geometry.
-    This preserves disentanglement while still passing semantic context.
-
-  The L_cross_recon / L_ortho losses are still supported (now optional since the
-  architecture itself enforces the separation) and active by default to additionally
-  strengthen z_g geometry-sufficiency.
-
-GRADIENT PATHS
-  PATH 1 — Reconstruction:      L_recon → GS_decoder → ZSCondDecoder → post_kl_g → z_g → encoder
-  PATH 2 — KL:                  L_KL → mu, log_var → encoder
-  PATH 3 — Mean Color:          L_color → MeanColorHead → z[:,0,:]
-  PATH 4 — Scene Semantic:      L_sem_kl → SceneSemanticHead → z[:,1:16,:]
-  PATH 5 — Layout Centroids:    L_layout → SceneLayoutHead → z[:,1:16,:]
-  PATH 6 — Cross-attn gradient: L_recon flows through cross-attn weights → post_kl_s → z_s → encoder
-  PATH 7 — Per-Gaussian InfoNCE:L_infonce → SemanticProjectionHead → decoder hidden
-  PATH 8 — Scene z_s InfoNCE:   L_z_s_nce → SemanticTokenInfoNCEHead → z_s → encoder
-  PATH 9 — Cross-recon:         L_cross_recon → decoder(z_cross) → z_g (geometry-sufficiency)
+CHANGE vs original: get_decoder_transformer_features() added between encode() and decode()
+for use by Stage 2 Latent Perceptual Loss (LPL).
+See train_stage2.py --lpl_weight flag.
 """
 
 import torch
@@ -131,15 +74,7 @@ class SceneLayoutHead(nn.Module):
         return self.head(x).reshape(x.shape[0], self.NUM_CATS, 3)
 
 
-# ============================================================================
-# Z_S INFONCE HEAD
-# ============================================================================
-
 class SemanticTokenInfoNCEHead(nn.Module):
-    """
-    z_s [B, semantic_dims] → L2-norm [B, 128].
-    No LayerNorm between linears to preserve gradient magnitude reaching z_s.
-    """
     def __init__(self, in_dim=512, proj_dim=128):
         super().__init__()
         self.head = nn.Sequential(
@@ -151,74 +86,28 @@ class SemanticTokenInfoNCEHead(nn.Module):
         return F.normalize(self.head(z_s_flat), p=2, dim=-1)
 
 
-
-# ============================================================================
-# Z_S TOKEN POOL PROJECTION HEAD
-# ============================================================================
-
 class ZSTokenPoolProjectHead(nn.Module):
-    """
-    Mean-pool 16 z_s/z_layout tokens → project through [B, 1024] bottleneck
-    → output [B, n_tokens, feature_dim] L2-normalised features.
-
-    EXACT MIRROR of the decoder InfoNCE path:
-      Decoder:
-        hidden [B, 1024]
-          -> SemanticProjectionHead(1024, num_gaussians=40000, feature_dim=32)
-          -> [B, 40000, 32]  L2-norm
-          -> compute_semantic_loss(embeddings, seg_labels [B,40000], subsample, ...)
-
-      This head:
-        tokens [B, 16, 32]
-          -> mean_pool                   -> [B, 32]
-          -> Linear(32 -> 1024)          -> [B, 1024]  <- same dim as decoder hidden
-          -> SemanticProjectionHead-style MLP
-          -> [B, 16, 32]  L2-norm
-          -> compute_semantic_loss(embeddings [B,16,32], labels [B,16], subsample, ...)
-
-    Labels for the 16 points: argmax(label_dist[b]) broadcast to all 16 positions.
-    Subsampling: same balanced/random strategy as decoder (trivial at N=16 but kept
-    for interface compatibility so compute_semantic_loss is called identically).
-
-    Visualization: PCA of mean_pool([B,16,32]) representations
-                   -> zs_pool_epoch_NNN.ply (one point per scene)
-    """
     def __init__(self, n_tokens=16, token_dim=32, hidden_dim=1024, feature_dim=32):
         super().__init__()
-        self.n_tokens   = n_tokens
+        self.n_tokens    = n_tokens
         self.feature_dim = feature_dim
-
-        # Pool: mean across tokens -> [B, token_dim]
-        # Expand to decoder hidden dimension
-        self.to_hidden = nn.Linear(token_dim, hidden_dim)
-
-        # SemanticProjectionHead-style: [B, 1024] -> [B, n_tokens * feature_dim]
-        self.projection = nn.Sequential(
+        self.to_hidden   = nn.Linear(token_dim, hidden_dim)
+        self.projection  = nn.Sequential(
             nn.Linear(hidden_dim, 512), nn.LayerNorm(512), nn.ReLU(),
             nn.Linear(512, 256),        nn.LayerNorm(256), nn.ReLU(),
             nn.Linear(256, n_tokens * feature_dim))
-
         total = sum(p.numel() for p in self.parameters())
-        print(f"[ZSTokenPoolProjectHead] [{n_tokens},{token_dim}]"
-              f"->pool->[{token_dim}]->[{hidden_dim}]->MLP->[{n_tokens},{feature_dim}] L2-norm | "
+        print(f"[ZSTokenPoolProjectHead] [{n_tokens},{token_dim}]->"
+              f"pool->[{token_dim}]->[{hidden_dim}]->MLP->[{n_tokens},{feature_dim}] L2-norm | "
               f"{total/1e3:.1f}K params")
-        print(f"  Mirrors: SemanticProjectionHead(1024,40000,32) on decoder hidden")
-        print(f"  Output [B,{n_tokens},{feature_dim}] used with compute_semantic_loss (same as decoder NCE)")
 
     def forward(self, tokens):
-        """
-        tokens: [B, n_tokens, token_dim]  z_s or z_layout
-        returns:
-          embeddings: [B, n_tokens, feature_dim]  L2-normalised (same format as decoder)
-          hidden:     [B, 1024]  intermediate (for optional visualization)
-        """
-        pooled    = tokens.mean(dim=1)          # [B, 32]    mean pool
-        hidden    = self.to_hidden(pooled)       # [B, 1024]  decoder-matching bottleneck
-        proj      = self.projection(hidden)      # [B, n_tokens * feature_dim]
+        pooled    = tokens.mean(dim=1)
+        hidden    = self.to_hidden(pooled)
+        proj      = self.projection(hidden)
         B         = tokens.shape[0]
         embeddings = F.normalize(
-            proj.reshape(B, self.n_tokens, self.feature_dim),
-            p=2, dim=-1)                         # [B, n_tokens, feature_dim]
+            proj.reshape(B, self.n_tokens, self.feature_dim), p=2, dim=-1)
         return embeddings, hidden
 
 
@@ -227,20 +116,6 @@ class ZSTokenPoolProjectHead(nn.Module):
 # ============================================================================
 
 class Layout16Projector(nn.Module):
-    """
-    Projects shape_embed [B, width] → z_layout [B, n_tokens, embed_dim].
-
-    z_layout is SEPARATE from the main latent Z — it is an additional global
-    conditioning signal derived from shape_embed, not part of the VAE latent.
-    This means the reconstruction path (Z) is completely unmodified.
-
-    Enables Strategy B1 (cross-attn) and B2 (additive), or both simultaneously.
-
-    At second-stage inference:
-      Stage 1 DiT generates z_layout [B, 15, 32] conditioned on text/class.
-      Token 0 = color token; tokens 1-15 = layout tokens.
-      Stage 2 DiT denoises z_geo [B, 496, 32] conditioned on z_layout.
-    """
     def __init__(self, in_dim=384, n_tokens=16, token_dim=32):
         super().__init__()
         self.n_tokens  = n_tokens
@@ -257,23 +132,9 @@ class Layout16Projector(nn.Module):
 
 
 class LayoutAdditiveConditioner(nn.Module):
-    """
-    Strategy B2: projects z_layout to a single broadcast bias vector.
-
-    flatten(z_layout) [B, n_tokens*token_dim=512]
-      → Linear(512→width) → LayerNorm → ReLU → Linear(width→width)
-      → [B, width]  (broadcast over all 512 decoder positions)
-
-    Applied ONCE before the transformer, unlike cross-attention which applies
-    per layer. Lower capacity but more stable and faster.
-
-    Can be combined with cross-attention (Strategy B3):
-      H = H + additive_bias          (once, before stack)
-      for each layer: H += cross_attn(Q=H, K=z_layout, V=z_layout)
-    """
     def __init__(self, n_tokens=16, token_dim=32, width=384):
         super().__init__()
-        in_dim = n_tokens * token_dim   # 512
+        in_dim = n_tokens * token_dim
         self.proj = nn.Sequential(
             nn.Linear(in_dim, width), nn.LayerNorm(width), nn.ReLU(),
             nn.Linear(width, width))
@@ -282,8 +143,7 @@ class LayoutAdditiveConditioner(nn.Module):
 
     def forward(self, z_layout):
         B = z_layout.shape[0]
-        flat = z_layout.reshape(B, -1)   # [B, 512]
-        return self.proj(flat)           # [B, width]
+        return self.proj(z_layout.reshape(B, -1))
 
 
 # ============================================================================
@@ -291,7 +151,6 @@ class LayoutAdditiveConditioner(nn.Module):
 # ============================================================================
 
 class FourierDecoderPE(nn.Module):
-    """3D Fourier PE over 8×8×8 scaffold grid. Handles 512 or 496 tokens."""
     SCAFFOLD_DIMS = 8
 
     def __init__(self, fourier_embedder, width, num_tokens=512):
@@ -302,15 +161,11 @@ class FourierDecoderPE(nn.Module):
             for j in range(S):
                 for k in range(S):
                     coords.append([(2*i/(S-1))-1, (2*j/(S-1))-1, (2*k/(S-1))-1])
-        all_coords = torch.tensor(coords, dtype=torch.float32)  # [512, 3]
-        # Skip the first (512 - num_tokens) voxels, which are the z_s voxels.
-        # Works for any num_tokens, not just the hardcoded 496 case.
+        all_coords = torch.tensor(coords, dtype=torch.float32)
         if num_tokens != 512:
-            n_skip = 512 - num_tokens
-            all_coords = all_coords[n_skip:]  # [num_tokens, 3]
+            all_coords = all_coords[512 - num_tokens:]
         self.register_buffer('voxel_coords', all_coords)
-        assert all_coords.shape[0] == num_tokens, \
-            f"FourierDecoderPE: expected {num_tokens} coords, got {all_coords.shape[0]}"
+        assert all_coords.shape[0] == num_tokens
         self.fourier_embedder = fourier_embedder
         self.proj = nn.Linear(fourier_embedder.out_dim, width)
         nn.init.trunc_normal_(self.proj.weight, std=0.02)
@@ -324,44 +179,30 @@ class FourierDecoderPE(nn.Module):
 
 
 # ============================================================================
-# MAIN NEW IDEA: Z_S CROSS-ATTENTION CONDITIONED DECODER TRANSFORMER
+# ZSCond DECODER TRANSFORMER
 # ============================================================================
 
 class ZSCondTransformerBlock(nn.Module):
-    """
-    Transformer block: self-attention on z_g + cross-attention with z_s.
-
-    x   = z_g sequence [B, 496, width]
-    z_s = semantic tokens [B, 16, width] — key/value for cross-attn
-    """
     def __init__(self, width, heads):
         super().__init__()
-        self.norm_sa  = nn.LayerNorm(width)
-        self.norm_ca  = nn.LayerNorm(width)
-        self.norm_ff  = nn.LayerNorm(width)
+        self.norm_sa    = nn.LayerNorm(width)
+        self.norm_ca    = nn.LayerNorm(width)
+        self.norm_ff    = nn.LayerNorm(width)
         self.self_attn  = nn.MultiheadAttention(width, heads, batch_first=True)
         self.cross_attn = nn.MultiheadAttention(width, heads, batch_first=True)
-        self.ffn = nn.Sequential(
+        self.ffn        = nn.Sequential(
             nn.Linear(width, 4*width), nn.GELU(), nn.Linear(4*width, width))
 
     def forward(self, x, z_s_kv):
-        # Self-attention among z_g tokens
         h, _ = self.self_attn(self.norm_sa(x), self.norm_sa(x), self.norm_sa(x))
         x = x + h
-        # Cross-attention: z_g queries, z_s keys/values
         h, _ = self.cross_attn(self.norm_ca(x), z_s_kv, z_s_kv)
         x = x + h
-        # FFN
         x = x + self.ffn(self.norm_ff(x))
         return x
 
 
 class ZSCondTransformerDecoder(nn.Module):
-    """
-    N-layer decoder where z_s conditions every layer via cross-attention.
-    Input:  z_g [B, 496, width],  z_s [B, 16, width]
-    Output: [B, 496, width]
-    """
     def __init__(self, width, heads, layers):
         super().__init__()
         self.blocks   = nn.ModuleList(
@@ -370,8 +211,6 @@ class ZSCondTransformerDecoder(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         print(f"[ZSCondTransformerDecoder] {layers}× ZSCondTransformerBlock "
               f"(width={width}, heads={heads}) | {total/1e6:.2f}M params")
-        print(f"  Decoder input: z_g [B, 496, {width}]  (geometry tokens only)")
-        print(f"  Conditioning:  z_s [B,  16, {width}]  (cross-attn K/V per layer)")
 
     def forward(self, x, z_s_kv):
         for block in self.blocks:
@@ -446,7 +285,7 @@ FIXED_TOKEN_IDS_496 = torch.arange(_N_GAUSSIANS) * 496 // _N_GAUSSIANS
 
 
 # ============================================================================
-# PER-GAUSSIAN INFONCE HEADS (decoder-output level)
+# PER-GAUSSIAN INFONCE HEADS
 # ============================================================================
 
 class SegPredHead(nn.Module):
@@ -512,18 +351,18 @@ class SemanticProjectionHeadGeometric(nn.Module):
 
 
 # ============================================================================
-# GS DECODER MLP — configurable num_tokens
+# GS DECODER MLP
 # ============================================================================
 
 class GS_decoder(nn.Module):
     """
     Flat MLP: flatten(transformer_output) → 40000×14 Gaussian attributes.
-    num_tokens×width is the input dimension.
-    num_tokens=512 for old design, 496 for new design.
+    Instantiated as GS_decoder(D=3, W=1024, num_tokens=512, width=384).
+    Parameter count: ~777M  (Linear(196608→1024)=201M + Linear(1024→560000)=574M)
     """
     def __init__(self, D=8, W=256, num_tokens=512, width=384, color_residual=False):
         super().__init__()
-        input_ch           = num_tokens * width
+        input_ch            = num_tokens * width
         self.color_residual = color_residual
         self.pts_linears    = nn.ModuleList([nn.Linear(input_ch, W)])
         for _ in range(D - 1):
@@ -603,7 +442,6 @@ class CrossAttentionEncoder(nn.Module):
 
 
 class CrossAttentionDecoder(nn.Module):
-    """Occupancy/SDF decoder, unchanged."""
     def __init__(self, *, device, dtype, num_latents, out_channels, fourier_embedder,
                  width, heads, init_scale=0.25, qkv_bias=True, flash=False, use_checkpoint=False):
         super().__init__()
@@ -657,7 +495,6 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
             device=device, dtype=dtype, n_ctx=num_latents, width=width,
             layers=num_decoder_layers, heads=heads, init_scale=init_scale,
             qkv_bias=qkv_bias, flash=flash, use_checkpoint=use_checkpoint)
-        # Default GS decoder (512 tokens, old design — overridden in AlignedShapeLatentPerceiver)
         self.GS_decoder = GS_decoder(3, 1024, num_tokens=512, width=width,
                                      color_residual=color_residual)
         self.kl_emb_proj_mean = nn.Linear((num_latents - 1) * embed_dim, 64 * 64 * 4)
@@ -714,19 +551,14 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  decoder_fourier_pe=False,
                  token_cond_adaln=False,
                  semantic_token_heads=False,
-                 # ── MAIN NEW IDEA (failed, kept for reference) ───────────
                  decoder_zs_cross_attn=False,
-                 # ── STRATEGY B (new) ─────────────────────────────────────
                  decoder_layout_cross_attn=False,
                  decoder_layout_additive=False,
-                 # ── STRUCTURED TOKEN SPLIT ───────────────────────────────
                  structured_layout_tokens=False,
-                 # Legacy flags for backward compat
                  position_layout_residual=False,
                  jepa_idea1=False,
                  query_decoder=False):
 
-        # num_latents passed to super is already the full 512 (511 geom + 1 shape_embed)
         super().__init__(
             device=device, dtype=dtype, num_latents=1 + num_latents,
             point_feats=point_feats, embed_dim=embed_dim,
@@ -754,70 +586,50 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.decoder_layout_additive       = decoder_layout_additive
         self.structured_layout_tokens_flag = structured_layout_tokens
 
-        # Token counts in the LATENT SPACE z.
-        # z is always [B, 16384] = [B, 512, 32] when latent_disentangle=True,
-        # regardless of the encoder's num_latents (which only sets encoder depth).
-        _Z_TOKENS         = 16384 // embed_dim                 # always 512
-        self._n_zs_tokens = semantic_dims // embed_dim         # 512 // 32 = 16
-        self._n_zg_tokens = _Z_TOKENS - self._n_zs_tokens      # 512 - 16  = 496
+        _Z_TOKENS         = 16384 // embed_dim
+        self._n_zs_tokens = semantic_dims // embed_dim
+        self._n_zg_tokens = _Z_TOKENS - self._n_zs_tokens
 
         print(f"\n{'='*70}")
         print(f"  CAN3TOK")
-        print(f"  ── STRATEGY FLAGS ───────────────────────────────────────────────")
-        print(f"  decoder_zs_cross_attn    = {decoder_zs_cross_attn}  (Strategy D, failed)")
-        print(f"  decoder_layout_cross_attn= {decoder_layout_cross_attn}  (Strategy B1, NEW)")
-        print(f"  decoder_layout_additive  = {decoder_layout_additive}  (Strategy B2, NEW)")
-        _strat = "A" if latent_disentangle and not decoder_zs_cross_attn                  else ("B1+B2" if decoder_layout_cross_attn and decoder_layout_additive                  else ("B1" if decoder_layout_cross_attn                  else ("B2" if decoder_layout_additive                  else ("D" if decoder_zs_cross_attn else "C (baseline)"))))
+        print(f"  decoder_zs_cross_attn    = {decoder_zs_cross_attn}  (Strategy D)")
+        print(f"  decoder_layout_cross_attn= {decoder_layout_cross_attn}  (Strategy B1)")
+        print(f"  decoder_layout_additive  = {decoder_layout_additive}  (Strategy B2)")
+        _strat = ("A" if latent_disentangle and not decoder_zs_cross_attn
+                  else ("B1+B2" if decoder_layout_cross_attn and decoder_layout_additive
+                  else ("B1" if decoder_layout_cross_attn
+                  else ("B2" if decoder_layout_additive
+                  else ("D" if decoder_zs_cross_attn else "C (baseline)")))))
         print(f"  Active strategy: {_strat}")
-        if decoder_zs_cross_attn:
-            print(f"  z_s: {self._n_zs_tokens} tokens → cross-attn K/V (NOT in decoder sequence)")
-            print(f"  z_g: {self._n_zg_tokens} tokens → decoder input sequence")
-            print(f"  Each layer: self_attn(z_g) + cross_attn(Q=z_g,K=z_s,V=z_s) + FFN")
-        else:
-            print(f"  LEGACY: all 512 tokens → decoder (backward compatible)")
         print(f"  semantic_mode={semantic_mode} | color_residual={color_residual}")
         print(f"  latent_disentangle={latent_disentangle}  semantic_dims={semantic_dims}")
-        print(f"  scene_layout_head={scene_layout_head}")
-        print(f"  decoder_fourier_pe={decoder_fourier_pe}")
+        print(f"  scene_layout_head={scene_layout_head}  decoder_fourier_pe={decoder_fourier_pe}")
         print(f"  token_cond={token_cond} adaln={token_cond_adaln}")
         print(f"  semantic_token_heads={semantic_token_heads}")
         print(f"{'='*70}")
 
-        # ── HEAD INPUT DIMENSIONS ─────────────────────────────────────────────
         if semantic_token_heads and not latent_disentangle:
             raise ValueError("semantic_token_heads requires latent_disentangle=True")
         self.semantic_token_heads_flag = semantic_token_heads
 
-        # ── STRUCTURED TOKEN SPLIT ───────────────────────────────────────────
-        # Token split constants (used when structured_layout_tokens=True)
-        _N_SEM_TOKENS = 8   # tokens 1-8  → SceneSemanticHead
-        _N_LAY_TOKENS = 7   # tokens 9-15 → SceneLayoutHead
+        _N_SEM_TOKENS = 8
+        _N_LAY_TOKENS = 7
         self._n_sem_tokens = _N_SEM_TOKENS
         self._n_lay_tokens = _N_LAY_TOKENS
-
-        # WITHOUT structured_layout_tokens (default):
-        #   Both heads receive tokens 1-15 flattened [B, 480] — same floats, interference
-        # WITH structured_layout_tokens=True:
-        #   SceneSemanticHead → tokens 1-8  only [B, 8×32=256] — exclusive
-        #   SceneLayoutHead   → tokens 9-15 only [B, 7×32=224] — exclusive
-        #   Each head's gradient reaches only its own token range, no cross-contamination
 
         if semantic_token_heads or structured_layout_tokens:
             _color_in = embed_dim
             if structured_layout_tokens:
-                _sem_in = _N_SEM_TOKENS * embed_dim   # 8×32 = 256
-                _lay_in = _N_LAY_TOKENS * embed_dim   # 7×32 = 224
+                _sem_in = _N_SEM_TOKENS * embed_dim
+                _lay_in = _N_LAY_TOKENS * embed_dim
             else:
-                # semantic_token_heads without split: both on full 480
-                _sem_in = semantic_dims - embed_dim   # 480
-                _lay_in = semantic_dims - embed_dim   # 480 (same — interference)
+                _sem_in = semantic_dims - embed_dim
+                _lay_in = semantic_dims - embed_dim
         else:
-            # legacy: heads receive shape_embed [B, width=384]
             _color_in = width
             _sem_in   = width
             _lay_in   = width
 
-        # ── AUXILIARY HEADS (Strategy A / legacy) ────────────────────────────
         self.mean_color_head      = None
         self.last_mean_color_pred = None
         if color_residual:
@@ -833,46 +645,27 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         if scene_layout_head:
             self.scene_layout_module = SceneLayoutHead(in_dim=_lay_in)
 
-        # ── STRATEGY B STRUCTURED HEADS ────────────────────────────────────────
-        # Separate heads for z_layout tokens [B, 16, embed_dim]:
-        #   z_layout[:, 0, :]          [B, embed_dim=32]   → color
-        #   z_layout[:, 1:, :].flatten [B, 15*embed_dim=480] → semantic + layout
-        #
-        # These are ALWAYS created when any Strategy B flag is True AND the
-        # corresponding head flag is enabled. They are independent of the
-        # semantic_token_heads flag (which only applies to Strategy A).
-        #
-        # WHY SEPARATE HEADS:
-        #   Strategy B heads receive [B,32] and [B,480] from z_layout tokens.
-        #   Strategy A legacy heads receive [B,384] from shape_embed.
-        #   Same linear cannot handle both — separate heads needed.
-        _lay_color_in = embed_dim               # 32  — token 0
-        # With structured split: semantic head → tokens 1-8 only, layout → tokens 9-15
+        _lay_color_in = embed_dim
         if structured_layout_tokens:
-            _lay_sem_in = _N_SEM_TOKENS * embed_dim   # 8*32=256
-            _lay_lay_in = _N_LAY_TOKENS * embed_dim   # 7*32=224
+            _lay_sem_in = _N_SEM_TOKENS * embed_dim
+            _lay_lay_in = _N_LAY_TOKENS * embed_dim
         else:
-            _lay_sem_in = (self._n_zs_tokens - 1) * embed_dim  # 15*32=480
-            _lay_lay_in = (self._n_zs_tokens - 1) * embed_dim  # 15*32=480 (same)
+            _lay_sem_in = (self._n_zs_tokens - 1) * embed_dim
+            _lay_lay_in = (self._n_zs_tokens - 1) * embed_dim
 
-        self.lay_color_head     = None   # z_layout[:,0,:]      → mean_color [B,3]
-        self.lay_semantic_head  = None   # z_layout[:,1:,:].flat → label_dist [B,72]
-        self.lay_layout_head    = None   # z_layout[:,1:,:].flat → centroids  [B,72,3]
+        self.lay_color_head    = None
+        self.lay_semantic_head = None
+        self.lay_layout_head   = None
 
         _any_B_flag = decoder_layout_cross_attn or decoder_layout_additive
         if _any_B_flag:
             if color_residual:
                 self.lay_color_head = MeanColorHead(in_dim=_lay_color_in)
-                print(f"  [StratB] lay_color_head:    [{_lay_color_in}]→[3]  (z_layout token 0)")
             if scene_semantic_head:
                 self.lay_semantic_head = SceneSemanticHead(in_dim=_lay_sem_in)
-                print(f"  [StratB] lay_semantic_head: [{_lay_sem_in}]→[72]  (z_layout tokens 1-15)")
             if scene_layout_head:
                 self.lay_layout_head = SceneLayoutHead(in_dim=_lay_lay_in)
-                tok_range = 'tokens 9-15' if structured_layout_tokens else 'tokens 1-15'
-                print(f"  [StratB] lay_layout_head:   [{_lay_lay_in}]→[72,3] ({tok_range})")
 
-        # ── LATENT DISENTANGLEMENT ────────────────────────────────────────────
         self._mu_s_cache = None
         self._mu_g_cache = None
         if latent_disentangle:
@@ -886,38 +679,30 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             self.kl_emb_proj_var_g  = nn.Linear(kl_in, geom_dims)
             print(f"  DISENTANGLE: mu_s[{semantic_dims}] | mu_g[{geom_dims}]")
 
-        # ── Z_S INFONCE HEAD ─────────────────────────────────────────────────
         self.z_s_infonce_head      = None
         self.last_z_s_infonce_proj = None
         if latent_disentangle:
             self.z_s_infonce_head = SemanticTokenInfoNCEHead(
                 in_dim=semantic_dims, proj_dim=128)
 
-        # ── Z_S TOKEN POOL PROJECTION HEAD (mirrors decoder InfoNCE path) ────
-        # mean_pool([B,16,32])→[B,32]→Linear→[B,1024]→MLP→[B,128] L2-norm
-        # Strategy A: z_s tokens from latent
-        # Strategy B: z_layout tokens (separate head, added in Strategy B block)
-        self.zs_pool_proj_head  = None
-        self.last_zs_pool_proj  = None   # [B, 16, 32] L2-norm embeddings
-        self.last_zs_pool_hidden= None   # [B, 1024] intermediate
+        self.zs_pool_proj_head   = None
+        self.last_zs_pool_proj   = None
+        self.last_zs_pool_hidden = None
         if latent_disentangle:
             self.zs_pool_proj_head = ZSTokenPoolProjectHead(
                 n_tokens=self._n_zs_tokens, token_dim=embed_dim)
 
-        # ── ANCHOR PREDICTION ────────────────────────────────────────────────
         self.anchor_pred_from_tokens            = None
         self.last_predicted_anchors_from_tokens = None
         if position_scaffold:
             n_tok = self._n_zg_tokens if decoder_zs_cross_attn else _Z_TOKENS
             self.anchor_pred_from_tokens = AnchorPredFromTokens(width=width, num_tokens=n_tok)
 
-        # ── MAIN NEW IDEA: ZSCond DECODER ─────────────────────────────────────
         self.zs_cond_decoder = None
         self.post_kl_g       = None
         self.post_kl_s       = None
         self.GS_decoder_new  = None
         if decoder_zs_cross_attn:
-            # Separate projections: z_g and z_s expand to transformer width independently
             self.post_kl_g = nn.Linear(embed_dim, width)
             self.post_kl_s = nn.Linear(embed_dim, width)
             nn.init.trunc_normal_(self.post_kl_g.weight, std=0.02)
@@ -928,42 +713,34 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 3, 1024, num_tokens=self._n_zg_tokens, width=width,
                 color_residual=color_residual)
 
-        # ── STRATEGY B COMPONENTS ─────────────────────────────────────────────
-        self.layout_projector      = None   # shape_embed → z_layout [B,16,embed_dim]
-        self.post_kl_layout        = None   # z_layout embed_dim → width (for cross-attn)
-        self.layout_additive_cond  = None   # z_layout → broadcast bias [B,width]
-        self.zs_cond_decoder_B     = None   # ZSCond decoder for 512-token input
-        self.GS_decoder_B          = None   # 512-token GS decoder
-        self.z_layout_infonce_head  = None   # flatten(z_layout) [B,512]→[B,128] L2-norm
-        self.z_layout_pool_head     = None   # pool(z_layout)→[B,32]→[B,1024]→[B,128]
-        self.last_z_layout          = None   # cached [B,16,embed_dim] for losses + vis
-        self.last_z_layout_proj     = None   # cached [B,128] for InfoNCE
-        self.last_z_layout_pool_proj   = None   # [B,16,32] embeddings (Strategy B)
-        self.last_z_layout_pool_hidden  = None   # [B,1024] intermediate (Strategy B)
+        self.layout_projector          = None
+        self.post_kl_layout            = None
+        self.layout_additive_cond      = None
+        self.zs_cond_decoder_B         = None
+        self.GS_decoder_B              = None
+        self.z_layout_infonce_head     = None
+        self.z_layout_pool_head        = None
+        self.last_z_layout             = None
+        self.last_z_layout_proj        = None
+        self.last_z_layout_pool_proj   = None
+        self.last_z_layout_pool_hidden = None
 
         _any_B = decoder_layout_cross_attn or decoder_layout_additive
         if _any_B:
             self.layout_projector = Layout16Projector(
                 in_dim=width, n_tokens=self._n_zs_tokens, token_dim=embed_dim)
-            # InfoNCE head: flatten z_layout → [B, 16*32=512] → MLP → [B,128]
-            _lay_flat = self._n_zs_tokens * embed_dim   # 16 * 32 = 512
+            _lay_flat = self._n_zs_tokens * embed_dim
             self.z_layout_infonce_head = SemanticTokenInfoNCEHead(
                 in_dim=_lay_flat, proj_dim=128)
-            # Pool projection head — mirrors decoder InfoNCE path
             self.z_layout_pool_head = ZSTokenPoolProjectHead(
                 n_tokens=self._n_zs_tokens, token_dim=embed_dim)
             print(f"  [Strategy B] Layout16Projector + InfoNCE heads active")
-            print(f"  z_layout pool head: pool→[{embed_dim}]→[1024]→[128] L2-norm")
-            print(f"  z_layout InfoNCE: flatten [B,{_lay_flat}] → MLP → [B,128] L2-norm")
 
         if decoder_layout_cross_attn:
-            # Cross-attn conditioning: z_layout projected to width as K/V
             self.post_kl_layout = nn.Linear(embed_dim, width)
             nn.init.trunc_normal_(self.post_kl_layout.weight, std=0.02)
-            # ZSCond decoder: 512 geometry tokens in sequence, 16 layout K/V
             self.zs_cond_decoder_B = ZSCondTransformerDecoder(
                 width=width, heads=heads, layers=num_decoder_layers)
-            # 512-token GS decoder (same input size as original Can3Tok)
             self.GS_decoder_B = GS_decoder(
                 3, 1024, num_tokens=_Z_TOKENS, width=width,
                 color_residual=color_residual)
@@ -972,16 +749,11 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         if decoder_layout_additive:
             self.layout_additive_cond = LayoutAdditiveConditioner(
                 n_tokens=self._n_zs_tokens, token_dim=embed_dim, width=width)
-            if not decoder_layout_cross_attn:
-                # B2 only — need standard decoder since no zs_cond_decoder_B
-                # (legacy GS_decoder with 512 tokens is already in ShapeAsLatentPerceiver)
-                pass
             print(f"  [Strategy B2] additive: flatten(z_layout)→MLP→[B,{width}] broadcast bias")
 
         if decoder_layout_cross_attn and decoder_layout_additive:
             print(f"  [Strategy B3] both additive bias + cross-attn active")
 
-        # ── POSITIONAL ENCODING ───────────────────────────────────────────────
         self.decoder_pos_emb = None
         if decoder_pos_enc and not decoder_zs_cross_attn:
             n_tok = _Z_TOKENS
@@ -995,7 +767,6 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             self.decoder_fourier_pe_module = FourierDecoderPE(
                 fourier_embedder=self.fourier_embedder, width=width, num_tokens=n_tok)
 
-        # ── LEGACY TOKEN CONDITIONING (only when NOT using new design) ────────
         self.token_cond_adaln_flag = False
         self.adaLN_transformer     = None
         self.token_cond_mlp_B      = None
@@ -1004,8 +775,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
 
         if decoder_zs_cross_attn:
             if token_cond or token_cond_adaln:
-                print("  [INFO] decoder_zs_cross_attn=True: "
-                      "TokenCond/AdaLN disabled (z_s conditions via cross-attn)")
+                print("  [INFO] decoder_zs_cross_attn=True: TokenCond/AdaLN disabled")
         else:
             _adaln_valid = (token_cond and 'B' in token_cond_approach.upper())
             if token_cond_adaln and _adaln_valid:
@@ -1018,13 +788,11 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 nn.init.trunc_normal_(self.token_cat_assign, std=0.01)
                 self.token_cond_mlp_B = TokenCondMLP(fourier_out_dim, width)
 
-        # ── SEGMENT PREDICTION HEAD ───────────────────────────────────────────
         self.seg_pred_head = None
         self.last_seg_pred = None
         if predict_seg_labels:
             self.seg_pred_head = SegPredHead(in_dim=14, num_cats=72)
 
-        # ── PER-GAUSSIAN INFONCE HEADS ────────────────────────────────────────
         self.semantic_projection_hidden    = None
         self.semantic_projection_geometric = None
         self.semantic_distribution_head    = None
@@ -1079,60 +847,138 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         z = mu + torch.exp(0.5 * log_var) * torch.randn_like(mu)
         return shape_embed, mu, log_var, z, posterior
 
+    # =========================================================================
+    # LATENT PERCEPTUAL LOSS — DECODER TRANSFORMER FEATURE EXTRACTOR
+    # =========================================================================
+    #
+    # Reference: Berrada et al., NeurIPS 2024 — arXiv:2411.04873
+    #   "Boosting Latent Diffusion with Perceptual Objectives"
+    #
+    # Problem (Autoencoder-Diffusion Disconnect):
+    #   Stage 2 flow matching generates z_g tokens whose DISTRIBUTION matches
+    #   the encoder aggregate posterior (KL converges ~epoch 1400). However each
+    #   generated z_g_gen is ~211 units from the nearest encoder z_g_clean in
+    #   R^{15872}. The 777M GS_decoder was trained exclusively on encoder outputs
+    #   and extrapolates poorly for off-manifold Stage 2 inputs → blurry Gaussians.
+    #
+    # Solution (LPL):
+    #   Include the frozen decoder transformer in Stage 2 training objective.
+    #   Each geometry DiT step, after predicting v_pred:
+    #
+    #     z_g_est   = x_t + (1-t) * v_pred                   [B, 496, 32]
+    #     Z_est     = cat([z_s_clean, z_g_est],   dim=1)      [B, 512, 32]
+    #     Z_clean   = cat([z_s_clean, z_g_clean], dim=1)      [B, 512, 32]
+    #     feat_gen  = get_decoder_transformer_features(Z_est)   [B, 512, 384]
+    #     feat_clean= get_decoder_transformer_features(Z_clean) [B, 512, 384]  # no_grad
+    #     L_LPL     = MSE(feat_gen, feat_clean)
+    #     L_total   = L_flow + lpl_weight * L_LPL
+    #
+    # Feature level: transformer output H_out [B, 512, 384]
+    #   — BEFORE the 777M GS_decoder MLP
+    #   — only 21M transformer in backward path (~3.3GB extra activation memory)
+    #   — captures decoder's spatial per-token understanding of the scene
+    #
+    # Gradient: L_LPL → H_out_gen → Z_est → z_g_est → v_pred → DiT parameters
+    #   Stage 1 decoder weights: requires_grad=False → NEVER updated.
+    #
+    # Enable in Stage 2: --lpl_weight 0.01  (default 0.0 = disabled)
+
+    def get_decoder_transformer_features(self, latents, z_layout=None):
+        """
+        Return decoder transformer output H_out for Latent Perceptual Loss.
+
+        Runs the Stage 1 decoder forward pass up to and including the 12-layer
+        self-attention transformer, stopping BEFORE the 777M GS_decoder MLP.
+
+        Exactly mirrors the corresponding branch of decode() for all strategies.
+        Verified line-by-line against the actual decode() source code.
+
+        Parameters
+        ----------
+        latents  : Z [B, 512, 32]  full latent (z_s and z_g concatenated)
+        z_layout : [B, 16, 32]     Strategy B1/B2/B3 only; pass None for A and D
+
+        Returns
+        -------
+        H_out : [B, 512, 384]  (Strategy A / B)   decoder transformer output
+                [B, 496, 384]  (Strategy D)        cross-attn decoder output
+
+        Gradient flow
+        -------------
+        Do NOT use torch.no_grad() for the generated latent Z_est — gradients
+        must flow: L_LPL → feat_gen → Z_est → z_g_est → v_pred → DiT params.
+
+        DO use torch.no_grad() for the clean reference:
+            with torch.no_grad():
+                feat_clean = shape_model.get_decoder_transformer_features(Z_clean)
+
+        Stage 1 decoder parameters (requires_grad=False) are NEVER updated.
+        """
+        B = latents.shape[0]
+        _any_B = (self.decoder_layout_cross_attn or self.decoder_layout_additive)
+
+        if _any_B and z_layout is not None:
+            # ── Strategy B1 / B2 / B3 ────────────────────────────────────────
+            # Exact mirror of decode() _any_B branch:
+            H = self.post_kl(latents)                               # [B, 512, 384]
+            if self.decoder_layout_additive and self.layout_additive_cond is not None:
+                bias = self.layout_additive_cond(z_layout)          # [B, 384]
+                H    = H + bias.unsqueeze(1)                        # broadcast: [B, 512, 384]
+            if self.decoder_fourier_pe_flag and self.decoder_fourier_pe_module is not None:
+                H = H + self.decoder_fourier_pe_module(B, H.device)
+            elif self.decoder_pos_emb is not None:
+                H = H + self.decoder_pos_emb.unsqueeze(0)
+            if self.decoder_layout_cross_attn and self.zs_cond_decoder_B is not None:
+                H_lay = self.post_kl_layout(z_layout)               # [B, 16, 384]
+                return self.zs_cond_decoder_B(H, H_lay)             # [B, 512, 384]
+            else:
+                return self.transformer(H)                          # [B, 512, 384]
+
+        elif self.decoder_zs_cross_attn:
+            # ── Strategy D ───────────────────────────────────────────────────
+            # Exact mirror of decode() decoder_zs_cross_attn branch:
+            n_s = self._n_zs_tokens                                 # 16
+            H_g = self.post_kl_g(latents[:, n_s:, :])              # [B, 496, 384]
+            H_s = self.post_kl_s(latents[:, :n_s, :])              # [B,  16, 384]
+            if self.decoder_fourier_pe_flag and self.decoder_fourier_pe_module is not None:
+                H_g = H_g + self.decoder_fourier_pe_module(B, H_g.device)
+            return self.zs_cond_decoder(H_g, H_s)                  # [B, 496, 384]
+
+        else:
+            # ── Strategy A  (primary LPL use case) ───────────────────────────
+            # Exact mirror of decode() legacy/else branch.
+            # token_cond_adaln is always False for Stage 2 because load_stage1()
+            # sets p.token_cond=False → self.token_cond_adaln_flag=False,
+            # so the branch always falls through to self.transformer(H).
+            H = self.post_kl(latents)                               # [B, 512, 384]
+            if self.decoder_fourier_pe_flag and self.decoder_fourier_pe_module is not None:
+                H = H + self.decoder_fourier_pe_module(B, H.device)
+            elif self.decoder_pos_emb is not None:
+                H = H + self.decoder_pos_emb.unsqueeze(0)
+            return self.transformer(H)                              # [B, 512, 384]
+
     # ── DECODE ────────────────────────────────────────────────────────────────
 
     def decode(self, latents, volume_queries=None, return_semantic_features=False,
                shape_embed=None, scaffold_anchors=None, scaffold_token_ids=None,
                z_layout=None):
-        """
-        latents:  Z [B, 512, 32] always.
-        z_layout: [B, 16, 32]  layout tokens (Strategy B1/B2/B3 only).
-                  Pass self.last_z_layout when calling decode() from forward().
-
-        STRATEGY A  (latent_disentangle=True, no cross-attn):
-          All 512 tokens [z_layout|z_geo] in decoder sequence. Best performance.
-
-        STRATEGY B1 (decoder_layout_cross_attn=True):
-          512 geometry tokens in sequence + z_layout as cross-attn K/V per layer.
-
-        STRATEGY B2 (decoder_layout_additive=True):
-          512 geometry tokens in sequence + z_layout projected to additive broadcast bias.
-
-        STRATEGY B3 (both B1 and B2):
-          Additive bias (once, before stack) + cross-attn per layer.
-
-        STRATEGY C (baseline, no flags):
-          512 geometry tokens, standard transformer.
-
-        STRATEGY D (decoder_zs_cross_attn=True, FAILED):
-          496 geometry tokens + 16 z_s as cross-attn K/V.
-        """
         B = latents.shape[0]
 
-        # ── STRATEGY B1 / B2 / B3: 512 geometry + layout conditioning ─────────
         _any_B = (self.decoder_layout_cross_attn or self.decoder_layout_additive)
         if _any_B and z_layout is not None:
-            H = self.post_kl(latents)   # [B, 512, 384] — standard post_kl, full geometry
-
-            # Strategy B2 (or B3 additive part): broadcast bias before transformer
+            H = self.post_kl(latents)
             if self.decoder_layout_additive and self.layout_additive_cond is not None:
-                bias = self.layout_additive_cond(z_layout)   # [B, 384]
-                H    = H + bias.unsqueeze(1)                  # [B, 512, 384]
-
-            # Fourier PE / learnable PE on the 512-token geometry sequence
+                bias = self.layout_additive_cond(z_layout)
+                H    = H + bias.unsqueeze(1)
             if self.decoder_fourier_pe_flag and self.decoder_fourier_pe_module is not None:
                 H = H + self.decoder_fourier_pe_module(B, H.device)
             elif self.decoder_pos_emb is not None:
                 H = H + self.decoder_pos_emb.unsqueeze(0)
-
-            # Strategy B1 (or B3 cross-attn part): per-layer cross-attn to z_layout
             if self.decoder_layout_cross_attn and self.zs_cond_decoder_B is not None:
-                H_lay = self.post_kl_layout(z_layout)   # [B, 16, 384]
-                H     = self.zs_cond_decoder_B(H, H_lay) # [B, 512, 384]
+                H_lay = self.post_kl_layout(z_layout)
+                H     = self.zs_cond_decoder_B(H, H_lay)
             else:
-                # B2 only: standard transformer (no cross-attn)
                 H = self.transformer(H)
-
             H_out = H
 
             self.last_predicted_anchors_from_tokens = None
@@ -1146,38 +992,24 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                                self.semantic_distribution_head])
             need_hidden = return_semantic_features and has_sem
             latents_flat = H_out.reshape(B, -1)
-
-            if self.decoder_layout_cross_attn and self.GS_decoder_B is not None:
-                gs_dec = self.GS_decoder_B
-            else:
-                gs_dec = self.GS_decoder   # B2 only: use standard 512-token decoder
-
+            gs_dec = self.GS_decoder_B if (self.decoder_layout_cross_attn and self.GS_decoder_B is not None) else self.GS_decoder
             if need_hidden:
                 reconstruction, hidden = gs_dec(latents_flat, return_hidden=True)
             else:
-                hidden        = None
+                hidden = None
                 reconstruction = gs_dec(latents_flat)
-
             _fixed_ids = FIXED_TOKEN_IDS_512
 
         elif self.decoder_zs_cross_attn:
-            # ── NEW DESIGN ────────────────────────────────────────────────────
-            n_s = self._n_zs_tokens   # 16
-            z_s_raw = latents[:, :n_s, :]   # [B, 16, 32]
-            z_g_raw = latents[:, n_s:, :]   # [B, 496, 32]
-
-            # Project to transformer width separately
-            H_g = self.post_kl_g(z_g_raw)   # [B, 496, 384]
-            H_s = self.post_kl_s(z_s_raw)   # [B, 16,  384]
-
-            # Fourier PE on z_g
+            n_s     = self._n_zs_tokens
+            z_s_raw = latents[:, :n_s, :]
+            z_g_raw = latents[:, n_s:, :]
+            H_g = self.post_kl_g(z_g_raw)
+            H_s = self.post_kl_s(z_s_raw)
             if self.decoder_fourier_pe_flag and self.decoder_fourier_pe_module is not None:
                 H_g = H_g + self.decoder_fourier_pe_module(B, H_g.device)
+            H_out = self.zs_cond_decoder(H_g, H_s)
 
-            # Run ZSCond transformer: self-attn(z_g) + cross-attn(z_g, z_s)
-            H_out = self.zs_cond_decoder(H_g, H_s)   # [B, 496, 384]
-
-            # Anchor prediction
             self.last_predicted_anchors_from_tokens = None
             pred_anchors = None
             if self.anchor_pred_from_tokens is not None:
@@ -1192,15 +1024,12 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             if need_hidden:
                 reconstruction, hidden = self.GS_decoder_new(latents_flat, return_hidden=True)
             else:
-                hidden        = None
+                hidden = None
                 reconstruction = self.GS_decoder_new(latents_flat)
-
             _fixed_ids = FIXED_TOKEN_IDS_496
 
         else:
-            # ── LEGACY DESIGN ─────────────────────────────────────────────────
             H = self.post_kl(latents)
-
             if self.decoder_fourier_pe_flag and self.decoder_fourier_pe_module is not None:
                 H = H + self.decoder_fourier_pe_module(B, H.device)
             elif self.decoder_pos_emb is not None:
@@ -1240,10 +1069,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             else:
                 hidden = None
                 reconstruction = self.GS_decoder(latents_flat)
-
             _fixed_ids = FIXED_TOKEN_IDS_512
 
-        # ── ADD DC TERM (position scaffold) ──────────────────────────────────
         if pred_anchors is not None:
             pred_3d = reconstruction.reshape(B, 40_000, 14)
             if scaffold_token_ids is not None:
@@ -1254,12 +1081,10 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             pred_3d[:, :, 0:3] += dc
             reconstruction = pred_3d.reshape(B, -1)
 
-        # ── SEGMENT PREDICTION ────────────────────────────────────────────────
         self.last_seg_pred = None
         if self.seg_pred_head is not None:
             self.last_seg_pred = self.seg_pred_head(reconstruction.reshape(B, 40000, 14))
 
-        # ── PER-GAUSSIAN SEMANTIC FEATURES ───────────────────────────────────
         semantic_features = None
         if return_semantic_features and hidden is not None:
             if self.semantic_mode == 'hidden':
@@ -1280,106 +1105,76 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         shape_embed, mu, log_var, z, posterior = self.encode(pc, feats, sample_posterior)
         _se = self._shape_embed_cache
 
-        # ── STRATEGY A/D: z_s InfoNCE projections ───────────────────────────
         self.last_z_s_infonce_proj = None
         if self.z_s_infonce_head is not None:
             self.last_z_s_infonce_proj = self.z_s_infonce_head(
                 z[:, :self.semantic_dims])
 
-        # Pool projection: mean_pool(z_s tokens)→[B,1024]→[B,128]
-        # Mirrors decoder hidden InfoNCE — direct gradient to z_s
-        self.last_zs_pool_proj  = None
+        self.last_zs_pool_proj   = None
         self.last_zs_pool_hidden = None
         if self.zs_pool_proj_head is not None:
             _z_s_toks = z.reshape(z.shape[0], 512, 32)[:, :self._n_zs_tokens, :]
             self.last_zs_pool_proj, self.last_zs_pool_hidden = \
-                self.zs_pool_proj_head(_z_s_toks)  # [B,16,32], [B,1024]
+                self.zs_pool_proj_head(_z_s_toks)
 
-        # ── STRATEGY B: compute z_layout from shape_embed ────────────────────
         self.last_z_layout      = None
         self.last_z_layout_proj = None
         _any_B = self.decoder_layout_cross_attn or self.decoder_layout_additive
         if _any_B and self.layout_projector is not None:
-            self.last_z_layout = self.layout_projector(_se)   # [B, 16, 32]
-            # Flatten InfoNCE projection
+            self.last_z_layout = self.layout_projector(_se)
             if self.z_layout_infonce_head is not None:
-                z_lay_flat = self.last_z_layout.reshape(z.shape[0], -1)  # [B, 512]
+                z_lay_flat = self.last_z_layout.reshape(z.shape[0], -1)
                 self.last_z_layout_proj = self.z_layout_infonce_head(z_lay_flat)
-            # Pool projection: mean_pool(z_layout)→[B,1024]→[B,128]
             self.last_z_layout_pool_proj   = None
-            self.last_z_layout_pool_hidden  = None
+            self.last_z_layout_pool_hidden = None
             if self.z_layout_pool_head is not None:
                 self.last_z_layout_pool_proj, self.last_z_layout_pool_hidden = \
-                    self.z_layout_pool_head(self.last_z_layout)  # [B,16,32], [B,1024]
+                    self.z_layout_pool_head(self.last_z_layout)
 
-        # ── STRATEGY A: also populate last_z_layout_proj from z_s tokens ────
-        # In Strategy A, z_s tokens ARE the layout tokens.
-        # zs_layout_infonce_weight uses last_z_layout_proj — without this block
-        # it stays None for Strategy A and the loss silently computes 0.
-        # Fix: reuse z_s_infonce_head (same SemanticTokenInfoNCEHead architecture)
-        # to populate last_z_layout_proj from flatten(z_s tokens).
         if (not _any_B and self.latent_disentangle
                 and self.z_s_infonce_head is not None):
-            # last_z_s_infonce_proj already computed above using z_s_infonce_head
-            # Route it to last_z_layout_proj so training loop finds it
-            self.last_z_layout_proj = self.last_z_s_infonce_proj   # [B, 128]
+            self.last_z_layout_proj = self.last_z_s_infonce_proj
 
-        # ── AUXILIARY HEADS ───────────────────────────────────────────────────
-        # Route to z tokens (semantic_token_heads) or shape_embed (legacy)
-        # For Strategy B: run heads on z_layout tokens when available
-        _lay_src = self.last_z_layout   # [B, 16, 32] or None
+        _lay_src = self.last_z_layout
 
         if self.semantic_token_heads_flag or self.structured_layout_tokens_flag:
             _ed = self.embed_dim
             _sd = self.semantic_dims
             self.last_mean_color_pred = (
                 self.mean_color_head(z[:, :_ed]) if self.mean_color_head else None)
-
             if self.structured_layout_tokens_flag:
-                # STRUCTURED: separate token ranges, no gradient interference
-                # z[:, :_ed] = token 0 (color, already used above)
-                # z[:, _ed : _ed + _n_sem*_ed] = tokens 1-8 → semantic
-                # z[:, _ed + _n_sem*_ed : _sd] = tokens 9-15 → layout
-                _n_s = self._n_sem_tokens  # 8
-                z_sem = z[:, _ed : _ed + _n_s * _ed]          # [B, 256]
-                z_lay = z[:, _ed + _n_s * _ed : _sd]          # [B, 224]
+                _n_s  = self._n_sem_tokens
+                z_sem = z[:, _ed : _ed + _n_s * _ed]
+                z_lay = z[:, _ed + _n_s * _ed : _sd]
                 self.last_scene_semantic_pred = (
                     self.scene_semantic_module(z_sem) if self.scene_semantic_module else None)
                 self.last_scene_layout_pred = (
                     self.scene_layout_module(z_lay) if self.scene_layout_module else None)
             else:
-                # UNSTRUCTURED: both heads on all tokens 1-15 (old behaviour)
-                z_sem = z[:, _ed:_sd]   # [B, 480]
+                z_sem = z[:, _ed:_sd]
                 self.last_scene_semantic_pred = (
                     self.scene_semantic_module(z_sem) if self.scene_semantic_module else None)
                 self.last_scene_layout_pred = (
                     self.scene_layout_module(z_sem) if self.scene_layout_module else None)
         elif _lay_src is not None and _any_B:
-            # Strategy B: dedicated heads on z_layout tokens (correct input dims).
-            # Token 0 → lay_color_head [B, 32]
-            # Without structured split: tokens 1-15 → both heads [B, 480] (interference)
-            # With structured split:    tokens 1-8  → lay_semantic_head [B, 256]
-            #                           tokens 9-15 → lay_layout_head   [B, 224]
             B_cur = z.shape[0]
             self.last_mean_color_pred = (
                 self.lay_color_head(_lay_src[:, 0, :]) if self.lay_color_head else None)
-
             if self.structured_layout_tokens_flag:
-                _n_s   = self._n_sem_tokens   # 8
-                z_sem  = _lay_src[:, 1 : 1+_n_s, :].reshape(B_cur, -1)  # [B, 256]
-                z_lay  = _lay_src[:, 1+_n_s : , :].reshape(B_cur, -1)   # [B, 224]
+                _n_s  = self._n_sem_tokens
+                z_sem = _lay_src[:, 1 : 1+_n_s, :].reshape(B_cur, -1)
+                z_lay = _lay_src[:, 1+_n_s : , :].reshape(B_cur, -1)
                 self.last_scene_semantic_pred = (
                     self.lay_semantic_head(z_sem) if self.lay_semantic_head else None)
                 self.last_scene_layout_pred = (
                     self.lay_layout_head(z_lay) if self.lay_layout_head else None)
             else:
-                _lay_all = _lay_src[:, 1:, :].reshape(B_cur, -1)  # [B, 480]
+                _lay_all = _lay_src[:, 1:, :].reshape(B_cur, -1)
                 self.last_scene_semantic_pred = (
                     self.lay_semantic_head(_lay_all) if self.lay_semantic_head else None)
                 self.last_scene_layout_pred = (
                     self.lay_layout_head(_lay_all) if self.lay_layout_head else None)
         else:
-            # Legacy: heads on shape_embed [B, 384]
             self.last_scene_layout_pred = (
                 self.scene_layout_module(_se) if self.scene_layout_module else None)
 
@@ -1392,7 +1187,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             shape_embed=_se,
             scaffold_anchors=scaffold_anchors,
             scaffold_token_ids=scaffold_token_ids,
-            z_layout=self.last_z_layout)   # None if not Strategy B
+            z_layout=self.last_z_layout)
 
         if not self.semantic_token_heads_flag and not _any_B:
             self.last_mean_color_pred = (

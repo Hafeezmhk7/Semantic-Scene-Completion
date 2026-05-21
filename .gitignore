@@ -21,6 +21,8 @@ wandb/
 # Logs
 logs/
 *.log
+*.log_ss2
+*.log_ss1
 
 # Large datasets
 *.h5
@@ -37,5 +39,19 @@ logs/
 *.jpeg
 
 #Pdfs
-*.pdflog_ss2/
+*.pdf
+
+
+# Logs (directories)
+log_ss2/
 logs_ss1/
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Job output logs (if any)
+*.out
+*.err

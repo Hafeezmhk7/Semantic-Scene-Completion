@@ -1,0 +1,185 @@
+#!/bin/bash
+#SBATCH --job-name=decoder_finetune
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=4:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=60G
+#SBATCH --output=log_ss2/decoder_finetune_%j.out
+#SBATCH --error=log_ss2/decoder_finetune_%j.err
+
+# ============================================================================
+# Can3Tok — GS Decoder Robustness Fine-Tuning
+# ============================================================================
+#
+# WHAT THIS DOES
+# ──────────────
+# The GS decoder (777M params) was trained on 300 encoder outputs. Stage 2
+# generates latents ~RMSE 0.09 off the encoder manifold. The decoder
+# extrapolates poorly for these off-manifold inputs → blurry Gaussians.
+#
+# This script fine-tunes ONLY the GS decoder to produce the same output
+# for Stage 2 generated latents as for encoder latents from the same scene.
+# Everything else stays frozen. (LV-RAE, arXiv:2602.08620)
+#
+# SINGLE GPU — no DDP needed. Memory ~11.5GB, well within H100 80GB.
+#
+# WHAT TO SET
+# ───────────
+# 1. STAGE1_CHECKPOINT  — your Stage 1 best_model.pth (Strategy A)
+# 2. GEOMETRY_CHECKPOINT — Stage 2 geometry DiT best_model.pth (epoch ~1400)
+# 3. OUTPUT_DIR          — where to save the fine-tuned checkpoint
+#
+# The fine-tuned checkpoint is a DROP-IN REPLACEMENT for the Stage 1
+# checkpoint. Use it in sample_stage2.py with --stage1_checkpoint.
+#
+# EXPECTED RESULTS
+# ────────────────
+# Training output per epoch:
+#   Anchor loss:  MSE between fine-tuned and frozen decoder for CLEAN latents
+#                 → Should stay near 0 (no forgetting of Stage 1 quality)
+#   Robust loss:  MSE between fine-tuned decoder (Stage 2 latents) and
+#                 frozen decoder (clean latents) for the SAME scene
+#                 → Should decrease toward Anchor loss level
+#                 → ratio = Robust/Anchor: start >> 1, target = 1.0
+#
+# When ratio ≈ 1.0: the decoder treats Stage 2 latents the same as encoder
+# latents → reconstruction quality matches Stage 1 for generated scenes.
+#
+# TIMING
+# ──────
+# 200 epochs × 300 scenes × ~2s/epoch ≈ ~10 minutes
+# (short because: single GPU, small dataset, only GS decoder updated)
+# ============================================================================
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# CONFIGURATION — set these before submitting
+# ============================================================================
+
+# ── Stage 1 checkpoint (Strategy A, latent_disentangle=True) ─────────────────
+STAGE1_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21860551_hidden_colorresidual_disent512_fourierpe_layout_semTok_poolNCE_pgNCE_inferencefixed/best_model.pth"
+
+# ── Stage 2 geometry DiT (best checkpoint — use epoch 1400 from baseline run) ─
+# The baseline run (job 685) achieved best val loss 0.40481 at epoch 1400.
+# Use that checkpoint here. Fréchet/dim = 0.094 at epoch 1400 is good.
+GEOMETRY_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage2/stage2_A_geometry_cross_attn_B_22662167/best_model.pth"
+
+# ── Config ────────────────────────────────────────────────────────────────────
+STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+
+# ── Output directory ──────────────────────────────────────────────────────────
+OUTPUT_DIR="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_decoder_ft/decoder_ft_${SLURM_JOB_ID}"
+
+# ── Training hyperparameters ──────────────────────────────────────────────────
+NUM_EPOCHS=200          # 200 is sufficient; can extend to 500 if still improving
+BATCH_SIZE=32           # 32 fits easily on H100 with 2× GS decoder in memory
+LR=1e-5                 # 10× smaller than Stage 1 (1e-4) to prevent forgetting
+WEIGHT_DECAY=1e-4
+TRAIN_SCENES=300        # all training scenes
+VAL_SCENES=50
+
+# ── Fine-tuning specific ──────────────────────────────────────────────────────
+# MIX_RATIO: fraction of each batch using Stage 2 generated latents
+# 0.5 = 50% clean + 50% generated (default, balanced)
+# 0.3 = 30% generated, more conservative
+MIX_RATIO=0.5
+
+# EULER_STEPS: how many steps for Stage 2 DiT sampling per batch
+# 20 steps = ~4× faster than full quality (50 steps)
+# Produces latents close to 50-step quality for fine-tuning purposes
+EULER_STEPS=20
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+EVAL_EVERY=10   # evaluate + save every 10 epochs
+VIS_EVERY=50    # save PLY visualisations every 50 epochs
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
+mkdir -p log_ss2 "$OUTPUT_DIR"
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+if [ ! -f "$STAGE1_CHECKPOINT" ]; then
+    echo "ERROR: Stage 1 checkpoint not found: $STAGE1_CHECKPOINT"
+    exit 1
+fi
+if [ ! -f "$GEOMETRY_CHECKPOINT" ]; then
+    echo "ERROR: Geometry checkpoint not found: $GEOMETRY_CHECKPOINT"
+    exit 1
+fi
+
+echo "========================================================================"
+echo "  GS Decoder Robustness Fine-Tuning"
+echo "  Stage 1:    $STAGE1_CHECKPOINT"
+echo "  Stage 2:    $GEOMETRY_CHECKPOINT"
+echo "  Output:     $OUTPUT_DIR"
+echo "  Mix ratio:  $MIX_RATIO  Euler steps: $EULER_STEPS"
+echo "  LR:         $LR  Epochs: $NUM_EPOCHS"
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+CMD="python fine_tune_decoder.py"
+CMD="$CMD --stage1_checkpoint  $STAGE1_CHECKPOINT"
+CMD="$CMD --geometry_checkpoint $GEOMETRY_CHECKPOINT"
+CMD="$CMD --stage1_config      $STAGE1_CONFIG"
+CMD="$CMD --output_dir         $OUTPUT_DIR"
+CMD="$CMD --num_epochs         $NUM_EPOCHS"
+CMD="$CMD --batch_size         $BATCH_SIZE"
+CMD="$CMD --lr                 $LR"
+CMD="$CMD --weight_decay       $WEIGHT_DECAY"
+CMD="$CMD --train_scenes       $TRAIN_SCENES"
+CMD="$CMD --val_scenes         $VAL_SCENES"
+CMD="$CMD --mix_ratio          $MIX_RATIO"
+CMD="$CMD --euler_steps        $EULER_STEPS"
+CMD="$CMD --eval_every         $EVAL_EVERY"
+CMD="$CMD --vis_every          $VIS_EVERY"
+
+echo "Command: $CMD"
+echo ""
+
+SECONDS=0
+eval $CMD
+EXIT=$?
+
+echo ""
+echo "Exit: $EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+if [ $EXIT -eq 0 ]; then
+    echo ""
+    echo "COMPLETED. Fine-tuned checkpoint:"
+    echo "  $OUTPUT_DIR/best_model.pth"
+    echo ""
+    echo "To use in Stage 2 inference (sample_stage2.py):"
+    echo "  --stage1_checkpoint $OUTPUT_DIR/best_model.pth"
+    echo ""
+    echo "What to check in the logs:"
+    echo "  Anchor loss → near 0     (decoder hasn't forgotten Stage 1 quality)"
+    echo "  Robust loss → decreasing (decoder is becoming robust to Stage 2 latents)"
+    echo "  Ratio = Robust/Anchor → decreasing toward 1.0"
+    echo "  When ratio ≈ 1.0: Stage 2 latents treated same as encoder latents"
+    echo ""
+    echo "Visualisations saved to: $OUTPUT_DIR/vis/"
+    echo "  gen/      ← Stage 2 generated latents decoded with fine-tuned decoder"
+    echo "  clean_ref/ ← Encoder latents decoded with fine-tuned decoder (reference)"
+    echo "  Compare these: if fine-tuning worked, gen/ should look like clean_ref/"
+else
+    echo "FAILED (exit $EXIT)"
+    echo "  cat log_ss2/decoder_finetune_${SLURM_JOB_ID}.err | tail -30"
+fi

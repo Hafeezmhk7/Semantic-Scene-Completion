@@ -1,36 +1,29 @@
 #!/bin/bash
-#SBATCH --job-name=stage2_A_2k_2nd_step
+#SBATCH --job-name=stage2_A
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=2
-#SBATCH --time=48:00:00
+#SBATCH --time=20:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=120G
-#SBATCH --output=log_ss2/stage2_A_2k_2nd_step%j.out
-#SBATCH --error=log_ss2/stage2_A_2k_2nd_step%j.err
+#SBATCH --output=logs/stage2_A_%j.out
+#SBATCH --error=logs/stage2_A_%j.err
 
 # ============================================================================
-# CAN3TOK STAGE 2 — Strategy A
+# CAN3TOK STAGE 2 — Strategy A  (with optional Latent Perceptual Loss)
 # ============================================================================
 #
-# Run in TWO sequential submissions:
+# Run in TWO sequential steps. Submit step 1 first.
+# After step 1 converges (~200 epochs), check the val_loss, then submit step 2.
 #
-#   Submission 1 — Layout DiT (STAGE=layout):
-#       Learns P(z_s) — distribution of semantic layout tokens [B, 16, 32].
-#       This checkpoint is SHARED with Strategy D — no need to retrain it.
+#  STEP 1 — Layout DiT (shared with Strategy D):
+#    Learns P(z_s) — the distribution of semantic layout tokens [B, 16, 32].
+#    Use the checkpoint from this step as LAYOUT_CKPT in Step 2 and in
+#    run_stage2_D.job.
 #
-#   Submission 2 — Geometry DiT (STAGE=geometry):
-#       Learns P(z_g | z_s_clean) — geometry conditioned on clean z_s.
-#       z_s conditions every DiT block via cross-attention K/V (default).
-#       Ablation: set ZS_CONDITIONING=adaLN to test pooled conditioning.
-#
-# Ablation experiments:
-#   Run STAGE=geometry twice:
-#     ZS_CONDITIONING=cross_attn  →  GeometryDiTA with cross-attention
-#     ZS_CONDITIONING=adaLN       →  GeometryDiT_adaLN with pooled z_s
-#   Compare generation quality to measure how much per-token z_s structure
-#   matters.  The checkpoint run_name embeds the conditioning type so both
-#   runs can coexist in checkpoints_stage2/.
+#  STEP 2 — Geometry DiT A (prefix conditioning):
+#    Learns P(z_g | z_s) — geometry conditioned on a clean z_s prefix.
+#    All 512 tokens attend to each other (z_s as first 16 prefix tokens).
 #
 # ============================================================================
 
@@ -40,47 +33,32 @@ echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 # CONFIGURATION  — edit these before submitting
 # ============================================================================
 
-# ── Stage 1 checkpoint (Strategy A — latent_disentangle=True) ─────────────────
-STAGE1_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21860551_hidden_colorresidual_disent512_fourierpe_layout_semTok_poolNCE_pgNCE_inferencefixed/best_model.pth"
+# ── Stage 1 checkpoint (REQUIRED — set before submitting) ────────────────────
+STAGE1_CHECKPOINT="/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/<YOUR_RUN>/best_model.pth"
 STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 
 # ── Step: layout (Submission 1) | geometry (Submission 2) ────────────────────
 STAGE="geometry"           # layout | geometry
 
-# ── Layout checkpoint — required for STAGE=geometry ──────────────────────────
-LAYOUT_CKPT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage2/stage2_A_layout_B_22414639"           # e.g. checkpoints_stage2/stage2_A_layout_B_JOBID/best_model.pth
+# ── For Step 2 only: path to the completed layout checkpoint ─────────────────
+LAYOUT_CKPT=""           # e.g. .../checkpoints_stage2/stage2_A_layout_B_JID/best_model.pth
 
-# ── z_s conditioning — only applies to STAGE=geometry ────────────────────────
-# cross_attn : dedicated cross-attention per block   ← default, recommended
-# adaLN      : pooled z_s added to t_embed           ← ablation
-ZS_CONDITIONING="cross_attn"
-
-# ── Resume a previous geometry run (optional) ─────────────────────────────────
+# ── Resume (optional) ────────────────────────────────────────────────────────
 RESUME_CHECKPOINT=""
 
-# ── Model size: S (fast smoke-test) | B (default) | L (best quality) ─────────
+# ── Model size: S (fast test) | B (default) | L (best quality) ───────────────
 MODEL_SIZE="B"
 
 # ── Training ──────────────────────────────────────────────────────────────────
 BATCH_SIZE=64
-NUM_EPOCHS=5000
+NUM_EPOCHS=500
 LR=1e-4
 WEIGHT_DECAY=1e-2
-WARMUP_STEPS=500        # longer warmup for longer run
-LR_MIN_RATIO=0.05       # floor = 5e-6 instead of 1e-5; gives meaningful LR longer
-EVAL_EVERY=50           # less frequent eval saves time over 2000 epochs
-TRAIN_SCENES=1000       # use more of SceneSplat-7K; 300 was for quick testing
-VAL_SCENES=100
-
-# ── Visualization & diagnostics ────────────────────────────────────────────────
-# VIS_FREQ: save generated PLY every N epochs (0=off).
-# geometry stage: uses real z_s from val encoder + generated z_g — best qualitative signal.
-VIS_FREQ=50
-VIS_NUM_SCENES=4
-VIS_NUM_STEPS=50
-# FLOW_DIAG_FREQ: print velocity field diagnostics every N epochs (0=off).
-# Prints cosine(v_pred, v_target), per-t-bin loss, v_pred/v_target std.
-FLOW_DIAG_FREQ=50
+WARMUP_STEPS=200
+LR_MIN_RATIO=0.1
+EVAL_EVERY=25
+TRAIN_SCENES=300
+VAL_SCENES=50
 
 # ============================================================================
 # ENVIRONMENT
@@ -91,13 +69,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
-cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
 mkdir -p logs
-
-# Create log directories BEFORE anything writes to them
-mkdir -p log_ss2
-
-
 
 # ============================================================================
 # VALIDATION
@@ -114,9 +87,6 @@ fi
 
 echo "========================================================================"
 echo "  Stage 2 — Strategy A — Stage: $STAGE"
-if [ "$STAGE" = "geometry" ]; then
-    echo "  z_s conditioning: $ZS_CONDITIONING"
-fi
 echo "  Stage 1: $STAGE1_CHECKPOINT"
 echo "  Model size: $MODEL_SIZE"
 echo "========================================================================"
@@ -137,8 +107,6 @@ CMD="$CMD --lr $LR --weight_decay $WEIGHT_DECAY"
 CMD="$CMD --warmup_steps $WARMUP_STEPS --lr_min_ratio $LR_MIN_RATIO"
 CMD="$CMD --eval_every $EVAL_EVERY"
 CMD="$CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
-CMD="$CMD --vis_freq $VIS_FREQ --vis_num_scenes $VIS_NUM_SCENES --vis_num_steps $VIS_NUM_STEPS"
-CMD="$CMD --flow_diag_freq $FLOW_DIAG_FREQ"
 
 if [ "$STAGE" = "geometry" ]; then
     CMD="$CMD --zs_conditioning $ZS_CONDITIONING"
@@ -161,25 +129,26 @@ echo "Exit: $EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(dat
 if [ $EXIT -eq 0 ]; then
     echo ""
     echo "COMPLETED — Strategy A, stage=$STAGE"
+    echo ""
     if [ "$STAGE" = "layout" ]; then
         echo ""
         echo "  Next steps:"
         echo "    1. Set LAYOUT_CKPT to the best_model.pth from this run"
         echo "    2. Set STAGE=geometry"
-        echo "    3. Submit twice: once with ZS_CONDITIONING=cross_attn (default)"
-        echo "                     once with ZS_CONDITIONING=adaLN (ablation)"
+        echo "    3. sbatch run_stage2_A.job"
         echo ""
-        echo "  This layout checkpoint can also be reused for Strategy D!"
+        echo "  Note: The same layout checkpoint can also be used for Strategy D!"
+        echo "    Copy LAYOUT_CKPT to run_stage2_D.job"
     else
-        echo "  Generation command:"
+        echo "  Stage 2 A complete. Generate scenes:"
         echo "    python stage2/sample_stage2.py \\"
         echo "      --strategy A \\"
         echo "      --stage1_checkpoint $STAGE1_CHECKPOINT \\"
         echo "      --layout_checkpoint $LAYOUT_CKPT \\"
-        echo "      --geometry_checkpoint checkpoints_stage2/stage2_A_geometry_${ZS_CONDITIONING}_B_${SLURM_JOB_ID}/best_model.pth \\"
-        echo "      --num_samples 8 --num_steps 50 --output_dir ./generated_A_${ZS_CONDITIONING}/"
+        echo "      --geometry_checkpoint checkpoints_stage2/stage2_A_geometry_B_${SLURM_JOB_ID}/best_model.pth \\"
+        echo "      --num_samples 8 --num_steps 50 --output_dir ./generated_A/"
     fi
 else
     echo "FAILED (exit $EXIT)"
-    echo "  cat logs/stage2_A_${SLURM_JOB_ID}.err | tail -30"
+    echo "  cat log_ss2/stage2_A_geometry_lpl_${SLURM_JOB_ID}.err | tail -30"
 fi
