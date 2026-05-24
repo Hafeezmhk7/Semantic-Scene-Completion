@@ -2,7 +2,7 @@ compute_environment: LOCAL_MACHINE
 debug: false
 distributed_type: MULTI_GPU
 downcast_bf16: 'no'
-mixed_precision: 'no'
+mixed_precision: 'bf16'
 num_machines: 1
 num_processes: 2     # number of H100s per node — adjust to match --gpus in job script
 use_cpu: false

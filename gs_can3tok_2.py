@@ -16,6 +16,14 @@ ALSO:
   Per-Gaussian InfoNCE kept for ablation (--semantic_mode hidden/geometric/dist)
   PCA visualisation for both: per-Gaussian + z_s space PLY
   All loss components printed every epoch
+
+BF16 MIXED PRECISION (2025-05 update):
+  torch.autocast('cuda', dtype=torch.bfloat16, enabled=True) now wraps:
+    1. Main training forward pass (gs_autoencoder(...))
+    2. Eval forward pass in evaluate_model (model(...))
+    3. Cross-recon decode() call (was already autocast, now uses shared vars)
+  Enable by setting mixed_precision: 'bf16' in accelerate_config.yaml.
+  No code change needed for fp32 fallback — enabled=False when mp='no'.
 """
 
 import torch
@@ -521,9 +529,10 @@ gs_dataset_train = gs_dataset(
     scene_layout_head=args.scene_layout_head,
     jepa_idea1=args.jepa_idea1,
     position_layout_residual=args.position_layout_residual)
+# ── FIX: shuffle=True for training (was False — every epoch saw same batch order) ──
 trainDataLoader = Data.DataLoader(
     dataset=gs_dataset_train, batch_size=args.batch_size,
-    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True)
+    shuffle=True, num_workers=9, pin_memory=True, persistent_workers=True)
 
 print(f"\n--- Validation Dataset ---")
 gs_dataset_val = gs_dataset(
@@ -547,6 +556,22 @@ if accelerator.is_main_process:
 gs_autoencoder, optimizer, trainDataLoader, valDataLoader, scheduler = accelerator.prepare(
     gs_autoencoder, optimizer, trainDataLoader, valDataLoader, scheduler)
 raw_model = accelerator.unwrap_model(gs_autoencoder)
+
+# ============================================================================
+# MIXED PRECISION SETUP
+# ============================================================================
+# Defined once here after accelerator.prepare() so both the training loop and
+# evaluate_model() share the same dtype/enabled flags.
+# Set mixed_precision: 'bf16' in accelerate_config.yaml to enable on H100.
+# Falls back to fp32 automatically when mixed_precision='no'.
+_mp             = accelerator.mixed_precision
+_autocast_dtype = (torch.bfloat16 if _mp == 'bf16' else
+                   torch.float16  if _mp == 'fp16' else torch.float32)
+_use_autocast   = (_mp != 'no')
+if accelerator.is_main_process:
+    print(f"\n  Mixed precision : {_mp}")
+    print(f"  Autocast dtype  : {_autocast_dtype}")
+    print(f"  Autocast enabled: {_use_autocast}")
 
 # ============================================================================
 # CHECKPOINT METADATA
@@ -599,6 +624,14 @@ _ckpt_meta = {
 # ============================================================================
 def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None):
     model.eval()
+
+    # ── Mixed precision for eval forward pass ────────────────────────────────
+    # Uses the module-level _autocast_dtype / _use_autocast set after
+    # accelerator.prepare(). Wrapping the model() call with autocast ensures
+    # eval runs in bf16 when enabled, matching the training forward pass.
+    _eval_dtype     = _autocast_dtype
+    _eval_autocast  = _use_autocast
+
     total_l2 = total_kl = total_color = total_scene_sem = 0.0
     total_anchor = total_layout = total_seg = total_z_s_nce = total_zs_tok_nce = total_zs_lay_nce = 0.0
     per_param    = {k: 0.0 for k in PARAM_SLICES}
@@ -637,11 +670,14 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
                        if args.position_scaffold else None)
 
             _rsf = True if do_sem_pca else None
-            (shape_embed, mu, log_var, z,
-             UV_gs_recover, pg_feats) = model(
-                UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:,:,:3],
-                scaffold_anchors=sa_gpu, scaffold_token_ids=sti_gpu,
-                return_semantic_features=_rsf)
+
+            # ── BF16 FIX: wrap eval forward in autocast ───────────────────────
+            with torch.autocast('cuda', dtype=_eval_dtype, enabled=_eval_autocast):
+                (shape_embed, mu, log_var, z,
+                 UV_gs_recover, pg_feats) = model(
+                    UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:,:,:3],
+                    scaffold_anchors=sa_gpu, scaffold_token_ids=sti_gpu,
+                    return_semantic_features=_rsf)
 
             mcp  = raw_model.shape_model.last_mean_color_pred
             ssp  = raw_model.shape_model.last_scene_semantic_pred
@@ -672,16 +708,16 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
             kl_loss    = -0.5*torch.sum(1+log_var - mu.pow(2) - log_var.exp(), dim=1)
 
             if mcp is not None and args.color_residual:
-                total_color += F.mse_loss(mcp, mean_color_gt).item() * B
+                total_color += F.mse_loss(mcp.float(), mean_color_gt).item() * B
             if ssp is not None and args.scene_semantic_head:
                 p_s = batch_data['label_dist'].float().to(device)
-                total_scene_sem += scene_semantic_kl_loss(ssp, p_s).item() * B
+                total_scene_sem += scene_semantic_kl_loss(ssp.float(), p_s).item() * B
             if anch is not None and args.position_scaffold:
-                total_anchor += F.mse_loss(anch, sa_gpu).item() * B
+                total_anchor += F.mse_loss(anch.float(), sa_gpu).item() * B
             if slp is not None and args.scene_layout_head:
                 gt_c = batch_data['category_centroids'].float().to(device)
                 gt_v = batch_data['category_valid'].float().to(device)
-                total_layout += compute_layout_loss(slp, gt_c, gt_v).item() * B
+                total_layout += compute_layout_loss(slp.float(), gt_c, gt_v).item() * B
             if args.predict_seg_labels and sgp is not None:
                 total_seg += compute_seg_pred_loss(sgp, batch_data['segment_labels'].long().to(device)).item() * B
             # z_s token InfoNCE validation loss + collect tokens for visualization
@@ -712,15 +748,15 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
             n_scenes  += B
 
             if n_scenes <= B:
-                _pos_abs_min  = pred_abs[:,:,0:3].cpu().min().item()
-                _pos_abs_max  = pred_abs[:,:,0:3].cpu().max().item()
+                _pos_abs_min  = pred_abs[:,:,0:3].cpu().float().min().item()
+                _pos_abs_max  = pred_abs[:,:,0:3].cpu().float().max().item()
                 _pos_gt_range = (UV_gs_batch[:,:,4:7].cpu().max()-UV_gs_batch[:,:,4:7].cpu().min()).item()/2
 
             ind = compute_individual_losses(pred_3d, target)
             for k in per_param: per_param[k] += ind[k]
 
             if do_recon and len(recon_preds) < args.recon_ply_num_scenes:
-                pnp = pred_abs.cpu().numpy(); mnp = mean_color_gt.cpu().numpy()
+                pnp = pred_abs.cpu().float().numpy(); mnp = mean_color_gt.cpu().numpy()
                 for si in range(B):
                     if len(recon_preds) >= args.recon_ply_num_scenes: break
                     recon_preds.append(pnp[si]); recon_means.append(mnp[si])
@@ -729,22 +765,22 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
                 for si in range(B):
                     if len(pca_input) >= args.pca_num_scenes: break
                     pca_input.append(UV_gs_batch.cpu().numpy()[si])
-                    pca_recon.append(pred_abs.cpu().numpy()[si])
+                    pca_recon.append(pred_abs.cpu().float().numpy()[si])
                     if do_sem_pca and pg_feats is not None:
-                        pca_sem_feat.append(pg_feats.cpu().numpy()[si])
+                        pca_sem_feat.append(pg_feats.cpu().float().numpy()[si])
 
             if do_z_s_vis and zsp is not None:
-                z_s_proj_acc.append(zsp.detach().cpu().numpy())
+                z_s_proj_acc.append(zsp.detach().cpu().float().numpy())
                 label_dist_acc.append(label_dist_v.cpu().numpy())
             if do_zs_tok_vis and z_s_tokens_eval is not None:
-                zs_tokens_acc.append(z_s_tokens_eval.cpu().numpy())
+                zs_tokens_acc.append(z_s_tokens_eval.cpu().float().numpy())
                 if not do_z_s_vis:
                     label_dist_acc.append(label_dist_v.cpu().numpy())
 
             # Collect z_layout tokens for visualization (Strategy B)
             z_lay_raw_eval = raw_model.shape_model.last_z_layout
             if do_zs_lay_vis and z_lay_raw_eval is not None:
-                zs_layout_acc.append(z_lay_raw_eval.detach().cpu().numpy())
+                zs_layout_acc.append(z_lay_raw_eval.detach().cpu().float().numpy())
                 if not do_z_s_vis and not do_zs_tok_vis:
                     label_dist_acc.append(label_dist_v.cpu().numpy())
 
@@ -755,7 +791,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator, epoch=None
                     _ph = getattr(raw_model.shape_model,
                                   'last_z_layout_pool_hidden', None)
                 if _ph is not None:
-                    zs_pool_acc.append(_ph.detach().cpu().numpy())  # [B, 1024]
+                    zs_pool_acc.append(_ph.detach().cpu().float().numpy())  # [B, 1024]
                     if not label_dist_acc:
                         label_dist_acc.append(label_dist_v.cpu().numpy())
 
@@ -914,10 +950,16 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
 
         optimizer.zero_grad()
 
-        (shape_embed, mu, log_var, z,
-         UV_gs_recover, pg_features) = gs_autoencoder(
-            UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:,:,:3],
-            scaffold_anchors=sa_gpu, scaffold_token_ids=sti_gpu)
+        # ── BF16 FIX: wrap main training forward in autocast ─────────────────
+        # When mixed_precision='bf16' in accelerate_config.yaml, this enables
+        # bf16 tensor cores on H100 for the full encoder + decoder forward pass.
+        # _autocast_dtype and _use_autocast are set once after accelerator.prepare().
+        # Falls back to fp32 transparently when mixed_precision='no'.
+        with torch.autocast('cuda', dtype=_autocast_dtype, enabled=_use_autocast):
+            (shape_embed, mu, log_var, z,
+             UV_gs_recover, pg_features) = gs_autoencoder(
+                UV_gs_batch, UV_gs_batch, UV_gs_batch, UV_gs_batch[:,:,:3],
+                scaffold_anchors=sa_gpu, scaffold_token_ids=sti_gpu)
 
         mcp   = raw_model.shape_model.last_mean_color_pred
         ssp   = raw_model.shape_model.last_scene_semantic_pred
@@ -951,22 +993,22 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
 
         color_pred_loss = torch.tensor(0., device=device)
         if mcp is not None and args.color_residual:
-            color_pred_loss = F.mse_loss(mcp, mean_color_gt)
+            color_pred_loss = F.mse_loss(mcp.float(), mean_color_gt)
 
         scene_sem_loss = torch.tensor(0., device=device)
         if ssp is not None and args.scene_semantic_head:
             p_s = batch_data['label_dist'].float().to(device)
-            scene_sem_loss = scene_semantic_kl_loss(ssp, p_s)
+            scene_sem_loss = scene_semantic_kl_loss(ssp.float(), p_s)
 
         anchor_loss = torch.tensor(0., device=device)
         if anch is not None and args.position_scaffold and sa_gpu is not None:
-            anchor_loss = F.mse_loss(anch, sa_gpu)
+            anchor_loss = F.mse_loss(anch.float(), sa_gpu)
 
         layout_loss = torch.tensor(0., device=device)
         if slp is not None and args.scene_layout_head:
             gt_c = batch_data['category_centroids'].float().to(device)
             gt_v = batch_data['category_valid'].float().to(device)
-            layout_loss = compute_layout_loss(slp, gt_c, gt_v)
+            layout_loss = compute_layout_loss(slp.float(), gt_c, gt_v)
 
         seg_pred_loss = torch.tensor(0., device=device)
         if args.predict_seg_labels and sgp is not None and seg_labels is not None:
@@ -1074,23 +1116,24 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                         _n_s   = raw_model.shape_model._n_sem_tokens  # 8
                         _start = _ed + _n_s * _ed   # 32 + 8*32 = 288
                         z_lay_B = z_s_swapped[:, _start:_sd]  # [B, 224]
-                        raw_model.shape_model.last_scene_layout_pred =                             raw_model.shape_model.scene_layout_module(z_lay_B)
+                        raw_model.shape_model.last_scene_layout_pred = \
+                            raw_model.shape_model.scene_layout_module(z_lay_B)
                     else:
                         # unstructured: layout module expects full tokens 1-15 [B, 480]
                         z_sem_B = z_s_swapped[:, _ed:_sd]     # [B, 480]
-                        raw_model.shape_model.last_scene_layout_pred =                             raw_model.shape_model.scene_layout_module(z_sem_B)
+                        raw_model.shape_model.last_scene_layout_pred = \
+                            raw_model.shape_model.scene_layout_module(z_sem_B)
 
             se_shifted = torch.roll(raw_model.shape_model._shape_embed_cache, shifts=1, dims=0)
-            _mp = accelerator.mixed_precision
-            _dtype = (torch.bfloat16 if _mp == 'bf16' else
-                      torch.float16  if _mp == 'fp16' else torch.float32)
+            # ── BF16 FIX: use shared _autocast_dtype / _use_autocast ─────────
+            # Removed local _mp / _dtype redefinition — now uses module-level vars.
             # For Strategy B: shift z_layout as well so cross-recon uses shifted layout
             _z_layout_shifted = None
             _any_B_train = args.decoder_layout_cross_attn or args.decoder_layout_additive
             if _any_B_train and raw_model.shape_model.last_z_layout is not None:
                 _z_layout_shifted = torch.roll(
                     raw_model.shape_model.last_z_layout, shifts=1, dims=0)
-            with torch.autocast('cuda', dtype=_dtype, enabled=(_mp != 'no')):
+            with torch.autocast('cuda', dtype=_autocast_dtype, enabled=_use_autocast):
                 UV_cross, _ = raw_model.shape_model.decode(
                     lat_cross, volume_queries=None,
                     return_semantic_features=False, shape_embed=se_shifted,
