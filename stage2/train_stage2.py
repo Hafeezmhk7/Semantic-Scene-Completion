@@ -467,14 +467,29 @@ def compute_flow_diagnostics(model, x_clean, model_kwargs, n_bins=4):
 # Model factory
 # ============================================================================
 
-def build_stage2_model(strategy, stage, size, zs_conditioning="cross_attn"):
+def build_stage2_model(
+    strategy:        str,
+    stage:           str,
+    size:            str,
+    zs_conditioning: str = "cross_attn",
+    rope_type:       str = "learned_ape",
+):
+    """
+    Construct the Stage 2 DiT model.
+
+    rope_type controls the positional encoding scheme for geometry models:
+      'learned_ape'  — default, learned absolute PE (original behaviour)
+      '1d'           — 1-D RoPE (sequence position 0→495)
+      '3d'           — 3-D RoPE (8×8×8 spatial grid, head_dim split x/y/z)
+    rope_type is ignored for layout and completion stages (they keep APE).
+    """
     if stage == "layout":
         return LayoutDiT_models[f"LayoutDiT-{size}"]()
     elif stage == "geometry":
         if zs_conditioning == "adaLN":
-            return GeometryDiT_adaLN_models[f"GeometryDiT_adaLN-{size}"]()
+            return GeometryDiT_adaLN_models[f"GeometryDiT_adaLN-{size}"](rope_type=rope_type)
         suffix = "A" if strategy == "A" else "D"
-        return GeometryDiT_models[f"GeometryDiT{suffix}-{size}"]()
+        return GeometryDiT_models[f"GeometryDiT{suffix}-{size}"](rope_type=rope_type)
     elif stage == "completion":
         assert strategy == "B1"
         return CompletionDiT_models[f"CompletionDiT-{size}"]()
@@ -521,7 +536,41 @@ def parse_args():
     p.add_argument("--flow_diag_freq",     type=int, default=0)
     p.add_argument("--stage1_config",      type=str,
                    default="./model/configs/aligned_shape_latents/shapevae-256.yaml")
-
+    # ── Latent Perceptual Loss (LPL) ─────────────────────────────────────────
+    # Berrada et al., NeurIPS 2024 — "Boosting Latent Diffusion with Perceptual Objectives"
+    # Addresses the autoencoder-diffusion disconnect:
+    #   Generated z_g lies on a different manifold from encoder z_g even when
+    #   their global distribution matches (KL converged).  LPL directly closes
+    #   this gap by including the frozen Stage 1 decoder transformer in the
+    #   Stage 2 training objective.
+    #
+    # How it works:
+    #   For each geometry training step, after computing v_pred:
+    #     z_g_est   = x_t + (1-t) * v_pred                 ← estimated endpoint
+    #     Z_est     = cat([z_s_clean, z_g_est], dim=1)      ← [B, 512, 32]
+    #     feat_gen  = decoder_transformer(Z_est)             ← [B, 512, 384]
+    #     feat_clean= decoder_transformer(Z_clean) [no_grad] ← [B, 512, 384]
+    #     L_LPL     = MSE(feat_gen, feat_clean)
+    #     L_total   = L_flow + lpl_weight * L_LPL
+    #
+    # Only applies to --stage geometry.  Set to 0.0 to disable (default).
+    # Recommended starting value: 0.01
+    # Requires get_decoder_transformer_features() in Stage 1 model.
+    p.add_argument("--lpl_weight",         type=float, default=0.0,
+                   help="Weight for Latent Perceptual Loss (0=disabled). "
+                        "Only used with --stage geometry. "
+                        "Requires get_decoder_transformer_features() in Stage 1.")
+    # ── Positional encoding (ablation) ────────────────────────────────────────
+    p.add_argument("--rope_type",          type=str,   default="learned_ape",
+                   choices=["learned_ape", "1d", "3d"],
+                   help=(
+                       "Positional encoding for geometry DiT (ablation). "
+                       "'learned_ape' = default (ViT-style, added at input). "
+                       "'1d' = 1-D RoPE on Q/K at every block (sequence position). "
+                       "'3d' = 3-D RoPE on Q/K (8×8×8 spatial grid, "
+                       "head_dim split d_x+d_y+d_z). "
+                       "Ignored for layout/completion stages."
+                   ))
     return p.parse_args()
 
 
@@ -566,6 +615,14 @@ def main():
     if accelerator.is_main_process:
         print(f"\n{'='*70}")
         print(f"  CAN3TOK STAGE 2 — Strategy {args.strategy} | Stage {args.stage}")
+        if args.stage == "geometry":
+            print(f"  z_s conditioning: {args.zs_conditioning}")
+            if args.lpl_weight > 0:
+                print(f"  Latent Perceptual Loss: ENABLED  (weight={args.lpl_weight})")
+                print(f"  LPL features: decoder transformer output H_out [B,512,384]")
+                print(f"  Reference: Berrada et al., NeurIPS 2024 (LPL closes manifold gap)")
+            else:
+                print(f"  Latent Perceptual Loss: disabled  (--lpl_weight 0.0)")
         print(f"  Model size: {args.model_size}   Save: {save_path}")
         print(f"  PLY saved every {args.eval_every} epochs (at each eval step)")
         if args.flow_diag_freq > 0:
@@ -573,7 +630,8 @@ def main():
         print(f"{'='*70}\n")
 
     shape_model, s1_meta = load_stage1(args.stage1_checkpoint, args.stage1_config, device)
-    model = build_stage2_model(args.strategy, args.stage, args.model_size, args.zs_conditioning)
+    model = build_stage2_model(args.strategy, args.stage, args.model_size,
+                               args.zs_conditioning, args.rope_type)
 
     if accelerator.is_main_process:
         print(f"  Stage 2 model: {model}\n")
@@ -634,6 +692,7 @@ def main():
         "path_type": args.path_type, "prediction": args.prediction,
         "stage1_checkpoint": args.stage1_checkpoint,
         "lpl_weight": args.lpl_weight,
+        "rope_type": args.rope_type,
         "s1_latent_disentangle":        s1_meta["latent_disentangle"],
         "s1_semantic_dims":             s1_meta["semantic_dims"],
         "s1_color_residual":            s1_meta["color_residual"],
@@ -643,10 +702,28 @@ def main():
 
     print(f"Starting training — epoch {start_epoch} → {args.num_epochs - 1}\n")
 
-    for epoch in tqdm(range(start_epoch, args.num_epochs), disable=not accelerator.is_main_process):
+    # Local alias used inside the training loop
+    lpl_weight = args.lpl_weight
+
+    # Validate LPL requirements once before training starts
+    if lpl_weight > 0 and args.stage == "geometry":
+        if not hasattr(shape_model, "get_decoder_transformer_features"):
+            raise AttributeError(
+                "--lpl_weight > 0 requires get_decoder_transformer_features() "
+                "to be defined on the Stage 1 AlignedShapeLatentPerceiver.\n"
+                "Add the method from lpl_method_to_add.py to "
+                "model/michelangelo/models/tsal/sal_perceiver_dist_changes.py"
+            )
+        if accelerator.is_main_process:
+            print(f"  [LPL] get_decoder_transformer_features() found on shape_model — OK\n")
+
+    for epoch in tqdm(range(start_epoch, args.num_epochs),
+                      disable=not accelerator.is_main_process):
         model.train()
-        epoch_loss = 0.0
-        n_batches  = 0
+        epoch_loss      = 0.0
+        epoch_vpred_std = 0.0
+        epoch_lpl_loss  = 0.0   # tracks L_LPL separately for logging
+        n_batches       = 0
 
         for batch in train_loader:
             features = batch["features"].float().to(device)
@@ -662,12 +739,109 @@ def main():
                 epoch_vpred_std += terms["pred"].std().item()
 
             elif args.stage == "geometry":
-                # Target: z_g [B, 496, 32], conditioned on z_s
-                terms = transport.training_losses(
-                    raw_model, z_g_clean,
-                    model_kwargs={"z_s_clean": z_s_clean},
-                )
-                loss = terms["loss"].mean()
+                if lpl_weight > 0:
+                    # ── LPL training step ──────────────────────────────────────
+                    # We bypass transport.training_losses() to access x_t and t,
+                    # which are needed to reconstruct the clean endpoint estimate.
+                    #
+                    # Two fixes applied vs the initial implementation:
+                    #
+                    # FIX A — Timestep gating (t_min_lpl = 0.6):
+                    #   The endpoint estimate z_g_est = x_t + (1-t)*v_pred is only
+                    #   reliable when t is large (near the data end of the path).
+                    #   The LPL gradient scales as (1-t), so it is STRONGEST at
+                    #   t≈0 (pure noise, worst estimate) and WEAKEST at t≈1
+                    #   (clean data, best estimate). This is backwards.
+                    #   Gating to t>0.6 ensures the endpoint estimate is at least
+                    #   60% data and the gradient comes from reliable examples.
+                    #
+                    # FIX B — Scale normalisation:
+                    #   L_LPL operates on [B,512,384] transformer hidden states
+                    #   whose per-element magnitude is naturally ~22× larger than
+                    #   the latent space L_flow operates on. With weight=0.05,
+                    #   the LPL gradient DOMINATES (1.4× the flow gradient) rather
+                    #   than acting as a small regulariser. Normalising by the
+                    #   clean feature variance makes the scale dataset-independent
+                    #   and stable. Recommended weight: 0.0001–0.001.
+
+                    # Step 1: sample t and noise, build x_t and velocity target
+                    t_samp, x0, _ = transport.sample(z_g_clean)
+                    _, x_t, v_target = transport.path_sampler.plan(t_samp, x0, z_g_clean)
+
+                    # Step 2: predict velocity with current DiT
+                    v_pred = raw_model(x_t, t_samp, z_s_clean=z_s_clean)
+
+                    # Step 3: flow matching loss (standard MSE on velocity)
+                    L_flow = ((v_pred - v_target) ** 2).mean()
+                    epoch_vpred_std += v_pred.std().item()
+
+                    # Step 4: estimate clean endpoint (only for high-t samples)
+                    #   FIX A: only include batch elements where t > t_min_lpl
+                    #   For these, x_t = t*z_clean + (1-t)*noise has majority
+                    #   clean signal, so z_g_est is a reliable estimate.
+                    B_cur     = z_g_clean.shape[0]
+                    t_exp     = t_samp.view(B_cur, 1, 1)              # [B, 1, 1]
+                    t_min_lpl = 0.6
+                    lpl_mask  = (t_samp >= t_min_lpl)                 # [B] bool
+
+                    if lpl_mask.sum() > 0:
+                        # Select only high-t batch elements
+                        z_g_clean_lpl = z_g_clean[lpl_mask]           # [M, 496, 32]
+                        z_s_clean_lpl = z_s_clean[lpl_mask]           # [M,  16, 32]
+                        x_t_lpl       = x_t[lpl_mask]                 # [M, 496, 32]
+                        v_pred_lpl    = v_pred[lpl_mask]               # [M, 496, 32]
+                        t_exp_lpl     = t_exp[lpl_mask]               # [M,  1,   1]
+
+                        z_g_est = x_t_lpl + (1.0 - t_exp_lpl) * v_pred_lpl  # [M, 496, 32]
+
+                        Z_est   = torch.cat([z_s_clean_lpl, z_g_est],   dim=1)  # [M, 512, 32]
+                        Z_clean = torch.cat([z_s_clean_lpl, z_g_clean_lpl], dim=1)  # [M, 512, 32]
+
+                        # Reference features — no gradient needed
+                        with torch.no_grad():
+                            feat_clean = shape_model.get_decoder_transformer_features(Z_clean)
+                            # [M, 512, 384]
+
+                        # Generated features — disable gradient checkpointing.
+                        # checkpoint.py saves inputs via ctx.save_for_backward()
+                        # which DETACHES them, breaking the autograd graph.
+                        # Stage 1 is frozen so checkpointing has no memory benefit.
+                        _uc_saved = {}
+                        for _name, _mod in shape_model.named_modules():
+                            if getattr(_mod, 'use_checkpoint', False):
+                                _uc_saved[_name] = True
+                                _mod.use_checkpoint = False
+
+                        feat_gen = shape_model.get_decoder_transformer_features(Z_est)
+                        # [M, 512, 384]
+
+                        for _name, _mod in shape_model.named_modules():
+                            if _name in _uc_saved:
+                                _mod.use_checkpoint = True
+
+                        # FIX B: normalise LPL by clean feature variance so its
+                        # scale is independent of hidden state magnitude.
+                        # Without this, L_LPL ≈ 33 while L_flow ≈ 1.2 → LPL
+                        # dominates even at weight=0.05.
+                        feat_var = feat_clean.var().detach().clamp(min=1e-6)
+                        L_LPL    = torch.nn.functional.mse_loss(
+                            feat_gen, feat_clean.detach()) / feat_var
+
+                        loss = L_flow + lpl_weight * L_LPL
+                        epoch_lpl_loss += L_LPL.item()
+                    else:
+                        # No high-t samples in this batch — skip LPL
+                        loss = L_flow
+                        epoch_lpl_loss += 0.0
+
+                else:
+                    # ── Standard flow matching (no LPL) ───────────────────────
+                    terms = transport.training_losses(
+                        raw_model, z_g_clean,
+                        model_kwargs={"z_s_clean": z_s_clean},
+                    )
+                    loss = terms["loss"].mean()
+                    epoch_vpred_std += terms["pred"].std().item()
 
             elif args.stage == "completion":
                 loss = completion_training_step(
@@ -685,9 +859,44 @@ def main():
         lr_now   = scheduler.get_last_lr()[0]
 
         if accelerator.is_main_process:
-            print(f"Epoch {epoch:04d} | Loss={avg_loss:.5f} | LR={lr_now:.2e}")
+            print(f"Epoch {epoch:04d} | Loss={avg_loss:.5f} | LR={lr_now:.2e}", end="")
+            if args.stage != "completion":
+                print(f" | v_pred_std={epoch_vpred_std/max(n_batches,1):.4f}", end="")
+            if lpl_weight > 0 and args.stage == "geometry":
+                avg_lpl = epoch_lpl_loss / max(n_batches, 1)
+                print(f" | L_LPL={avg_lpl:.5f}", end="")
+            print()
 
-        # ── Validation ─────────────────────────────────────────────────────
+        # ── Flow diagnostics ────────────────────────────────────────────────
+        if (args.flow_diag_freq > 0 and epoch % args.flow_diag_freq == 0
+                and accelerator.is_main_process and args.stage != "completion"):
+            model.eval()
+            try:
+                db = next(iter(val_loader))
+                df = db["features"].float().to(device)
+                with torch.no_grad():
+                    zs, zg, zc, zl = encode_batch(shape_model, df, args.strategy, s1_meta)
+                target = zg if args.stage == "geometry" else zs
+                mkw    = {"z_s_clean": zs} if args.stage == "geometry" else {}
+                diag   = compute_flow_diagnostics(raw_model, target, mkw)
+                print(f"  [FLOW DIAG epoch {epoch}]")
+                print(f"    t:       mean={diag['t_mean']:.3f}  std={diag['t_std']:.3f}  "
+                      f"(expect ~0.500/~0.289)")
+                print(f"    vtarget: mean={diag['vtarget_mean']:+.4f}  "
+                      f"std={diag['vtarget_std']:.4f}  (expect ~0/~1.41)")
+                print(f"    vpred:   mean={diag['vpred_mean']:+.4f}  "
+                      f"std={diag['vpred_std']:.4f}")
+                print(f"    cosine(vpred,vtarget) = {diag['vpred_vtarget_cosine']:.4f}  "
+                      f"(0=random → 1=perfect)")
+                for i in range(4):
+                    k = f"loss_t{i}"
+                    if k in diag:
+                        print(f"    t_bin_{i} [{i/4:.2f},{(i+1)/4:.2f}]: {diag[k]:.5f}")
+            except Exception as e:
+                print(f"  [FLOW DIAG] Failed: {e}")
+            model.train()
+
+        # ── Validation + PLY saving ──────────────────────────────────────────
         if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
             model.eval()
             val_loss = 0.0;  n_val = 0

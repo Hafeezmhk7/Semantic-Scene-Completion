@@ -2,11 +2,18 @@ compute_environment: LOCAL_MACHINE
 debug: false
 distributed_type: MULTI_GPU
 downcast_bf16: 'no'
+# gpu_ids: all  — let SLURM control which GPUs are visible via CUDA_VISIBLE_DEVICES.
+# DO NOT set gpu_ids to specific indices like '0,1' — on Snellius, SLURM assigns
+# GPUs by physical PCIe bus ID (e.g. '26000'), not logical index 0,1.
+# 'all' correctly uses whatever CUDA_VISIBLE_DEVICES SLURM has set.
 gpu_ids: all
 machine_rank: 0
 main_training_function: main
 mixed_precision: bf16
 num_machines: 1
+# num_processes here is a FALLBACK only.
+# The job script overrides this with --num_processes $NUM_GPUS on the command line,
+# which always matches the --gpus=N in the SLURM header.
 num_processes: 2
 rdzv_backend: static
 same_network: true

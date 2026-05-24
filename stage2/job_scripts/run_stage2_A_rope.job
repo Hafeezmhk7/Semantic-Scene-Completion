@@ -1,0 +1,265 @@
+#!/bin/bash
+#SBATCH --job-name=stage2_A_geometry_rope
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=2
+#SBATCH --time=48:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=120G
+#SBATCH --output=log_ss2/stage2_A_geometry_rope_9599_%j.out
+#SBATCH --error=log_ss2/stage2_A_geometry_rope_9599_%j.err
+
+# ============================================================================
+# CAN3TOK STAGE 2 — Strategy A  (with optional Latent Perceptual Loss)
+# ============================================================================
+#
+# Run in TWO sequential submissions:
+#
+#   Submission 1 — Layout DiT (STAGE=layout, LPL_WEIGHT=0.0):
+#       Learns P(z_s). No LPL needed here — LPL only applies to geometry stage.
+#
+#   Submission 2 — Geometry DiT (STAGE=geometry):
+#       Learns P(z_g | z_s_clean).
+#       Set LPL_WEIGHT > 0 to enable Latent Perceptual Loss.
+#
+# ── What is LPL? ─────────────────────────────────────────────────────────────
+#
+#   Problem: even after distribution matching (KL(gen||prior) ≈ KL(clean||prior)),
+#   generated z_g tokens lie on a different MANIFOLD from encoder z_g tokens.
+#   The expected distance between them is ~211 units in R^15872.
+#   The Stage 1 GS_decoder (777M params) was trained only on encoder manifold
+#   points → degrades for off-manifold Stage 2 inputs.
+#
+#   Solution (Berrada et al., NeurIPS 2024 — "Boosting Latent Diffusion with
+#   Perceptual Objectives"):
+#
+#   At each geometry training step, after computing v_pred:
+#     z_g_est   = x_t + (1-t) * v_pred         [B, 496, 32]  ← endpoint estimate
+#     Z_est     = cat([z_s_clean, z_g_est])     [B, 512, 32]
+#     Z_clean   = cat([z_s_clean, z_g_clean])   [B, 512, 32]
+#     feat_gen  = frozen_decoder_transformer(Z_est)   [B, 512, 384]
+#     feat_clean= frozen_decoder_transformer(Z_clean) [B, 512, 384]  (no_grad)
+#     L_LPL     = MSE(feat_gen, feat_clean)
+#     L_total   = L_flow + LPL_WEIGHT * L_LPL
+#
+#   Gradient path: L_LPL → feat_gen → Z_est → z_g_est → v_pred → DiT params
+#   Stage 1 decoder weights: frozen (requires_grad=False), NOT updated.
+#
+# ── PREREQUISITE ─────────────────────────────────────────────────────────────
+#
+#   Before enabling LPL, add get_decoder_transformer_features() to
+#   AlignedShapeLatentPerceiver in:
+#     model/michelangelo/models/tsal/sal_perceiver_dist_changes.py
+#
+#   The method is provided in lpl_method_to_add.py.  Insert it between
+#   the encode() and decode() methods of AlignedShapeLatentPerceiver.
+#
+# ── MEMORY NOTE ──────────────────────────────────────────────────────────────
+#
+#   LPL adds ~3.3GB activation memory per GPU for the decoder transformer
+#   backward pass.  On H100 (80GB) this is well within budget.
+#   If OOM: reduce batch size by 8 (e.g. BATCH_SIZE=56 instead of 64).
+#
+# ============================================================================
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# ── Stage 1 checkpoint (Strategy A — latent_disentangle=True) ────────────────
+STAGE1_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints/RGB_job_21860551_hidden_colorresidual_disent512_fourierpe_layout_semTok_poolNCE_pgNCE_inferencefixed/best_model.pth"
+STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+
+# ── Step: layout (Submission 1) | geometry (Submission 2) ────────────────────
+STAGE="geometry"           # layout | geometry
+
+# ── Layout checkpoint — required for STAGE=geometry ──────────────────────────
+LAYOUT_CKPT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage2/stage2_A_layout_B_22414639"
+
+# ── z_s conditioning ─────────────────────────────────────────────────────────
+ZS_CONDITIONING="cross_attn"   # cross_attn | adaLN
+
+# ── Resume a previous geometry run (optional) ─────────────────────────────────
+RESUME_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage2/stage2_A_geometry_cross_attn_B_22949599/best_model.pth"
+
+# ── Model size ────────────────────────────────────────────────────────────────
+MODEL_SIZE="B"
+
+# ── Positional encoding — ablation ────────────────────────────────────────────
+#
+# ROPE_TYPE controls positional encoding for the geometry DiT.
+# Run three separate jobs to compare (change only ROPE_TYPE, keep all else equal):
+#
+#   'learned_ape'  DEFAULT — ViT-style learned APE added at input.
+#                  Same as all previous runs (baseline).
+#
+#   '1d'           1-D RoPE applied to Q and K at every attention block.
+#                  Encodes relative sequence index (0→495) in Q·K products.
+#                  Based on: RoFormer (Su et al., arXiv:2104.09864)
+#
+#   '3d'           3-D RoPE. head_dim split d_x=10 + d_y=10 + d_z=12.
+#                  Token i mapped to grid (i%8, (i//8)%8, i//64) in 8×8×8 cube.
+#                  Encodes 3D spatial proximity in attention at every layer.
+#                  Based on: VideoRoPE / RoPE-3D (2024)
+#
+ROPE_TYPE="learned_ape"
+
+# ── Training ──────────────────────────────────────────────────────────────────
+BATCH_SIZE=64
+NUM_EPOCHS=5000
+LR=1e-4
+WEIGHT_DECAY=1e-2
+WARMUP_STEPS=500
+LR_MIN_RATIO=0.05
+EVAL_EVERY=50
+TRAIN_SCENES=300
+VAL_SCENES=50
+
+# ── Latent Perceptual Loss ────────────────────────────────────────────────────
+#
+# Set LPL_WEIGHT=0.0 to run WITHOUT LPL (standard flow matching, baseline).
+# Set LPL_WEIGHT > 0  to run WITH    LPL (addresses manifold gap).
+#
+# IMPORTANT: the previous run with LPL_WEIGHT=0.05 was too large.
+# With LPL_WEIGHT=0.05, the weighted LPL term dominated the flow matching
+# loss (1.4× larger gradient). This caused:
+#   - Val loss 2× worse than baseline at epoch 1000
+#   - Fréchet distance 4.5× worse than baseline
+#   - std_ratio overshooting to 1.13 (tokens too spread out)
+#
+# Two fixes applied in train_stage2.py:
+#   1. Timestep gating: LPL only computed for t > 0.6 (reliable endpoint estimates)
+#   2. Feature variance normalisation: L_LPL divided by feat_clean.var()
+#      so the scale is ≈1.0 and comparable to L_flow
+#
+# After normalisation, L_LPL ≈ 1.0 (same scale as L_flow ≈ 1.2).
+# Recommended starting weights:
+#   0.00  — baseline (no LPL)                ← compare against this first
+#   0.01  — gentle LPL (≈1% of total loss)   ← start here
+#   0.05  — moderate LPL (≈5% of total loss)
+#
+LPL_WEIGHT=0.00
+
+# ── Visualization & diagnostics ────────────────────────────────────────────────
+VIS_FREQ=0
+VIS_NUM_SCENES=4
+VIS_NUM_STEPS=50
+FLOW_DIAG_FREQ=50
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+# ── GPU count — must match --gpus=N in the SLURM header above ────────────────
+# DO NOT manually export CUDA_VISIBLE_DEVICES.
+# Snellius assigns GPUs by physical PCIe bus ID (e.g. "26000"), not index 0/1.
+# SLURM sets CUDA_VISIBLE_DEVICES correctly for the allocated devices.
+# Our only job: tell accelerate how many processes to spawn, matching --gpus.
+#
+# We derive NUM_GPUS from SLURM so the count is always consistent:
+#   SLURM_GPUS        = "2"          (set by --gpus=2)
+#   SLURM_GPUS_ON_NODE= "2"          (set on single-node jobs)
+#   fallback          = 2
+NUM_GPUS="${SLURM_GPUS:-${SLURM_GPUS_ON_NODE:-2}}"
+echo "NUM_GPUS=$NUM_GPUS  CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+
+mkdir -p logs log_ss2
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+if [[ "$STAGE1_CHECKPOINT" == *"<YOUR"* ]]; then
+    echo "ERROR: Set STAGE1_CHECKPOINT before submitting."
+    exit 1
+fi
+if [ "$STAGE" = "geometry" ] && [ -z "$LAYOUT_CKPT" ]; then
+    echo "ERROR: Set LAYOUT_CKPT for --stage geometry."
+    exit 1
+fi
+
+echo "========================================================================"
+echo "  Stage 2 — Strategy A — Stage: $STAGE"
+if [ "$STAGE" = "geometry" ]; then
+    echo "  z_s conditioning: $ZS_CONDITIONING"
+    if (( $(echo "$LPL_WEIGHT > 0" | bc -l) )); then
+        echo "  Latent Perceptual Loss: ENABLED  (weight=$LPL_WEIGHT)"
+        echo "  Prerequisite: get_decoder_transformer_features() in sal_perceiver_dist_changes.py"
+    else
+        echo "  Latent Perceptual Loss: DISABLED  (LPL_WEIGHT=0.0)"
+    fi
+fi
+echo "  Stage 1: $STAGE1_CHECKPOINT"
+echo "  Model size: $MODEL_SIZE"
+echo "========================================================================"
+
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+
+ACCELERATE_CONFIG="./job_scripts/accelerate_config.yaml"
+
+# --num_processes on the command line overrides whatever num_processes is in
+# the config file. This guarantees the process count always matches --gpus=N.
+CMD="accelerate launch --config_file $ACCELERATE_CONFIG --num_processes $NUM_GPUS --num_machines 1 stage2/train_stage2.py"
+CMD="$CMD --strategy A --stage $STAGE"
+CMD="$CMD --stage1_checkpoint $STAGE1_CHECKPOINT"
+CMD="$CMD --stage1_config $STAGE1_CONFIG"
+CMD="$CMD --model_size $MODEL_SIZE"
+CMD="$CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+CMD="$CMD --lr $LR --weight_decay $WEIGHT_DECAY"
+CMD="$CMD --warmup_steps $WARMUP_STEPS --lr_min_ratio $LR_MIN_RATIO"
+CMD="$CMD --eval_every $EVAL_EVERY"
+CMD="$CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
+CMD="$CMD --vis_freq $VIS_FREQ --vis_num_scenes $VIS_NUM_SCENES --vis_num_steps $VIS_NUM_STEPS"
+CMD="$CMD --flow_diag_freq $FLOW_DIAG_FREQ"
+CMD="$CMD --lpl_weight $LPL_WEIGHT"
+
+if [ "$STAGE" = "geometry" ]; then
+    CMD="$CMD --zs_conditioning $ZS_CONDITIONING"
+    CMD="$CMD --rope_type $ROPE_TYPE"
+fi
+[ -n "$RESUME_CHECKPOINT" ] && CMD="$CMD --resume_checkpoint $RESUME_CHECKPOINT"
+
+echo "Command: $CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $CMD
+EXIT=$?
+echo ""
+echo "Exit: $EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+if [ $EXIT -eq 0 ]; then
+    echo ""
+    echo "COMPLETED — Strategy A, stage=$STAGE, lpl_weight=$LPL_WEIGHT"
+    if [ "$STAGE" = "layout" ]; then
+        echo ""
+        echo "  Next steps:"
+        echo "    1. Set LAYOUT_CKPT to the best_model.pth from this run"
+        echo "    2. Set STAGE=geometry"
+        echo "    3. Run twice to compare: LPL_WEIGHT=0.0 (baseline) vs LPL_WEIGHT=0.01 (LPL)"
+        echo ""
+        echo "  This layout checkpoint can also be reused for Strategy D."
+    else
+        LPL_TAG=$([ $(echo "$LPL_WEIGHT > 0" | bc -l) -eq 1 ] && echo "lpl${LPL_WEIGHT}" || echo "nolpl")
+        echo ""
+        echo "  To compare baseline vs LPL, run the latent distribution diagnostic:"
+        echo "  The diagnostic will print Fréchet/dim and KL(gen||clean) —"
+        echo "  lower values with LPL = manifold gap has been reduced."
+    fi
+else
+    echo "FAILED (exit $EXIT)"
+    echo "  cat log_ss2/stage2_A_geometry_lpl_${SLURM_JOB_ID}.err | tail -30"
+fi

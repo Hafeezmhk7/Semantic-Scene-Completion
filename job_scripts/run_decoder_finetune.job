@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=decoder_finetune
+#SBATCH --job-name=decoder_finetune_7121
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 #SBATCH --time=4:00:00
@@ -65,7 +65,7 @@ STAGE1_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints
 # ── Stage 2 geometry DiT (best checkpoint — use epoch 1400 from baseline run) ─
 # The baseline run (job 685) achieved best val loss 0.40481 at epoch 1400.
 # Use that checkpoint here. Fréchet/dim = 0.094 at epoch 1400 is good.
-GEOMETRY_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage2/stage2_A_geometry_cross_attn_B_22662167/best_model.pth"
+GEOMETRY_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage2/stage2_A_geometry_cross_attn_B_23067121/best_model.pth"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
@@ -74,7 +74,7 @@ STAGE1_CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 OUTPUT_DIR="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_decoder_ft/decoder_ft_${SLURM_JOB_ID}"
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
-NUM_EPOCHS=200          # 200 is sufficient; can extend to 500 if still improving
+NUM_EPOCHS=1000          # 200 is sufficient; can extend to 500 if still improving
 BATCH_SIZE=32           # 32 fits easily on H100 with 2× GS decoder in memory
 LR=1e-5                 # 10× smaller than Stage 1 (1e-4) to prevent forgetting
 WEIGHT_DECAY=1e-4

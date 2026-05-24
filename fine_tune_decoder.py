@@ -254,8 +254,10 @@ def main():
     geom_strategy = geom_ckpt.get("strategy",        "A")
     geom_size     = geom_ckpt.get("model_size",       "B")
     geom_zs_cond  = geom_ckpt.get("zs_conditioning", "cross_attn")
+    geom_rope     = geom_ckpt.get("rope_type",        "learned_ape")
 
-    geometry_model = build_stage2_model(geom_strategy, "geometry", geom_size, geom_zs_cond)
+    geometry_model = build_stage2_model(geom_strategy, "geometry", geom_size,
+                                        geom_zs_cond, geom_rope)
     geometry_model.load_state_dict(geom_ckpt["model_state_dict"])
     geometry_model.to(device).eval()
     for p in geometry_model.parameters():
