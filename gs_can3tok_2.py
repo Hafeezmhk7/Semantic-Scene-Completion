@@ -523,7 +523,7 @@ gs_dataset_train = gs_dataset(
     position_layout_residual=args.position_layout_residual)
 trainDataLoader = Data.DataLoader(
     dataset=gs_dataset_train, batch_size=args.batch_size,
-    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=False)
+    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True)
 
 print(f"\n--- Validation Dataset ---")
 gs_dataset_val = gs_dataset(
@@ -539,7 +539,7 @@ gs_dataset_val = gs_dataset(
     position_layout_residual=args.position_layout_residual)
 valDataLoader = Data.DataLoader(
     dataset=gs_dataset_val, batch_size=args.batch_size,
-    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=False)
+    shuffle=False, num_workers=9, pin_memory=True, persistent_workers=True)
 
 if accelerator.is_main_process:
     print(f"\n  Train: {len(gs_dataset_train)} scenes | Val: {len(gs_dataset_val)} scenes")

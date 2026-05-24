@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=1
-#SBATCH --time=48:00:00
+#SBATCH --gpus=2
+#SBATCH --time=1:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
-#SBATCH --mem=160G
-#SBATCH --output=logs_ss1/can3tok_mkl%j.out
-#SBATCH --error=logs_ss1/can3tok_mkl%j.err
+#SBATCH --mem=180G
+#SBATCH --output=logs_ss1/can3tok_3_8scene%j.out
+#SBATCH --error=logs_ss1/can3tok_3_8kscene%j.err
 
 # ============================================================================
 # CAN3TOK — DECODER STRATEGIES
@@ -92,7 +92,7 @@ SEMANTIC_TOKEN_HEADS=True
 # PCA vis: zs_pool_epoch_NNN.ply  (one point per scene)
 # Log:     PoolNCE= and PoolNCats= in epoch print
 ZS_POOL_INFONCE_WEIGHT=0.3
-ZS_POOL_INFONCE_TEMPERATURE=0.07
+ZS_POOL_INFONCE_TEMPERATURE=0.10
 
 # ── z_layout InfoNCE (NEW — prototype NCE, same mechanism as per-Gaussian) ───
 # Works for all strategies. Requires DECODER_LAYOUT_* or LATENT_DISENTANGLE.
@@ -114,7 +114,7 @@ Z_S_INFONCE_DELTA=0.4
 SEMANTIC_MODE="hidden"
 SEGMENT_WEIGHT=0.3
 INSTANCE_WEIGHT=0.0
-SEMANTIC_TEMP=0.07
+SEMANTIC_TEMP=0.10
 SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
 
@@ -132,10 +132,10 @@ SCALE_PENALTY_WEIGHT=0.0
 SCALE_PENALTY_THRESHOLD=0.5
 
 # ── Core training ─────────────────────────────────────────────────────────────
-BATCH_SIZE=64
+BATCH_SIZE=90
 NUM_EPOCHS=2000
-LEARNING_RATE=1e-4
-KL_WEIGHT=1e-4
+LEARNING_RATE=2e-4
+KL_WEIGHT=1e-5
 EVAL_EVERY=50
 WEIGHT_DECAY=1e-2
 WARMUP_STEPS=300
@@ -143,7 +143,7 @@ LR_MIN_RATIO=0.1
 FAILURE_THRESHOLD=100
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
-TRAIN_SCENES=300
+TRAIN_SCENES=3800
 VAL_SCENES=50
 SAMPLING_METHOD="opacity"
 USE_CANONICAL_NORM=True
@@ -159,13 +159,13 @@ SCALE_NORM_MODE="linear"
 PCA_VIS_FREQ=500
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
-RECON_PLY_FREQ=50
+RECON_PLY_FREQ=100
 RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 export WANDB_API_KEY="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"
-USE_WANDB=False
+USE_WANDB=True
 
 # ============================================================================
 # VALIDATION
