@@ -1,0 +1,175 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_diag
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=1:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --output=logs_ss1/diagnostic_%j.out
+#SBATCH --error=logs_ss1/diagnostic_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
+mkdir -p logs_ss1 diagnostics
+
+# ============================================================================
+# PATHS
+# ============================================================================
+DATA_CHUNKS="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
+DATA_FULL="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train"
+CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage1/RGB_job_23106852_hidden_colorresidual_disent512_fourierpe_layout_semTok_poolNCE_pgNCE_inferencefixed/best_model.pth"
+CONFIG="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+
+# Use v2 if available (faster: 10k gaussians, GPU), else fall back to v1
+if [ -f "diagnose_v2.py" ]; then
+    DIAG_SCRIPT="diagnose_v2.py"
+    FULL_FLAG="--full_scenes"
+else
+    DIAG_SCRIPT="diagnose_chunk_contradiction.py"
+    FULL_FLAG=""
+    echo "WARNING: diagnose_v2.py not found, using v1 (slower)"
+fi
+
+echo ""
+echo "Using diagnostic script: $DIAG_SCRIPT"
+echo "GPU available: $(python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")')"
+echo ""
+
+# ============================================================================
+# DIAGNOSTIC 1: Grid chunks with real encoder
+# ============================================================================
+echo "========================================================"
+echo "  DIAGNOSTIC 1: Grid Chunks (3800 chunks from 800 rooms)"
+echo "========================================================"
+echo "Start: $(date)"
+
+python $DIAG_SCRIPT \
+    --data_path  $DATA_CHUNKS \
+    --mode       checkpoint \
+    --checkpoint $CHECKPOINT \
+    --config     $CONFIG \
+    --max_scenes 50 \
+    --pairs_per_scene 5 \
+    --output     ./diagnostics/chunks_checkpoint_${SLURM_JOB_ID}.npz
+
+echo "Finished: $(date)"
+echo ""
+
+# ============================================================================
+# DIAGNOSTIC 2: Full scenes with real encoder
+# ============================================================================
+echo "========================================================"
+echo "  DIAGNOSTIC 2: Full Scenes (800 complete rooms)"
+echo "========================================================"
+echo "Start: $(date)"
+
+python $DIAG_SCRIPT \
+    --data_path  $DATA_FULL \
+    --mode       checkpoint \
+    --checkpoint $CHECKPOINT \
+    --config     $CONFIG \
+    --max_scenes 50 \
+    --pairs_per_scene 5 \
+    $FULL_FLAG \
+    --output     ./diagnostics/fullscenes_checkpoint_${SLURM_JOB_ID}.npz
+
+echo "Finished: $(date)"
+echo ""
+
+# ============================================================================
+# SUMMARY COMPARISON
+# ============================================================================
+echo "========================================================"
+echo "  COMPARISON SUMMARY"
+echo "========================================================"
+
+python - << 'PYEOF'
+import numpy as np, sys
+from pathlib import Path
+
+# Find the most recent diagnostic files
+diag_dir = Path('./diagnostics')
+chunk_files = sorted(diag_dir.glob('chunks_checkpoint_*.npz'))
+full_files  = sorted(diag_dir.glob('fullscenes_checkpoint_*.npz'))
+
+if not chunk_files:
+    print("ERROR: No chunk diagnostic file found"); sys.exit(1)
+
+chunk_data = np.load(chunk_files[-1])
+
+print(f"\nLoaded: {chunk_files[-1].name}")
+print(f"\n{'='*60}")
+print(f"  CHUNK RESULTS (grid chunks, 3800 total)")
+print(f"{'='*60}")
+print(f"  z cosine sim intra-scene: {chunk_data['intra_z_sims'].mean():.6f} ± {chunk_data['intra_z_sims'].std():.6f}")
+print(f"  z cosine sim inter-scene: {chunk_data['inter_z_sims'].mean():.6f} ± {chunk_data['inter_z_sims'].std():.6f}")
+print(f"  z sim std (all pairs):    {np.concatenate([chunk_data['intra_z_sims'], chunk_data['inter_z_sims']]).std():.6f}")
+print(f"  pos sim intra-scene:      {chunk_data['intra_pos_sims'].mean():.4f}")
+print(f"  pos sim inter-scene:      {chunk_data['inter_pos_sims'].mean():.4f}")
+print(f"  contradiction score:      {chunk_data['contradiction_score']:.4f}")
+
+if full_files:
+    full_data = np.load(full_files[-1])
+    print(f"\nLoaded: {full_files[-1].name}")
+    print(f"\n{'='*60}")
+    print(f"  FULL SCENE RESULTS (800 complete rooms)")
+    print(f"{'='*60}")
+
+    if 'z_std' in full_data:
+        print(f"  z std across full scenes: {full_data['z_std']:.6f}")
+    if 'inter_z_sims' in full_data:
+        print(f"  z cosine sim between scenes: {full_data['inter_z_sims'].mean():.6f} ± {full_data['inter_z_sims'].std():.6f}")
+        print(f"  z sim std (all pairs):       {full_data['inter_z_sims'].std():.6f}")
+
+    print(f"\n{'='*60}")
+    print(f"  KEY COMPARISON")
+    print(f"{'='*60}")
+
+    chunk_z_std = np.concatenate([chunk_data['intra_z_sims'], chunk_data['inter_z_sims']]).std()
+
+    if 'inter_z_sims' in full_data:
+        full_z_std = full_data['inter_z_sims'].std()
+        ratio = full_z_std / (chunk_z_std + 1e-8)
+        print(f"  z variation ratio (full/chunk): {ratio:.1f}x")
+        print()
+        if ratio > 10:
+            print(f"  FINDING: Encoder discriminates full scenes {ratio:.0f}x better than chunks.")
+            print(f"  Chunks collapse to near-identical z — encoder has no signal for position.")
+            print(f"  ROOT CAUSE CONFIRMED: per-chunk normalisation destroys position information.")
+            print(f"  FIX: Train on full scenes.")
+        elif ratio > 3:
+            print(f"  FINDING: Encoder partially discriminates (ratio={ratio:.1f}x).")
+            print(f"  Chunks harder to distinguish than full scenes but not impossible.")
+            print(f"  More epochs or stronger regularisation may help.")
+        else:
+            print(f"  FINDING: Encoder discriminates similarly for both (ratio={ratio:.1f}x).")
+            print(f"  The problem is NOT encoder discrimination.")
+            print(f"  Look at decoder capacity or learning dynamics instead.")
+else:
+    print("\nFull scene diagnostic not yet complete.")
+    chunk_z_std = np.concatenate([chunk_data['intra_z_sims'], chunk_data['inter_z_sims']]).std()
+    print(f"\n  Random proxy gave z_std = 0.002413")
+    print(f"  Real encoder gives z_std = {chunk_z_std:.6f}")
+    ratio = chunk_z_std / 0.002413
+    print(f"  Ratio vs random:          {ratio:.1f}x")
+    if ratio < 3:
+        print(f"  Trained encoder barely better than random at distinguishing chunks.")
+    else:
+        print(f"  Trained encoder does distinguish chunks ({ratio:.1f}x better than random).")
+
+PYEOF
+
+echo ""
+echo "All diagnostics complete. End: $(date)"
+echo ""
+echo "To view results:"
+echo "  cat logs_ss1/diagnostic_${SLURM_JOB_ID}.out"

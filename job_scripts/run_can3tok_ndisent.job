@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=can3tok
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=4
-#SBATCH --time=5:00:00
+#SBATCH --gpus=2
+#SBATCH --time=18:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=36
-#SBATCH --mem=160G
-#SBATCH --output=logs_ss1/can3tok_%j.out
-#SBATCH --error=logs_ss1/can3tok_%j.err
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=90G
+#SBATCH --output=logs_ss1/can3tok_nodisent_%j.out
+#SBATCH --error=logs_ss1/can3tok_nodisent_%j.err
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
@@ -28,7 +28,7 @@ echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 #                HELD-OUT CHUNK VAL: the first TRAIN_SCENES sorted chunks go
 #                  to training. The remaining (3888 - TRAIN_SCENES) are used
 #                  as a second validation set (in-distribution diagnostic).
-#                  Set TRAIN_SCENES=3800 → 88 held-out chunks for chunk val.
+#                  Set TRAIN_SCENES=800 → 88 held-out chunks for chunk val.
 #                  Set TRAIN_SCENES=3888 (or blank) → no held-out chunks.
 #                PRE-FLIGHT: this script verifies norm_factor.npy presence
 #                  before launching to catch missing precomputation early.
@@ -60,28 +60,45 @@ DECODER_LAYOUT_CROSS_ATTN=False
 DECODER_LAYOUT_ADDITIVE=False
 
 # ── Latent disentanglement ────────────────────────────────────────────────────
-LATENT_DISENTANGLE=True
+# ABLATION: disentanglement DISABLED.
+# Effect on architecture:
+#   - mu_s_proj_mean/var and kl_emb_proj_mean_g/var are REMOVED
+#   - z is a single flat 16384-d vector (not split into z_s[512]+z_g[15872])
+#   - z_s_infonce_head and zs_pool_proj_head are REMOVED
+# Effect on losses:
+#   - cross_recon=0: no z_s/z_g split → no meaningful cross-scene swap
+#   - ortho_weight=0: no z_s/z_g to orthogonalise
+#   - zs_pool_infonce=0: no z_s tokens to pool
+# Still active: scene_layout_head, scene_semantic_head (use shape_embed),
+#               per-Gaussian InfoNCE (uses decoder hidden states),
+#               segment_loss, color_residual, decoder_fourier_pe
+LATENT_DISENTANGLE=False
 SEMANTIC_DIMS=512
-CROSS_RECON_WEIGHT=0.3
-ORTHO_WEIGHT=0.1
+CROSS_RECON_WEIGHT=0.0
+ORTHO_WEIGHT=0.0
 
 # ── Color ─────────────────────────────────────────────────────────────────────
 COLOR_RESIDUAL=True
-MEAN_COLOR_WEIGHT=0.5
-COLOR_LOSS_WEIGHT=2.0
+MEAN_COLOR_WEIGHT=1
+COLOR_LOSS_WEIGHT=1
 
 # ── Structured token split ────────────────────────────────────────────────────
-STRUCTURED_LAYOUT_TOKENS=True
+# Disabled: structured_layout_tokens splits z by semantic_dims/embed_dim
+# which is only meaningful when latent_disentangle=True.
+STRUCTURED_LAYOUT_TOKENS=False
 
 # ── Semantic / layout heads ───────────────────────────────────────────────────
 SCENE_SEMANTIC_HEAD=True
 SCENE_SEMANTIC_WEIGHT=0.3
 SCENE_LAYOUT_HEAD=True
 LAYOUT_LOSS_WEIGHT=0.3
-SEMANTIC_TOKEN_HEADS=True
+# Disabled: semantic_token_heads requires latent_disentangle=True.
+# Model raises ValueError if both are not aligned.
+SEMANTIC_TOKEN_HEADS=False
 
 # ── z_s pool InfoNCE ─────────────────────────────────────────────────────────
-ZS_POOL_INFONCE_WEIGHT=0.3
+# Disabled: no z_s tokens exist without latent_disentangle=True.
+ZS_POOL_INFONCE_WEIGHT=0.0
 ZS_POOL_INFONCE_TEMPERATURE=0.10
 
 # ── Other InfoNCE (off by default) ───────────────────────────────────────────
@@ -116,31 +133,46 @@ SCALE_PENALTY_THRESHOLD=0.5
 
 # ── Core training ─────────────────────────────────────────────────────────────
 BATCH_SIZE=90
-NUM_EPOCHS=2000
-# LR=8e-4 is safe with the current protections:
-#   1. log_var.clamp(-10,10) hard-caps KL explosion regardless of LR
-#   2. KL annealing prevents the encoder building a non-Gaussian posterior
-#      before regularisation kicks in
-# The explosion in doc 20 required all three conditions: lr=8e-4 AND no clamp
-# AND no annealing. With (2) and (3) in place, lr=8e-4 is correct.
-# Using lr=4e-4 (sqrt scaling) makes position convergence ~2× slower with
-# no safety benefit, wasting a 13-hour GPU allocation.
-LEARNING_RATE=4e-4
-KL_WEIGHT=5e-5
+NUM_EPOCHS=3000
+# lr=1e-4: proven optimal in Run 3 (1500 chunks, val L2=6.46).
+# Run 3 had HALF the LR of Run 1 (2e-4) and achieved 4.5x better results.
+# The gain is from warm restarts + lower LR, not higher LR.
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-5
 # KL annealing: ramp kl_weight linearly from 0 → KL_WEIGHT over KL_ANNEAL_STEPS
 # optimizer steps. Prevents the epoch-50 KL explosion caused by the encoder
 # building up a non-Gaussian posterior before the KL penalty becomes relevant.
 #
 # COMPUTING THE RIGHT VALUE:
 #   steps_per_epoch = ceil(TRAIN_SCENES / (BATCH_SIZE × num_GPUs))
-#   4 GPU: ceil(3800 / (90 × 4)) ≈ 11 steps/epoch
-#   1 GPU: ceil(3800 / (90 × 1)) ≈ 42 steps/epoch
-#   Recommended ramp duration: 100-200 epochs of training data
-#     4 GPU, 200 epoch ramp: KL_ANNEAL_STEPS = 200 × 11 = 2200  ← default
-#     1 GPU, 200 epoch ramp: KL_ANNEAL_STEPS = 200 × 42 = 8400
-#   Set to 0 to disable annealing (fixed kl_weight from step 1, old behaviour).
-KL_ANNEAL_STEPS=2200
-EVAL_EVERY=50
+#   4 GPU: ceil(3800 / (90 × 4)) = 11 steps/epoch
+#   1 GPU: ceil(3800 / (90 × 1)) = 43 steps/epoch
+#   Recommended ramp duration: ~200 epochs
+#     4 GPU, 200 epoch ramp: KL_ANNEAL_STEPS = 200 × 11 = 2200  ← used here
+#     1 GPU, 200 epoch ramp: KL_ANNEAL_STEPS = 200 × 43 = 8600
+#   Verified: doc 17 (1 GPU, kl_anneal_steps=2200) reached kl_weight=5e-5
+#   at epoch 51 (2200/43=51) — confirmed correct for that run.
+#   On 4 GPU with kl_anneal_steps=2200: ramp completes at epoch 200 as intended.
+#   Set to 0 to disable annealing (fixed kl_weight, old behaviour).
+KL_ANNEAL_STEPS=0
+# ── Cosine warm restarts ──────────────────────────────────────────────────────
+# PROVEN in Run 3 (1500 chunks, T0≈900 epochs, lr=1e-4):
+#   val L2=6.46 vs Run 1 (3800 chunks, no restarts, lr=2e-4) val L2=29.04.
+#   Run 3 had LESS data and LOWER LR but 4.5x better convergence.
+#   Each restart lets the optimizer escape local minima (encoder KL spikes
+#   briefly then drops lower — confirmed healthy re-exploration).
+#
+# T0 = restart period in EPOCHS (0 = single cosine, old behaviour).
+# Target 3-5 complete cycles over total training budget:
+#   3000 epochs / T0=800 = 3.75 cycles  ← used here for 3800 chunks
+# Schedule within each cycle: peak→floor over T0/2 epochs, floor→peak over T0/2.
+# Floor = lr * lr_min_ratio = 1e-4 * 0.1 = 1e-5.
+LR_RESTART_T0=800
+# EVAL_EVERY=20: doc 17 (1 GPU) showed val full L2 peaked at epoch 50 (134.82)
+# then regressed to 135.26 by epoch 100. EVAL_EVERY=50 would miss the best
+# checkpoint if the peak is sharp. EVAL_EVERY=20 adds ~2% eval overhead but
+# ensures the best model is captured with ±10 epoch resolution.
+EVAL_EVERY=20
 WEIGHT_DECAY=1e-2
 WARMUP_STEPS=300
 LR_MIN_RATIO=0.1
@@ -160,14 +192,49 @@ FAILURE_THRESHOLD=100
 TRAIN_SCENES=3800
 VAL_SCENES=50
 SAMPLING_METHOD="opacity"
+
+# ── Extra training datasets ───────────────────────────────────────────────────
+# Colon-separated list of extra scene directories to add on top of TRAIN_DATA.
+# Each directory must contain scene subdirectories with coord.npy, color.npy,
+# scale.npy, quat.npy, opacity.npy (standard SceneSplat layout).
+# Semantics are automatically disabled for extra paths (different label spaces).
+# Reconstruction and geometry losses are completely unaffected.
+#
+# To use all three datasets, uncomment and set:
+#   EXTRA_TRAIN_PATHS="/home/yli7/scratch/datasets/gaussian_world/preprocessed/arkitscenes_mcmc_3dgs/train:/home/yli7/scratch/datasets/gaussian_world/preprocessed/scannetpp_v2_mcmc_3dgs_lang_large_new/train"
+#   EXTRA_TRAIN_SCENES="1290:906"   # 0 = all scenes from that path
+#
+# To use only ArkitScenes:
+#   EXTRA_TRAIN_PATHS="/home/yli7/scratch/datasets/gaussian_world/preprocessed/arkitscenes_mcmc_3dgs/train"
+#   EXTRA_TRAIN_SCENES="1290"
+#
+# Leave empty to use only TRAIN_DATA (original behaviour, fully backward compatible):
+EXTRA_TRAIN_PATHS=""
+EXTRA_TRAIN_SCENES=""
+
 USE_CANONICAL_NORM=True
+
+# ── Chunk normalization ───────────────────────────────────────────────────────
+# Controls whether grid chunks use norm_factor.npy (global coordinate frame).
+#
+# True  [DEFAULT]: all chunks of a room share one norm_factor.npy computed from
+#   their spatial union → same physical location = same target coordinates in
+#   every chunk → position loss converges cleanly.
+#
+# False [ABLATION]: ignore norm_factor.npy even when present. Each chunk is
+#   normalized into its own local sphere. Same physical point → different targets
+#   in different chunks → gradient cancellation → position stalls at ~2300.
+#   Set to False to confirm experimentally that global frame = convergence.
+#
+# Full scenes / ArkitScenes / ScanNet++ are unaffected (no norm_factor.npy).
+CHUNK_NORM_FACTOR=True
 SCALE_NORM_MODE="linear"
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
 PCA_VIS_FREQ=500
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
-RECON_PLY_FREQ=100
+RECON_PLY_FREQ=500
 RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
@@ -295,7 +362,7 @@ TRAIN_CMD="$TRAIN_CMD --train_data $TRAIN_DATA"
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE --kl_weight $KL_WEIGHT --kl_anneal_steps $KL_ANNEAL_STEPS"
 TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY --warmup_steps $WARMUP_STEPS"
-TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO --lr_restart_T0 $LR_RESTART_T0 --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
 
@@ -343,7 +410,8 @@ TRAIN_CMD="$TRAIN_CMD --scale_penalty_weight $SCALE_PENALTY_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --scale_penalty_threshold $SCALE_PENALTY_THRESHOLD"
 
 TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
-[ "$USE_CANONICAL_NORM" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+[ "$USE_CANONICAL_NORM"  = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+[ "$CHUNK_NORM_FACTOR"   = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_chunk_norm_factor"
 
 TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ --pca_num_scenes $PCA_NUM_SCENES"
 TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
@@ -356,6 +424,10 @@ if [ -n "$RESUME_CHECKPOINT" ]; then
     TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
     [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
 fi
+
+# Extra training datasets (only appended when non-empty)
+[ -n "$EXTRA_TRAIN_PATHS"  ] && TRAIN_CMD="$TRAIN_CMD --extra_train_paths $EXTRA_TRAIN_PATHS"
+[ -n "$EXTRA_TRAIN_SCENES" ] && TRAIN_CMD="$TRAIN_CMD --extra_train_scenes $EXTRA_TRAIN_SCENES" 
 
 echo "Command: $TRAIN_CMD"
 echo ""

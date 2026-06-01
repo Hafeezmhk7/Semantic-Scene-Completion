@@ -1,0 +1,64 @@
+#!/bin/bash
+#SBATCH --job-name=precompute_norm
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=32G
+#SBATCH --time=0:30:00
+#SBATCH --output=logs_ss1/precompute_norm_%j.out
+#SBATCH --error=logs_ss1/precompute_norm_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+echo "Note: GPU allocated but not used — only CPUs needed for precomputation"
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
+mkdir -p logs_ss1
+
+CHUNKS_DIR="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
+
+# ============================================================================
+# STEP 1: Precompute norm_factor.npy for all 3888 chunks
+# ============================================================================
+echo ""
+echo "========================================================"
+echo "  STEP 1: Precomputing norm_factor.npy"
+echo "  Combining all chunks per scene → global coordinate frame"
+echo "  800 scenes x ~5 chunks each = 3888 norm_factor.npy files"
+echo "========================================================"
+echo "Start: $(date)"
+
+python precompute_norm_from_chunks.py \
+    --chunks_dir $CHUNKS_DIR \
+    --workers    9
+
+echo "Finished: $(date)"
+
+# ============================================================================
+# STEP 2: Verify all chunks have consistent norm_factor.npy
+# ============================================================================
+echo ""
+echo "========================================================"
+echo "  STEP 2: Verification"
+echo "  Checking all chunks from same scene share one norm_factor"
+echo "========================================================"
+
+python precompute_norm_from_chunks.py \
+    --chunks_dir $CHUNKS_DIR \
+    --verify_only
+
+echo ""
+echo "========================================================"
+echo "  DONE. Next steps:"
+echo "  1. Replace gs_dataset_scenesplat.py with the updated version"
+echo "  2. Re-run the diagnostic to confirm pos_intra > pos_inter"
+echo "  3. Submit training job on 3800 chunks"
+echo "========================================================"
+echo "Job complete: $(date)"

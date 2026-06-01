@@ -1,39 +1,36 @@
 """
 SceneSplat Dataset for Can3Tok Training
 ========================================
-INFERENCE FIX (this version):
-  Trilinear anchor smoothing REMOVED from compute_position_scaffold.
+NORMALIZATION:
+  normalize_with_norm_factor() is used in _load_and_process().
+  - When norm_factor.npy is present (grid chunks after precomputation):
+      Uses the global parent-scene coordinate frame. All chunks from the
+      same room share one consistent coordinate system.
+  - When norm_factor.npy is absent (full scenes in train/):
+      Falls back to per-scene normalization — identical to original Can3Tok.
 
-  Previously:
-    position_offsets = coord - smooth_anchor   (smooth, trilinear)
-    PLY save: abs_pos = decoder_output + GT smooth_anchor   ← GT data leaked
+  This means the same dataset class works correctly for BOTH:
+    - train_grid1.0cm_chunk8x8_stride6x6/  (chunks → uses norm_factor.npy)
+    - train/                                (full scenes → per-scene fallback)
+    - val/                                  (full scenes → per-scene fallback)
 
-  Now:
-    The DC term (scaffold anchor) is PREDICTED inside the decoder by
-    AnchorPredFromTokens (transformer_tokens [B,512,width] → [B,512,3]).
-    The decoder output is already absolute positions (offset + predicted DC).
-    No GT smooth_anchor needed at PLY save or inference.
+SKIP_SCENES PARAMETER:
+  skip_scenes=N causes the first N sorted scene directories to be skipped
+  before applying max_scenes. This lets you carve out a held-out validation
+  split from the same directory without any file-system changes.
 
-  compute_position_scaffold now returns:
-    scaffold_anchors   [512, 3]   — voxel centroid positions (GT, for anchor_loss supervision)
-    scaffold_token_ids [40000]    — hard voxel assignment (GT, for accurate DC at training)
-    position_offsets   [40000, 3] — coord - scaffold_anchors[token_id]  (HARD, informational)
+  Example — training on the first 3800 chunks and evaluating on the rest:
+    train_ds = gs_dataset(root=chunk_dir, max_scenes=3800, ...)
+    val_ds   = gs_dataset(root=chunk_dir, skip_scenes=3800, ...)
 
-  position_offsets is kept in the batch for reference/diagnostics but is NO LONGER
-  used as a training target. The decoder is trained against absolute positions.
+  Because all chunks share the same norm_factor.npy (computed by
+  precompute_norm_from_chunks.py from the union of all chunks per scene),
+  the held-out chunks use exactly the same global coordinate frame as the
+  training chunks — normalization is fully consistent.
 
-STEP 1 — COLOR RESIDUAL (color_residual=True)
-   mean_color  = color.mean()   -> shape_embed via MeanColorHead
-   color_resid = color - mean   -> AC residuals in feature tensor
-   Batch dict: 'mean_color' [3]
-
-SCENE LAYOUT HEAD (scene_layout_head=True)
-   per-category centroids: category_centroids[72,3], category_valid[72]
-
-POSITION LAYOUT RESIDUAL (position_layout_residual=True)
-   DC  = per-Gaussian category centroid
-   AC  = coord - dc_position
-   Batch keys: dc_position [40000,3], position_residuals [40000,3]
+PRELOADING (preload=True, default):
+  All scenes preprocessed once at __init__ and stored in RAM.
+  Workers inherit via copy-on-write fork — zero per-batch overhead.
 """
 
 import os
@@ -43,19 +40,67 @@ from tqdm import tqdm
 
 
 def normalize_to_canonical_sphere(coord, scale, target_radius=10.0,
-                                   scale_norm_mode='log'):
-    center         = coord.mean(axis=0)
-    coord_centered = coord - center
-    distances      = np.linalg.norm(coord_centered, axis=1)
-    max_dist       = distances.max()
+                                   scale_norm_mode='linear'):
+    """Per-scene normalization (fallback when norm_factor.npy absent)."""
+    center       = coord.mean(axis=0)
+    coord_c      = coord - center
+    max_dist     = np.linalg.norm(coord_c, axis=1).max()
     if max_dist < 1e-6:
         max_dist = 1.0
     scale_factor = target_radius / (max_dist * 1.1)
-    coord_norm   = coord_centered * scale_factor
+    coord_norm   = coord_c * scale_factor
     if scale_norm_mode == 'log':
         scale_norm = np.log(scale + 1e-7) + np.log(scale_factor)
     else:
         scale_norm = scale * scale_factor
+    return coord_norm, scale_norm
+
+
+def normalize_with_norm_factor(coord, scale, scene_dir,
+                                target_radius=10.0, scale_norm_mode='linear'):
+    """
+    Normalize using precomputed global norm_factor when available,
+    otherwise fall back to per-scene normalization.
+
+    norm_factor.npy = [cx, cy, cz, scale_factor]
+    Produced by precompute_norm_from_chunks.py, which combines ALL chunks of
+    a scene → computes center+scale from the union → global scene frame.
+
+    WHY THIS MATTERS FOR CHUNKS:
+      Without: each chunk normalized into its own local 10m sphere.
+        Chunk A (left side of room): positions centered on left wall.
+        Chunk B (right side of room): positions centered on right wall.
+        z_A ≈ z_B (encoder sees similar content) but targets differ
+        → gradient cancellation → position loss stuck at ~2300.
+
+      With: all chunks of room share one coordinate frame.
+        Position [2, 0, 1] always refers to the same physical location.
+        Decoder can learn generalizable position priors → converges.
+
+    FALLBACK (full scenes, val set):
+      If norm_factor.npy is absent, identical to normalize_to_canonical_sphere.
+    """
+    nf_path = os.path.join(scene_dir, 'norm_factor.npy')
+
+    if os.path.exists(nf_path):
+        nf           = np.load(nf_path)
+        center       = nf[:3]
+        scale_factor = float(nf[3])
+        coord_norm   = (coord - center) * scale_factor
+    else:
+        center       = coord.mean(axis=0)
+        coord_c      = coord - center
+        max_dist     = np.linalg.norm(coord_c, axis=1).max()
+        if max_dist < 1e-6:
+            max_dist = 1.0
+        scale_factor = target_radius / (max_dist * 1.1)
+        coord_norm   = coord_c * scale_factor
+
+    if scale_norm_mode == 'log':
+        scale_norm = np.log(scale + 1e-7) + np.log(scale_factor)
+    else:
+        scale_norm = scale * scale_factor
+
     return coord_norm, scale_norm
 
 
@@ -85,29 +130,11 @@ def voxelize(coord, voxel_size=0.4, hash_type='fnv'):
 
 
 def compute_position_scaffold(coord, scaffold_dims=8, domain_size=16.0):
-    """
-    Build 8x8x8 scaffold grid with HARD voxel assignment.
-
-    SIMPLIFIED vs previous version:
-      Trilinear smoothing removed. The DC term is now predicted inside the
-      decoder by AnchorPredFromTokens, so smooth_anchor is no longer needed
-      as a GT quantity. This makes the training pipeline fully self-contained
-      at second-stage diffusion inference.
-
-    Returns:
-        scaffold_anchors:   [512, 3]   — voxel centroid positions
-                                         Used for anchor_loss supervision of AnchorPredFromTokens.
-        scaffold_token_ids: [N]        — hard voxel assignment per Gaussian
-                                         Used in decode() for accurate DC at training time.
-        position_offsets:   [N, 3]     — coord - scaffold_anchors[token_id]  (informational only)
-                                         NOT used as training target.
-                                         Training is against absolute positions (DC in decoder).
-    """
-    num_tokens  = scaffold_dims ** 3   # 512
+    """Build 8×8×8 scaffold grid with HARD voxel assignment."""
+    num_tokens  = scaffold_dims ** 3
     cell_size   = domain_size / scaffold_dims
     half_domain = domain_size / 2.0
 
-    # ── Step 1: hard voxel assignment ────────────────────────────────────────
     shifted = coord + half_domain
     sv_idx  = np.floor(shifted / cell_size).astype(np.int32)
     sv_idx  = np.clip(sv_idx, 0, scaffold_dims - 1)
@@ -116,7 +143,6 @@ def compute_position_scaffold(coord, scaffold_dims=8, domain_size=16.0):
         sv_idx[:, 1] * scaffold_dims +
         sv_idx[:, 2]).astype(np.int32)
 
-    # ── Step 2: compute scaffold anchors (mean Gaussian pos per voxel) ───────
     anchor_counts = np.bincount(scaffold_token_ids, minlength=num_tokens).astype(np.float64)
     anchor_sum    = np.zeros((num_tokens, 3), dtype=np.float64)
     for dim in range(3):
@@ -127,7 +153,6 @@ def compute_position_scaffold(coord, scaffold_dims=8, domain_size=16.0):
     occupied = anchor_counts > 0
     scaffold_anchors[occupied] = anchor_sum[occupied] / anchor_counts[occupied, np.newaxis]
 
-    # Fill empty voxels with geometric centre of that voxel cell
     empty_idx = np.where(~occupied)[0]
     if len(empty_idx) > 0:
         ix = empty_idx // (scaffold_dims ** 2)
@@ -138,10 +163,7 @@ def compute_position_scaffold(coord, scaffold_dims=8, domain_size=16.0):
         scaffold_anchors[empty_idx, 2] = iz * cell_size + cell_size/2.0 - half_domain
     scaffold_anchors = scaffold_anchors.astype(np.float32)
 
-    # ── Step 3: hard position offsets (informational, not used as target) ────
-    # The decoder is trained against absolute positions; this is kept for diagnostics.
     position_offsets = (coord - scaffold_anchors[scaffold_token_ids]).astype(np.float32)
-
     return scaffold_anchors, scaffold_token_ids, position_offsets
 
 
@@ -167,10 +189,10 @@ def compute_category_centroids(coord, segment, num_cats=72):
 
 def compute_position_layout_residuals(coord, segment, category_centroids, category_valid):
     """DC/AC position decomposition using per-category centroids."""
-    N           = len(coord)
-    dc_position = np.zeros((N, 3), dtype=np.float32)
-    scene_mean  = coord.mean(axis=0).astype(np.float32)
-    valid_mask  = segment >= 0
+    N            = len(coord)
+    dc_position  = np.zeros((N, 3), dtype=np.float32)
+    scene_mean   = coord.mean(axis=0).astype(np.float32)
+    valid_mask   = segment >= 0
     invalid_mask = ~valid_mask
     if valid_mask.sum() > 0:
         valid_segs = segment[valid_mask].astype(np.int64)
@@ -186,7 +208,7 @@ def compute_position_layout_residuals(coord, segment, category_centroids, catego
 
 
 def compute_voxel_label_dists(scaffold_token_ids, segment, num_tokens=512, num_cats=72):
-    """Per-super-voxel label distributions (JEPA Idea 1)."""
+    """Per-super-voxel label distributions."""
     voxel_label_dists = np.zeros((num_tokens, num_cats), dtype=np.float32)
     voxel_valid       = np.zeros(num_tokens, dtype=np.float32)
     valid_mask = segment >= 0
@@ -208,23 +230,28 @@ class gs_dataset(Dataset):
     """
     SceneSplat-7K dataset with ScanNet72 semantic labels.
 
-    INFERENCE FIX (this version):
-      - compute_position_scaffold no longer computes trilinear smooth anchors.
-      - 'smooth_anchor' key removed from batch dict.
-      - 'position_offsets' kept but is hard offset only, informational.
-      - Training target is absolute positions (DC predicted inside decoder).
-
     Feature tensor col layout (label_input=False, 18 cols):
       0:3   voxel_centers
       3     point_uniq_idx
-      4:7   xyz  (absolute — encoder Fourier embedder needs this)
-      7:10  rgb  (absolute or residuals if color_residual=True)
+      4:7   xyz  (normalized coordinates)
+      7:10  rgb
       10    opacity
       11:14 scale
       14:18 quaternion
+
+    Parameters
+    ----------
+    skip_scenes : int or None
+        Number of sorted scene directories to skip before applying max_scenes.
+        Use this to carve out a held-out validation split from the same folder
+        as the training data without any file-system changes.
+        Example:
+            train = gs_dataset(root=chunk_dir, max_scenes=3800, ...)
+            val   = gs_dataset(root=chunk_dir, skip_scenes=3800, ...)
+        Both use the same global norm_factor.npy — normalization is consistent.
     """
 
-    TARGET_POINTS = 40_000
+    TARGET_POINTS      = 40_000
     LABEL_MAX          = 71.0
     LABEL_MISSING_NORM = -1.0 / 71.0
     SCAFFOLD_DIMS      = 8
@@ -233,11 +260,12 @@ class gs_dataset(Dataset):
     NUM_CATS           = 72
 
     def __init__(self, root, resol=200, random_permute=False, train=True,
-                 sampling_method='opacity', max_scenes=None, normalize=True,
-                 normalize_colors=True, target_radius=10.0, scale_norm_mode='linear',
-                 label_input=False, color_residual=False, position_scaffold=False,
-                 scene_layout_head=False, jepa_idea1=False,
-                 position_layout_residual=False):
+                 sampling_method='opacity', max_scenes=None, skip_scenes=None,
+                 normalize=True, normalize_colors=True, use_chunk_norm_factor=True, target_radius=10.0,
+                 scale_norm_mode='linear', label_input=False, color_residual=False,
+                 position_scaffold=False, scene_layout_head=False, jepa_idea1=False,
+                 position_layout_residual=False, preload=True,
+                 disable_semantics=False):
 
         self.root                     = root
         self.resol                    = resol
@@ -246,6 +274,7 @@ class gs_dataset(Dataset):
         self.sampling_method          = sampling_method
         self.normalize                = normalize
         self.normalize_colors         = normalize_colors
+        self.use_chunk_norm_factor    = use_chunk_norm_factor
         self.target_radius            = target_radius
         self.scale_norm_mode          = scale_norm_mode
         self.label_input              = label_input
@@ -254,6 +283,7 @@ class gs_dataset(Dataset):
         self.scene_layout_head        = scene_layout_head
         self.jepa_idea1               = jepa_idea1
         self.position_layout_residual = position_layout_residual
+        self.disable_semantics        = disable_semantics  # True for non-ScanNet72 datasets
 
         if position_layout_residual and not scene_layout_head:
             print("  [INFO] position_layout_residual=True requires scene_layout_head=True. Enabling.")
@@ -262,36 +292,101 @@ class gs_dataset(Dataset):
             print("  [INFO] jepa_idea1=True requires position_scaffold=True. Enabling.")
             self.position_scaffold = True
 
+        # Build sorted list of all scene directories
         self.scene_dirs = sorted([
             os.path.join(root, d)
             for d in os.listdir(root)
             if os.path.isdir(os.path.join(root, d))
         ])
+
+        total_available = len(self.scene_dirs)
+
+        # ── SKIP: remove the first skip_scenes dirs (used as training data) ──
+        # This is the key mechanism for held-out chunk validation:
+        # train = gs_dataset(root=chunk_dir, max_scenes=3800, ...)
+        # val   = gs_dataset(root=chunk_dir, skip_scenes=3800, ...)
+        # Both sets of chunks share the same norm_factor.npy per scene, so
+        # the global coordinate frame is identical for training and validation.
+        if skip_scenes is not None and skip_scenes > 0:
+            self.scene_dirs = self.scene_dirs[skip_scenes:]
+            print(f"  Skipped first {skip_scenes} scenes (training split)  "
+                  f"→ {len(self.scene_dirs)} remaining for this split")
+
+        # ── CAP at max_scenes ────────────────────────────────────────────────
         if max_scenes is not None and max_scenes < len(self.scene_dirs):
             self.scene_dirs = self.scene_dirs[:max_scenes]
             print(f"  Limited to {max_scenes} scenes")
+
         if not self.scene_dirs:
-            raise ValueError(f"No scene directories found in {root}")
+            raise ValueError(
+                f"No scene directories found in {root} "
+                f"(total={total_available}, skip={skip_scenes}, max={max_scenes})")
 
         self.num_segment_categories = self.NUM_CATS
         self.feature_width = 19 if label_input else 18
 
-        print(f"  Loaded {len(self.scene_dirs)} scenes from {root}")
+        # ── Normalization mode report ─────────────────────────────────────────
+        _is_chunks   = ('chunk' in root or 'grid' in root)
+        _sample_size = min(20, len(self.scene_dirs))
+        _nf_count    = sum(
+            1 for d in self.scene_dirs[:_sample_size]
+            if os.path.exists(os.path.join(d, 'norm_factor.npy'))
+        )
+
+        print(f"  Loaded {len(self.scene_dirs)} scenes from {os.path.basename(root)}")
+        if _is_chunks:
+            _all_ok = (_nf_count == _sample_size)
+            if not use_chunk_norm_factor:
+                _status = 'DISABLED by --no_chunk_norm_factor (per-scene fallback)'
+            elif _all_ok:
+                _status = 'GLOBAL frame ✓'
+            else:
+                _status = 'MISSING — position will NOT converge ✗'
+            print(f"  norm_factor.npy : {_nf_count}/{_sample_size} sampled  ({_status})")
+            if _all_ok and _sample_size > 0:
+                # Spot-check: show one example norm_factor value
+                _ex = self.scene_dirs[0]
+                _nf = np.load(os.path.join(_ex, 'norm_factor.npy'))
+                print(f"  Example         : {os.path.basename(_ex)} → "
+                      f"center=({_nf[0]:.2f},{_nf[1]:.2f},{_nf[2]:.2f}) "
+                      f"scale={_nf[3]:.4f}")
+        else:
+            _has_nf = os.path.exists(os.path.join(self.scene_dirs[0], 'norm_factor.npy'))
+            print(f"  norm_factor.npy : {'present → global frame' if _has_nf else 'absent → per-scene fallback ✓'}")
+
         print(f"  color_residual={color_residual} | position_scaffold={self.position_scaffold}")
-        print(f"  scene_layout_head={self.scene_layout_head} | jepa_idea1={jepa_idea1}")
-        print(f"  position_layout_residual={position_layout_residual}")
-        if position_scaffold:
-            print(f"  SCAFFOLD (INFERENCE-FIXED):")
-            print(f"    DC predicted by AnchorPredFromTokens inside decoder")
-            print(f"    scaffold_anchors in batch: used for anchor_loss supervision only")
-            print(f"    scaffold_token_ids in batch: used for accurate DC at training time")
-            print(f"    position_offsets in batch: HARD offsets, informational only")
-            print(f"    smooth_anchor: REMOVED (no longer needed)")
+        print(f"  scene_layout_head={self.scene_layout_head}")
+
+        self._preloaded = None
+        if preload:
+            self._preload_all()
+
+    def _preload_all(self):
+        n = len(self.scene_dirs)
+        est_gb = n * (40000 * 18 * 4 + 40000 * 6 + 512 * 3 * 4) / 1e9
+        print(f"  Preloading {n} scenes into RAM (~{est_gb:.1f} GB)...")
+        self._preloaded = [None] * n
+        failed = 0
+        for idx in tqdm(range(n), desc="  Preloading", ncols=80, leave=False):
+            try:
+                self._preloaded[idx] = self._load_and_process(idx)
+            except Exception as e:
+                print(f"\n  [WARNING] Failed scene {idx} ({self.scene_dirs[idx]}): {e}")
+                failed += 1
+                if idx > 0 and self._preloaded[0] is not None:
+                    self._preloaded[idx] = self._preloaded[0]
+        print(f"  Preloaded {n - failed}/{n} scenes. "
+              f"{'All OK.' if failed == 0 else f'{failed} used fallback.'}")
 
     def __len__(self):
         return len(self.scene_dirs)
 
     def __getitem__(self, idx):
+        if self._preloaded is not None:
+            return self._preloaded[idx]
+        return self._load_and_process(idx)
+
+    def _load_and_process(self, idx):
         scene_dir = self.scene_dirs[idx]
 
         coord   = np.load(os.path.join(scene_dir, 'coord.npy'))
@@ -301,22 +396,50 @@ class gs_dataset(Dataset):
         opacity = np.load(os.path.join(scene_dir, 'opacity.npy'))
 
         if self.normalize:
-            coord, scale = normalize_to_canonical_sphere(
-                coord, scale, target_radius=self.target_radius,
-                scale_norm_mode=self.scale_norm_mode)
+            # use_chunk_norm_factor=True  → use norm_factor.npy global frame for
+            #   chunks (all chunks of a room share one coordinate system).
+            #   This is REQUIRED for position loss convergence on chunks.
+            # use_chunk_norm_factor=False → ignore norm_factor.npy even if present,
+            #   forcing per-scene normalisation. Use this to ablate the global frame
+            #   and verify that it is the cause of convergence difference.
+            # Full scenes: norm_factor.npy is absent so both modes give the same
+            #   per-scene fallback regardless of this flag.
+            _is_chunk_data = ('chunk' in scene_dir or 'grid' in scene_dir)
+            _use_nf = self.use_chunk_norm_factor or not _is_chunk_data
+            if _use_nf:
+                coord, scale = normalize_with_norm_factor(
+                    coord, scale,
+                    scene_dir=scene_dir,
+                    target_radius=self.target_radius,
+                    scale_norm_mode=self.scale_norm_mode)
+            else:
+                # Per-scene fallback: ignore norm_factor.npy even if present.
+                coord, scale = normalize_to_canonical_sphere(
+                    coord, scale,
+                    target_radius=self.target_radius,
+                    scale_norm_mode=self.scale_norm_mode)
+
         if self.normalize_colors:
             color = color / 255.0
 
-        try:
-            segment  = np.load(os.path.join(scene_dir, 'segment.npy'))
-            instance = np.load(os.path.join(scene_dir, 'instance.npy'))
-            has_semantics = True
-        except FileNotFoundError:
+        if self.disable_semantics:
+            # Extra datasets (ArkitScenes, ScanNet++, etc.) use different label
+            # spaces incompatible with ScanNet72. Disable semantics so InfoNCE
+            # losses don't receive mixed-space labels. Reconstruction is unaffected.
             segment       = np.full(len(coord), -1, dtype=np.int16)
             instance      = np.full(len(coord), -1, dtype=np.int32)
             has_semantics = False
+        else:
+            try:
+                segment  = np.load(os.path.join(scene_dir, 'segment.npy'))
+                instance = np.load(os.path.join(scene_dir, 'instance.npy'))
+                has_semantics = True
+            except FileNotFoundError:
+                segment       = np.full(len(coord), -1, dtype=np.int16)
+                instance      = np.full(len(coord), -1, dtype=np.int32)
+                has_semantics = False
 
-        # Deterministic top-40k sampling by opacity
+        # Top-40k sampling by opacity (deterministic)
         N = len(coord)
         if self.sampling_method == 'hybrid':
             scale_mag    = np.linalg.norm(scale, axis=1)
@@ -346,14 +469,12 @@ class gs_dataset(Dataset):
         segment  = segment [selected]
         instance = instance[selected]
 
-        # Color residual
         if self.color_residual:
             mean_color = color.mean(axis=0).astype(np.float32)
             color      = color - mean_color
         else:
             mean_color = np.zeros(3, dtype=np.float32)
 
-        # ── Position scaffold (SIMPLIFIED — hard assignment only) ─────────────
         T_pts = len(coord)
         if self.position_scaffold:
             (scaffold_anchors,
@@ -365,7 +486,6 @@ class gs_dataset(Dataset):
             scaffold_token_ids = np.zeros(T_pts, dtype=np.int32)
             position_offsets   = np.zeros((T_pts, 3), dtype=np.float32)
 
-        # Scene layout head: per-category centroids
         if self.scene_layout_head:
             category_centroids, category_valid = compute_category_centroids(
                 coord, segment, num_cats=self.NUM_CATS)
@@ -373,7 +493,6 @@ class gs_dataset(Dataset):
             category_centroids = np.zeros((self.NUM_CATS, 3), dtype=np.float32)
             category_valid     = np.zeros(self.NUM_CATS, dtype=np.float32)
 
-        # Position layout residual
         if self.position_layout_residual:
             dc_position, position_residuals = compute_position_layout_residuals(
                 coord, segment, category_centroids, category_valid)
@@ -381,7 +500,6 @@ class gs_dataset(Dataset):
             dc_position        = np.zeros((T_pts, 3), dtype=np.float32)
             position_residuals = np.zeros((T_pts, 3), dtype=np.float32)
 
-        # JEPA Idea 1
         if self.jepa_idea1 and self.position_scaffold:
             voxel_label_dists, voxel_valid = compute_voxel_label_dists(
                 scaffold_token_ids, segment,
@@ -390,18 +508,16 @@ class gs_dataset(Dataset):
             voxel_label_dists = np.zeros((self.SCAFFOLD_TOKENS, self.NUM_CATS), dtype=np.float32)
             voxel_valid       = np.zeros(self.SCAFFOLD_TOKENS, dtype=np.float32)
 
-        # Encoder voxelisation
-        volume_dims   = 40
-        resolution    = 16.0 / volume_dims
+        volume_dims    = 40
+        resolution     = 16.0 / volume_dims
         uniq_idx, inv_idx, _ = voxelize(coord, resolution, 'fnv')
-        origin_offset = np.array([(volume_dims - 1) / 2] * 3) * resolution
-        shifted_pts   = coord + origin_offset
-        voxel_idx     = np.floor(shifted_pts / resolution)
-        voxel_idx     = np.clip(voxel_idx, 0, volume_dims - 1)
-        voxel_centers = (voxel_idx - (volume_dims - 1) / 2) * resolution
+        origin_offset  = np.array([(volume_dims - 1) / 2] * 3) * resolution
+        shifted_pts    = coord + origin_offset
+        voxel_idx      = np.floor(shifted_pts / resolution)
+        voxel_idx      = np.clip(voxel_idx, 0, volume_dims - 1)
+        voxel_centers  = (voxel_idx - (volume_dims - 1) / 2) * resolution
         point_uniq_idx = uniq_idx[inv_idx]
 
-        # Feature tensor [T, 18]
         opacity_col    = opacity[:, np.newaxis]
         point_uniq_col = point_uniq_idx[:, np.newaxis]
         gs_params      = np.concatenate((coord, color, opacity_col, scale, quat), axis=1)
@@ -417,7 +533,6 @@ class gs_dataset(Dataset):
             gs_full_params = np.concatenate(
                 (voxel_centers, point_uniq_col, gs_params), axis=1)
 
-        # Scene-level label distribution
         label_dist = np.zeros(self.NUM_CATS, dtype=np.float32)
         valid_seg  = segment[segment >= 0]
         if len(valid_seg) > 0:
@@ -426,7 +541,6 @@ class gs_dataset(Dataset):
             label_dist /= label_dist.sum()
 
         return {
-            # Core features
             'features':           gs_full_params.astype(np.float32),
             'segment_labels':     segment,
             'instance_labels':    instance,
@@ -435,17 +549,13 @@ class gs_dataset(Dataset):
             'num_categories':     self.num_segment_categories,
             'mean_color':         mean_color,
             'label_dist':         label_dist,
-            # Scaffold — used for anchor_loss supervision and DC assignment at training
-            'scaffold_anchors':   scaffold_anchors,    # [512, 3]  GT, for anchor_loss
-            'scaffold_token_ids': scaffold_token_ids,  # [40000]   GT, for DC in decode()
-            'position_offsets':   position_offsets,    # [40000,3] HARD, informational only
-            # NOTE: 'smooth_anchor' removed — DC is now predicted inside the decoder
-            # Layout
+            'scaffold_anchors':   scaffold_anchors,
+            'scaffold_token_ids': scaffold_token_ids,
+            'position_offsets':   position_offsets,
             'category_centroids': category_centroids,
             'category_valid':     category_valid,
             'dc_position':        dc_position,
             'position_residuals': position_residuals,
-            # JEPA
             'voxel_label_dists':  voxel_label_dists,
             'voxel_valid':        voxel_valid,
         }
@@ -469,31 +579,35 @@ class gs_dataset(Dataset):
 
 
 if __name__ == "__main__":
-    import sys
+    import sys, time
     data_path = (sys.argv[1] if len(sys.argv) > 1
-                 else "/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/train")
+                 else "/home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6")
 
-    print("Testing scaffold (inference-fixed, no trilinear)...")
-    ds = gs_dataset(root=data_path, max_scenes=1, normalize=True,
-                    scale_norm_mode='linear', color_residual=True,
-                    position_scaffold=True)
-    s = ds[0]
+    print(f"Testing dataset: {data_path}")
 
+    # Test train/val split via skip_scenes
+    ds_train = gs_dataset(root=data_path, max_scenes=5, normalize=True,
+                          scale_norm_mode='linear', color_residual=True,
+                          position_scaffold=True, preload=True)
+    ds_val   = gs_dataset(root=data_path, skip_scenes=5, max_scenes=3,
+                          normalize=True, scale_norm_mode='linear',
+                          color_residual=True, position_scaffold=True, preload=True)
+
+    print(f"\n  Train: {len(ds_train)} scenes  |  Val: {len(ds_val)} scenes")
+    assert ds_train.scene_dirs[-1] != ds_val.scene_dirs[0], \
+        "ERROR: train and val share the same scene dirs!"
+    print(f"  Train last : {ds_train.scene_dirs[-1]}")
+    print(f"  Val first  : {ds_val.scene_dirs[0]}")
+    print(f"  No overlap: ✓")
+
+    t0 = time.time()
+    s            = ds_train[0]
     coord_abs    = s['features'][:, 4:7]
     scaf_anchors = s['scaffold_anchors']
     token_ids    = s['scaffold_token_ids']
     pos_offsets  = s['position_offsets']
-
-    # Verify: scaffold_anchors[token_ids] + position_offsets == coord
-    dc = scaf_anchors[token_ids]
+    dc  = scaf_anchors[token_ids]
     err = np.abs((dc + pos_offsets) - coord_abs).max()
-    print(f"  Invertibility error (hard): {err:.2e}  (must be < 1e-5)")
+    print(f"\n  Scaffold invertibility error: {err:.2e}  (must be < 1e-5)")
     assert err < 1e-5, f"FAIL: {err}"
-
-    print(f"  scaffold_anchors range: [{scaf_anchors.min():.3f}, {scaf_anchors.max():.3f}]m")
-    print(f"  position_offsets range: [{pos_offsets.min():.3f}, {pos_offsets.max():.3f}]m")
-    print(f"  coord_abs range:        [{coord_abs.min():.3f}, {coord_abs.max():.3f}]m")
-    print(f"  token_ids range:        [{token_ids.min()}, {token_ids.max()}]")
-    print(f"  No smooth_anchor in batch (correct)")
-    assert 'smooth_anchor' not in s, "smooth_anchor should be removed from batch"
-    print(f"\nPASSED")
+    print(f"PASSED")
