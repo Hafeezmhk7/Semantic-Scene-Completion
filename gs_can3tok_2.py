@@ -152,6 +152,16 @@ parser.add_argument('--train_scenes',         type=int,   default=None)
 parser.add_argument('--val_scenes',           type=int,   default=None)
 parser.add_argument('--sampling_method',      type=str,   default='opacity',
                     choices=['random','opacity','hybrid'])
+# ── Hypothesis test: random subset selection ─────────────────────────────────
+# When provided, the dataset randomly samples train_scenes from the full
+# directory list (using a deterministic seed for reproducibility) instead of
+# taking the first train_scenes sorted alphabetically. Use this to test the
+# memorization vs generalization hypothesis: if Pos converges on a random 300
+# from 3800 just like it did on the original 300, the limit was memorization.
+parser.add_argument('--random_subset_seed', type=int, default=None,
+    help='Random seed for selecting a subset of scenes. None = sorted first-N '
+         '(default). Set to any int (e.g. 42) to randomly select train_scenes '
+         'from the full directory. Only affects training data, not validation.')
 # ── Dataset source ────────────────────────────────────────────────────────────
 parser.add_argument('--train_data',           type=str,   default='chunks',
                     choices=['chunks', 'full', 'combined'],
@@ -205,6 +215,16 @@ parser.add_argument('--token_cond',           action='store_true', default=False
 parser.add_argument('--token_cond_approach',  type=str,   default='B',
                     choices=['A','B','AB'])
 parser.add_argument('--decoder_fourier_pe',   action='store_true', default=False)
+# ── Token-local decoder (architectural fix for scale plateau) ────────────────
+# When enabled, replaces the flat 777M-param GS_decoder (1024-d bottleneck) with
+# a shared per-token MLP (~1.6M params, no bottleneck). The transformer's [B,512,384]
+# output is decoded per-token: each token produces 79 Gaussians independently using
+# shared weights. This eliminates the information bottleneck that prevented scaling
+# beyond ~300 scenes. Per-Gaussian features for InfoNCE are derived from the per-token
+# mid-MLP activation plus an intra-token positional embedding, so every Gaussian gets
+# a distinct semantic feature.
+parser.add_argument('--token_local_decoder', action='store_true', default=False,
+    help='Replace flat GS_decoder with shared per-token MLP. See token_local_decoder.py.')
 parser.add_argument('--token_cond_adaln',     action='store_true', default=False)
 parser.add_argument('--semantic_token_heads', action='store_true', default=False)
 # Legacy
@@ -445,6 +465,7 @@ p.query_decoder           = args.query_decoder
 p.decoder_fourier_pe      = args.decoder_fourier_pe
 p.token_cond_adaln        = args.token_cond_adaln
 p.semantic_token_heads    = args.semantic_token_heads
+p.token_local_decoder     = args.token_local_decoder
 p.decoder_zs_cross_attn       = args.decoder_zs_cross_attn
 p.decoder_layout_cross_attn   = args.decoder_layout_cross_attn
 p.decoder_layout_additive     = args.decoder_layout_additive
@@ -490,6 +511,7 @@ if args.resume_checkpoint:
         ckpt.get('token_cond',            False) == args.token_cond,
         ckpt.get('token_cond_adaln',      False) == args.token_cond_adaln,
         ckpt.get('semantic_token_heads',  False) == args.semantic_token_heads,
+        ckpt.get('token_local_decoder',  False) == args.token_local_decoder,
         ckpt.get('decoder_zs_cross_attn', False) == args.decoder_zs_cross_attn,
     ])
     if not strict:
@@ -580,6 +602,10 @@ def build_lr_lambda_restart(warmup_steps, restart_T0_steps, lr_min_ratio):
 from gs_dataset_scenesplat import gs_dataset
 
 # Shared kwargs for all dataset instances
+# Only pass random_subset_seed to TRAINING datasets, not validation.
+# (We don't want randomization on val sets — keep them deterministic.)
+_train_only_kwargs = dict(random_subset_seed=args.random_subset_seed)
+
 _ds_kwargs = dict(
     resol=200,
     sampling_method=args.sampling_method,
@@ -605,7 +631,8 @@ if args.train_data == 'chunks':
         print(f"\n--- Training Dataset: CHUNKS ({_chunk_root}) ---")
     gs_dataset_train = gs_dataset(
         root=_chunk_root, random_permute=True, train=True,
-        max_scenes=args.train_scenes, skip_scenes=None, **_ds_kwargs)
+        max_scenes=args.train_scenes, skip_scenes=None,
+        **_train_only_kwargs, **_ds_kwargs)
     # Record the actual number of chunks used for training (needed for skip_scenes below)
     _n_train_chunks = len(gs_dataset_train)
 
@@ -614,7 +641,8 @@ elif args.train_data == 'full':
         print(f"\n--- Training Dataset: FULL SCENES ({_full_root}) ---")
     gs_dataset_train = gs_dataset(
         root=_full_root, random_permute=True, train=True,
-        max_scenes=args.train_scenes, skip_scenes=None, **_ds_kwargs)
+        max_scenes=args.train_scenes, skip_scenes=None,
+        **_train_only_kwargs, **_ds_kwargs)
     _n_train_chunks = 0   # no chunks used
 
 else:  # combined
@@ -623,9 +651,11 @@ else:  # combined
     if accelerator.is_main_process:
         print(f"\n--- Training Dataset: COMBINED (full + chunks) ---")
     _ds_full  = gs_dataset(root=_full_root,  random_permute=True, train=True,
-                           max_scenes=_max_full,  skip_scenes=None, **_ds_kwargs)
+                           max_scenes=_max_full,  skip_scenes=None,
+                           **_train_only_kwargs, **_ds_kwargs)
     _ds_chunk = gs_dataset(root=_chunk_root, random_permute=True, train=True,
-                           max_scenes=_max_chunk, skip_scenes=None, **_ds_kwargs)
+                           max_scenes=_max_chunk, skip_scenes=None,
+                           **_train_only_kwargs, **_ds_kwargs)
     gs_dataset_train = Data.ConcatDataset([_ds_full, _ds_chunk])
     _n_train_chunks  = len(_ds_chunk)
 
@@ -656,11 +686,25 @@ if args.train_data in ('chunks', 'combined') and _n_train_chunks > 0:
         print(f"\n--- Validation Dataset: held-out chunks "
               f"(skip_scenes={_n_train_chunks}) ---")
     try:
+        # ── Cap held-out chunk val at args.val_scenes ────────────────────
+        # Without this cap, max_scenes=None loads ALL remaining (3888 -
+        # train_scenes) chunks into RAM at ~3.1 MB each. With train=300
+        # that's 3588 chunks × ~3 MB = 11+ GB per rank. With DDP×4 ranks
+        # it's ~45 GB wasted on a diagnostic val nobody iterates fully.
+        # Capping at val_scenes (typically 50) shrinks this to ~150 MB.
+        #
+        # CAVEAT — random_subset_seed contamination:
+        #   When --random_subset_seed is set, training picks a RANDOM
+        #   permutation of 300 scenes, but this val set still skips the
+        #   alphabetically-first 300 scenes. The chunks selected here may
+        #   therefore overlap with the training set, biasing the chunk-val
+        #   metric optimistically. The val_full split (separate val/ dir)
+        #   remains contamination-free and is the metric to trust.
         gs_dataset_val_chunk = gs_dataset(
             root=_chunk_root,
             random_permute=False, train=False,
             skip_scenes=_n_train_chunks,   # skip the first _n_train_chunks (training)
-            max_scenes=None,               # all remaining chunks
+            max_scenes=args.val_scenes,    # cap at val_scenes (typically 50)
             **_ds_kwargs)
         if len(gs_dataset_val_chunk) > 0:
             _has_chunk_val = True
@@ -949,6 +993,7 @@ _ckpt_meta = {
     'token_cond_approach':        args.token_cond_approach,
     'token_cond_adaln':           args.token_cond_adaln,
     'semantic_token_heads':       args.semantic_token_heads,
+    'token_local_decoder':        args.token_local_decoder,
     'decoder_zs_cross_attn':      args.decoder_zs_cross_attn,
     'z_s_infonce_weight':         args.z_s_infonce_weight,
     'z_s_infonce_temperature':    args.z_s_infonce_temperature,
@@ -1361,8 +1406,11 @@ if raw_model.shape_model is not None:
 
     def _all_side_heads_ddp_visibility_hook(module, inp, output):
         # output = (shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features)
-        pf = output[5]
-        if pf is None:
+        # Attach zero-grad terms to UV_gs_recover (index 4) NOT per_gaussian_features
+        # (index 5). UV_gs_recover is always non-None and always in the loss graph; pf
+        # is None when semantic_mode='none', which would silently disable this fix.
+        uv = output[4]
+        if uv is None:
             return output
         zero_sum = None
         for attr in _SIDE_HEAD_ATTRS:
@@ -1372,8 +1420,12 @@ if raw_model.shape_model is not None:
                 zero_sum = term if zero_sum is None else zero_sum + term
         if zero_sum is None:
             return output
-        pf_modified = pf + zero_sum
-        return (output[0], output[1], output[2], output[3], output[4], pf_modified)
+        uv_modified = uv + zero_sum
+        # Also propagate to per_gaussian_features when it exists, keeping the original
+        # behaviour when semantic_mode is 'hidden'/'geometric'/'dist'.
+        pf = output[5]
+        pf_modified = (pf + zero_sum) if (pf is not None) else pf
+        return (output[0], output[1], output[2], output[3], uv_modified, pf_modified)
 
     raw_model.shape_model.register_forward_hook(_all_side_heads_ddp_visibility_hook)
     if accelerator.is_main_process:

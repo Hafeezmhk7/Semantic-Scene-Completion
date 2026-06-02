@@ -14,6 +14,15 @@ DECODER STRATEGIES (controlled by flags, all backward-compatible):
 CHANGE vs original: get_decoder_transformer_features() added between encode() and decode()
 for use by Stage 2 Latent Perceptual Loss (LPL).
 See train_stage2.py --lpl_weight flag.
+
+TOKEN-LOCAL DECODER ADDITION (token_local_decoder=True flag):
+  Replaces the flat 777M-param GS_decoder (1024-d bottleneck → memorisation
+  ceiling) with a shared per-token MLP (~1.6M params, no bottleneck). Each
+  of the 512 decoder tokens decodes its own slice of 79 Gaussians using
+  shared weights. Per-Gaussian semantic features for InfoNCE flow through
+  the existing SemanticProjectionHead via a pooled-hidden path that matches
+  the original [B, 1024] interface, so semantic_mode='hidden' works unchanged.
+  All other strategies (A/B/C/D) remain backward-compatible.
 """
 
 import torch
@@ -29,6 +38,7 @@ from model.michelangelo.models.modules.distributions import DiagonalGaussianDist
 from model.michelangelo.models.modules.transformer_blocks import (
     ResidualCrossAttentionBlock, Transformer)
 from .tsal_base import ShapeAsLatentModule
+from .token_local_decoder import TokenLocalDecoder
 
 
 # ============================================================================
@@ -557,7 +567,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  structured_layout_tokens=False,
                  position_layout_residual=False,
                  jepa_idea1=False,
-                 query_decoder=False):
+                 query_decoder=False,
+                 token_local_decoder=False):
 
         super().__init__(
             device=device, dtype=dtype, num_latents=1 + num_latents,
@@ -585,6 +596,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.decoder_layout_cross_attn = decoder_layout_cross_attn
         self.decoder_layout_additive       = decoder_layout_additive
         self.structured_layout_tokens_flag = structured_layout_tokens
+        self.token_local_decoder_flag      = token_local_decoder
 
         _Z_TOKENS         = 16384 // embed_dim
         self._n_zs_tokens = semantic_dims // embed_dim
@@ -606,6 +618,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         print(f"  scene_layout_head={scene_layout_head}  decoder_fourier_pe={decoder_fourier_pe}")
         print(f"  token_cond={token_cond} adaln={token_cond_adaln}")
         print(f"  semantic_token_heads={semantic_token_heads}")
+        print(f"  token_local_decoder={token_local_decoder}  (architectural fix; "
+              f"1.6M-param shared per-token MLP replaces 777M flat GS_decoder)")
         print(f"{'='*70}")
 
         if semantic_token_heads and not latent_disentangle:
@@ -804,6 +818,42 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             self.semantic_distribution_head = SemanticDistributionHead(1024, 72)
         elif semantic_mode not in ('none', 'attention'):
             raise ValueError(f"Unknown semantic_mode: '{semantic_mode}'")
+
+        # ────────────────────────────────────────────────────────────────────
+        # TOKEN-LOCAL DECODER OVERRIDE
+        # ────────────────────────────────────────────────────────────────────
+        # When token_local_decoder=True, replace every standard GS_decoder
+        # instance (already built above by super().__init__ and the strategy
+        # branches below) with a TokenLocalDecoder. The TokenLocalDecoder
+        # exposes the identical forward(x, return_hidden=False) interface and
+        # output shape [B, 40000*14] as the flat MLP, so decode() and the
+        # semantic-feature pipeline both work unchanged.
+        #
+        # GS_decoder instances that may exist at this point:
+        #   - self.GS_decoder       (512 tokens) → Strategy A / B / C paths
+        #   - self.GS_decoder_B     (512 tokens) → Strategy B1 path
+        #   - self.GS_decoder_new   (_n_zg_tokens) → Strategy D path
+        # Only the relevant decoder is actually used per forward, but consistent
+        # replacement keeps checkpoint compatibility simple.
+        #
+        # Per-Gaussian InfoNCE: the SemanticProjectionHead receives the [B, 1024]
+        # pooled hidden from TokenLocalDecoder.hidden_proj and produces per-
+        # Gaussian features [B, 40000, 32] exactly as before. No changes needed
+        # to the per_gaussian_features pipeline or the 6-tuple forward return.
+        if token_local_decoder:
+            print(f"\n  [TOKEN-LOCAL DECODER] Replacing flat GS_decoder(s) with "
+                  f"shared per-token MLPs:")
+            self.GS_decoder = TokenLocalDecoder(
+                width=width, hidden_dim=512, num_tokens=512,
+                num_gaussians=40_000, color_residual=color_residual)
+            if self.GS_decoder_B is not None:
+                self.GS_decoder_B = TokenLocalDecoder(
+                    width=width, hidden_dim=512, num_tokens=_Z_TOKENS,
+                    num_gaussians=40_000, color_residual=color_residual)
+            if self.GS_decoder_new is not None:
+                self.GS_decoder_new = TokenLocalDecoder(
+                    width=width, hidden_dim=512, num_tokens=self._n_zg_tokens,
+                    num_gaussians=40_000, color_residual=color_residual)
 
         print(f"{'='*70}\n")
 

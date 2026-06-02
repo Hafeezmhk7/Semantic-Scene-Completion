@@ -261,6 +261,7 @@ class gs_dataset(Dataset):
 
     def __init__(self, root, resol=200, random_permute=False, train=True,
                  sampling_method='opacity', max_scenes=None, skip_scenes=None,
+                 random_subset_seed=None,
                  normalize=True, normalize_colors=True, use_chunk_norm_factor=True, target_radius=10.0,
                  scale_norm_mode='linear', label_input=False, color_residual=False,
                  position_scaffold=False, scene_layout_head=False, jepa_idea1=False,
@@ -311,6 +312,21 @@ class gs_dataset(Dataset):
             self.scene_dirs = self.scene_dirs[skip_scenes:]
             print(f"  Skipped first {skip_scenes} scenes (training split)  "
                   f"→ {len(self.scene_dirs)} remaining for this split")
+
+        # ── RANDOM SUBSET (for hypothesis testing) ───────────────────────────
+        # When random_subset_seed is provided, randomly shuffle the directory
+        # list before applying max_scenes. This lets us test "what if I trained
+        # the SAME model on a 300-scene subset of the 3800-scene dataset?"
+        # without changing any other code path.
+        # Deterministic across runs via np.random.RandomState(seed).
+        if random_subset_seed is not None and max_scenes is not None and max_scenes < len(self.scene_dirs):
+            import numpy as _np
+            _rng = _np.random.RandomState(random_subset_seed)
+            _shuffled_indices = _rng.permutation(len(self.scene_dirs))[:max_scenes]
+            self.scene_dirs = [self.scene_dirs[i] for i in sorted(_shuffled_indices)]
+            print(f"  RANDOM SUBSET: sampled {max_scenes} scenes with seed={random_subset_seed}")
+            print(f"    First 3 selected: {[os.path.basename(d) for d in self.scene_dirs[:3]]}")
+            print(f"    Last 3 selected:  {[os.path.basename(d) for d in self.scene_dirs[-3:]]}")
 
         # ── CAP at max_scenes ────────────────────────────────────────────────
         if max_scenes is not None and max_scenes < len(self.scene_dirs):
