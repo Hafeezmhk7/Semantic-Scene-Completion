@@ -289,7 +289,7 @@ class AnchorPredFromTokens(nn.Module):
         return self.head(transformer_tokens.reshape(B*T, W)).reshape(B, T, 3)
 
 
-_N_GAUSSIANS  = 40_000
+_N_GAUSSIANS  = 10_000
 FIXED_TOKEN_IDS_512 = torch.arange(_N_GAUSSIANS) * 512 // _N_GAUSSIANS
 FIXED_TOKEN_IDS_496 = torch.arange(_N_GAUSSIANS) * 496 // _N_GAUSSIANS
 
@@ -321,7 +321,7 @@ class TokenCondMLP(nn.Module):
         return self.mlp(fe.reshape(B*T, D)).reshape(B, T, -1)
 
 class SemanticProjectionHead(nn.Module):
-    def __init__(self, hidden_dim=1024, num_gaussians=40000, feature_dim=32):
+    def __init__(self, hidden_dim=1024, num_gaussians=10000, feature_dim=32):
         super().__init__()
         self.num_gaussians = num_gaussians
         self.feature_dim   = feature_dim
@@ -347,7 +347,7 @@ class SemanticDistributionHead(nn.Module):
     def forward(self, hidden): return self.head(hidden)
 
 class SemanticProjectionHeadGeometric(nn.Module):
-    def __init__(self, gaussian_dim=14, num_gaussians=40000, feature_dim=32, hidden_dim=128):
+    def __init__(self, gaussian_dim=14, num_gaussians=10000, feature_dim=32, hidden_dim=128):
         super().__init__()
         self.num_gaussians = num_gaussians
         self.projection = nn.Sequential(
@@ -379,15 +379,15 @@ class GS_decoder(nn.Module):
             self.pts_linears.append(nn.Linear(W, W))
             self.pts_linears.append(nn.LayerNorm(W))
             self.pts_linears.append(nn.ReLU())
-        self.output_linear = nn.Linear(W, 40_000 * 14)
+        self.output_linear = nn.Linear(W, 10_000 * 14)
         print(f"  GS_DECODER ({num_tokens} tokens): {num_tokens}×{width}={input_ch} "
-              f"→ 40000×14  "
+              f"→ 10000×14  "
               f"({'residuals' if color_residual else 'clamp(0,1)'})")
 
     def forward(self, x, return_hidden=False):
         for layer in self.pts_linears: x = layer(x)
         hidden = x
-        raw    = self.output_linear(x).reshape(x.shape[0], 40_000, 14)
+        raw    = self.output_linear(x).reshape(x.shape[0], 10_000, 14)
         pos    = raw[:, :, 0:3]
         color  = raw[:, :, 3:6] if self.color_residual else raw[:, :, 3:6].clamp(0., 1.)
         opac   = torch.sigmoid(raw[:, :, 6:7])
@@ -811,9 +811,9 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.semantic_projection_geometric = None
         self.semantic_distribution_head    = None
         if semantic_mode == 'hidden':
-            self.semantic_projection_hidden = SemanticProjectionHead(1024, 40000, 32)
+            self.semantic_projection_hidden = SemanticProjectionHead(1024, 10000, 32)
         elif semantic_mode == 'geometric':
-            self.semantic_projection_geometric = SemanticProjectionHeadGeometric(14, 40000, 32, 128)
+            self.semantic_projection_geometric = SemanticProjectionHeadGeometric(14, 10000, 32, 128)
         elif semantic_mode == 'dist':
             self.semantic_distribution_head = SemanticDistributionHead(1024, 72)
         elif semantic_mode not in ('none', 'attention'):
@@ -845,15 +845,15 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                   f"shared per-token MLPs:")
             self.GS_decoder = TokenLocalDecoder(
                 width=width, hidden_dim=512, num_tokens=512,
-                num_gaussians=40_000, color_residual=color_residual)
+                num_gaussians=10_000, color_residual=color_residual)
             if self.GS_decoder_B is not None:
                 self.GS_decoder_B = TokenLocalDecoder(
                     width=width, hidden_dim=512, num_tokens=_Z_TOKENS,
-                    num_gaussians=40_000, color_residual=color_residual)
+                    num_gaussians=10_000, color_residual=color_residual)
             if self.GS_decoder_new is not None:
                 self.GS_decoder_new = TokenLocalDecoder(
                     width=width, hidden_dim=512, num_tokens=self._n_zg_tokens,
-                    num_gaussians=40_000, color_residual=color_residual)
+                    num_gaussians=10_000, color_residual=color_residual)
 
         print(f"{'='*70}\n")
 
@@ -1122,7 +1122,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             _fixed_ids = FIXED_TOKEN_IDS_512
 
         if pred_anchors is not None:
-            pred_3d = reconstruction.reshape(B, 40_000, 14)
+            pred_3d = reconstruction.reshape(B, 10_000, 14)
             if scaffold_token_ids is not None:
                 idx_3d = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, 3)
                 dc     = torch.gather(pred_anchors, 1, idx_3d)
@@ -1133,7 +1133,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
 
         self.last_seg_pred = None
         if self.seg_pred_head is not None:
-            self.last_seg_pred = self.seg_pred_head(reconstruction.reshape(B, 40000, 14))
+            self.last_seg_pred = self.seg_pred_head(reconstruction.reshape(B, 10000, 14))
 
         semantic_features = None
         if return_semantic_features and hidden is not None:
@@ -1141,7 +1141,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 semantic_features = self.semantic_projection_hidden(hidden)
             elif self.semantic_mode == 'geometric':
                 semantic_features = self.semantic_projection_geometric(
-                    reconstruction.reshape(B, 40000, 14))
+                    reconstruction.reshape(B, 10000, 14))
             elif self.semantic_mode == 'dist':
                 semantic_features = self.semantic_distribution_head(hidden)
 

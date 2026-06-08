@@ -7,25 +7,26 @@ DATASET MODES (--train_data):
                Normalization: GLOBAL scene frame via norm_factor.npy
   "full"     — train/ (800 full scenes, per-scene normalization)
   "combined" — both sources concatenated (4688 total)
-  Validation always uses val/ (100 held-out full scenes).
+  Validation always uses val/ (held-out full scenes).
 
-HELD-OUT CHUNK VALIDATION (when train_data="chunks" or "combined"):
-  The first --train_scenes chunks (sorted) go to training.
-  The remaining chunks (3888 - train_scenes) are held-out for chunk eval.
-  gs_dataset skip_scenes parameter handles the split — no file changes needed.
-  Normalization is IDENTICAL for train/val chunks: both use norm_factor.npy
-  written by precompute_norm_from_chunks.py from the union of all chunks.
+RECONSTRUCTION OBJECTIVE (--use_chamfer_loss):
+  element-wise (default): torch.norm(pred[i] - target[i]) per slot. Requires a
+      stable slot<->target correspondence. Pair with --morton_order so target
+      slot i is a spatially-stable location (otherwise opacity rank makes the
+      per-slot target unlearnable and the loss plateaus).
+  chamfer (--use_chamfer_loss): permutation-invariant nearest-neighbour matching
+      on position. Order-free, so --morton_order is not required.
 
-  This gives two evaluation streams every eval_every epochs:
-    val_full  — 100 held-out full scenes  (primary metric, thesis target)
-    val_chunk — held-out chunks            (in-distribution diagnostic)
-
-  The gap  full_L2 / chunk_L2  quantifies the train→eval distribution shift.
-  Best model checkpoint is saved on val_full (the thesis target).
+REPORTING CONVENTION (raw, matches training):
+  Both training AND validation now report the raw torch.norm per batch, averaged
+  over the number of batches (NOT divided by number of scenes). This makes the
+  train and val Pos/Col/Opa/Scl/Rot numbers directly comparable in scale.
+  No per-element or per-channel rescaling is applied to the loss itself.
+  (Minor caveat: train batch=90, val batch can differ, so the raw norm differs
+   by sqrt(batch ratio); this is a scale-only artefact, not a model difference.)
 
 BF16 MIXED PRECISION:
   torch.autocast wraps training forward, eval forward, cross-recon decode.
-  Enable via mixed_precision: 'bf16' in accelerate_config.yaml.
 """
 
 import torch
@@ -85,9 +86,87 @@ def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0
           + torch.norm(prediction[:,:,3:6] - target[:,:,3:6], p=2) * color_weight
           + torch.norm(prediction[:,:,6:]  - target[:,:,6:],  p=2)) / batch_size
 
+
+def _chunked_nn_indices(src, ref, chunk=2048):
+    """
+    For each point in src [Ns,3], the index of its nearest point in ref [Nr,3].
+    Chunked over src so the [Ns,Nr] distance matrix is never materialized in full.
+    argmin is non-differentiable (correct for Chamfer — gradients flow through the
+    gathered values, not the indices).
+    """
+    Ns = src.shape[0]
+    out = torch.empty(Ns, dtype=torch.long, device=src.device)
+    for s in range(0, Ns, chunk):
+        e = min(s + chunk, Ns)
+        d = torch.cdist(src[s:e].unsqueeze(0), ref.unsqueeze(0)).squeeze(0)  # [c, Nr]
+        out[s:e] = d.argmin(dim=1)
+    return out
+
+
+def chamfer_reconstruction_loss(prediction, target, batch_size, color_weight=1.0, chunk=2048):
+    """
+    Permutation-invariant reconstruction loss.
+
+    Matches predicted and target Gaussians by nearest neighbour IN POSITION
+    (columns 0:3), then applies the SAME channel weighting as
+    compute_reconstruction_loss on the matched pairs
+    (position + color*color_weight + rest[6:]). No opacity-specific scaling.
+    Bidirectional (pred->target and target->pred). The matching is
+    non-differentiable; gradients flow through the gathered values.
+
+    NOTE: matches on the position columns AS PASSED IN. Intended for absolute
+    position targets (default path; no position_scaffold / position_layout_residual).
+    A warning is printed at startup if combined with those residual modes.
+    """
+    B = prediction.shape[0]
+    total = prediction.new_zeros(())
+    for b in range(B):
+        pp = prediction[b]            # [N,14]
+        tt = target[b]                # [N,14]
+        with torch.no_grad():
+            idx_p2t = _chunked_nn_indices(pp[:, 0:3], tt[:, 0:3], chunk)  # pred -> nearest target
+            idx_t2p = _chunked_nn_indices(tt[:, 0:3], pp[:, 0:3], chunk)  # target -> nearest pred
+        matched_t = tt.index_select(0, idx_p2t)   # [N,14]
+        matched_p = pp.index_select(0, idx_t2p)   # [N,14]
+        loss_fwd = (torch.norm(pp[:, 0:3] - matched_t[:, 0:3], p=2)
+                  + torch.norm(pp[:, 3:6] - matched_t[:, 3:6], p=2) * color_weight
+                  + torch.norm(pp[:, 6:]  - matched_t[:, 6:],  p=2))
+        loss_bwd = (torch.norm(tt[:, 0:3] - matched_p[:, 0:3], p=2)
+                  + torch.norm(tt[:, 3:6] - matched_p[:, 3:6], p=2) * color_weight
+                  + torch.norm(tt[:, 6:]  - matched_p[:, 6:],  p=2))
+        total = total + 0.5 * (loss_fwd + loss_bwd)
+    return total / batch_size
+
+
 def compute_individual_losses(prediction, target):
     return {k: torch.norm(prediction[:,:,sl] - target[:,:,sl], p=2).item()
             for k, sl in PARAM_SLICES.items()}
+
+def compute_individual_losses_matched(prediction, target, chunk=2048):
+    """
+    Per-attribute reconstruction error UNDER NEAREST-NEIGHBOUR MATCHING (by position).
+
+    WHY THIS EXISTS: with Chamfer loss the model is trained to match the predicted
+    SET to the target SET, with no constraint that predicted slot i corresponds to
+    target slot i. The index-matched compute_individual_losses() therefore reports
+    garbage for position (and a misleading "looks converged" for near-constant
+    channels like opacity/scale) because it compares pred[i] to target[i] across two
+    differently-ordered sets. This version matches each predicted Gaussian to its
+    nearest target Gaussian in position (cols 0:3) and reports per-attribute norms on
+    those matched pairs, which is the meaningful per-component readout for Chamfer.
+    Diagnostic only (no grad). Direction: pred -> nearest target.
+    """
+    B = prediction.shape[0]
+    out = {k: 0.0 for k in PARAM_SLICES}
+    with torch.no_grad():
+        for b in range(B):
+            pp = prediction[b]
+            tt = target[b]
+            idx = _chunked_nn_indices(pp[:, 0:3], tt[:, 0:3], chunk)  # pred -> nearest target
+            matched_t = tt.index_select(0, idx)
+            for k, sl in PARAM_SLICES.items():
+                out[k] += torch.norm(pp[:, sl] - matched_t[:, sl], p=2).item()
+    return out
 
 def scene_semantic_kl_loss(p_hat, p_s, eps=1e-8):
     return (p_s * (torch.log(p_s + eps) - torch.log(p_hat.clamp(min=eps)))).sum(-1).mean()
@@ -132,45 +211,64 @@ parser.add_argument('--lr',                   type=float, default=1e-4)
 parser.add_argument('--kl_weight',            type=float, default=1e-5)
 parser.add_argument('--kl_anneal_steps',      type=int,   default=0,
     help='Number of optimizer steps over which to ramp kl_weight from 0 to its '
-         'target value (linear warm-up). 0 = no annealing (fixed kl_weight). '
-         'Recommended: set to ~20× batches_per_epoch so the encoder builds a '
-         'rough reconstruction prior before KL regularisation kicks in. '
-         'Example: 4 GPUs, 3800 scenes, batch=90 → ~10 steps/epoch → '
-         '2000 steps covers ~200 epochs of KL ramp.')
+         'target value (linear warm-up). 0 = no annealing (fixed kl_weight).')
 parser.add_argument('--weight_decay',         type=float, default=1e-2)
 parser.add_argument('--warmup_steps',         type=int,   default=100)
 parser.add_argument('--lr_min_ratio',         type=float, default=0.1)
 parser.add_argument('--lr_restart_T0',        type=int,   default=0,
-    help='Cosine warm restart period in EPOCHS. 0 = single cosine decay (old behaviour). '
-         'When >0, LR decays from peak to floor over T0 epochs then rises back to peak '
-         'and repeats. Proven in Run 3 (1500 chunks, T0=900) to achieve 4.5x better '
-         'convergence than single cosine over same epoch budget. '
-         'Recommended: ~800-1000 epochs for full-scene runs, ~500 for chunk runs.')
+    help='Cosine warm restart period in EPOCHS. 0 = single cosine decay.')
 parser.add_argument('--eval_every',           type=int,   default=20)
 parser.add_argument('--failure_threshold',    type=float, default=100.0)
 parser.add_argument('--train_scenes',         type=int,   default=None)
 parser.add_argument('--val_scenes',           type=int,   default=None)
+parser.add_argument('--chunk_val_scenes',     type=int,   default=None,
+    help='Held-out chunk count for the chunk-val split (chunks/combined only). These are '
+         'the chunks sorted AFTER the first --train_scenes, so they are DISJOINT from '
+         'training by construction. None = use all remaining chunks (e.g. 3888 total - '
+         '3800 train = 88). For a clean split do NOT set --random_subset_seed: a random '
+         'training subset overlaps the skipped val chunks, which the disjointness check '
+         'will reject.')
 parser.add_argument('--sampling_method',      type=str,   default='opacity',
                     choices=['random','opacity','hybrid'])
-# ── Hypothesis test: random subset selection ─────────────────────────────────
-# When provided, the dataset randomly samples train_scenes from the full
-# directory list (using a deterministic seed for reproducibility) instead of
-# taking the first train_scenes sorted alphabetically. Use this to test the
-# memorization vs generalization hypothesis: if Pos converges on a random 300
-# from 3800 just like it did on the original 300, the limit was memorization.
 parser.add_argument('--random_subset_seed', type=int, default=None,
-    help='Random seed for selecting a subset of scenes. None = sorted first-N '
-         '(default). Set to any int (e.g. 42) to randomly select train_scenes '
-         'from the full directory. Only affects training data, not validation.')
-# ── Dataset source ────────────────────────────────────────────────────────────
+    help='Random seed for selecting a subset of scenes. None = sorted first-N.')
+# Spatial crop
+parser.add_argument('--crop_percentile', type=float, default=100.0,
+    help='Spatial crop: keep inner crop_percentile%% of Gaussians by distance '
+         'from centroid before opacity sampling. 100.0 = disabled (default).')
+# Gaussian ordering (Morton / Z-order)
+parser.add_argument('--morton_order', action='store_true', default=False,
+    help='Reorder opacity-selected Gaussians along a space-filling curve so slot i maps to '
+         'a spatially-stable location. Makes element-wise loss learnable. Off by default. '
+         'Curve chosen by --order_curve.')
+parser.add_argument('--order_curve', type=str, default='hilbert', choices=['hilbert', 'morton'],
+    help='Space-filling curve used when --morton_order is set. "hilbert" (default) has '
+         'provably better locality than "morton" (Z-order): consecutive slots are always '
+         'spatially adjacent, giving a smoother slot->position target that fits and '
+         'generalizes better. "morton" kept for ablation/back-compat.')
+parser.add_argument('--order_frame_radius', type=float, default=10.0,
+    help='Frame for the space-filling sort. >0 (default 10.0, the canonical normalization '
+         'radius) = FIXED canonical frame [-R,R]: the curve traverses the same absolute '
+         'cells in the same order for every scene, so the slot->position target is '
+         'consistent across scenes (matches the original Can3Tok HilbertSort3D). '
+         '<=0 = legacy PER-SCENE min-max (each scene stretched to the grid; ordering is '
+         'scene-idiosyncratic, which hurts cross-scene generalization).')
+# Reconstruction objective
+parser.add_argument('--use_chamfer_loss', action='store_true', default=False,
+    help='Use permutation-invariant Chamfer reconstruction loss (NN matching on '
+         'position) instead of element-wise L2. Order-free (no --morton_order '
+         'needed). Slower due to the NN search. Off by default (element-wise).')
+parser.add_argument('--chamfer_chunk', type=int, default=2048,
+    help='Chunk size for the Chamfer NN search (memory control). Lower if OOM. '
+         'Only used when --use_chamfer_loss.')
+# Dataset source
 parser.add_argument('--train_data',           type=str,   default='chunks',
                     choices=['chunks', 'full', 'combined'],
-    help='"chunks" = train_grid/ (global norm via norm_factor.npy), '
-         '"full" = train/ (per-scene norm), '
-         '"combined" = both sources concatenated.')
-# ── MAIN NEW IDEA ─────────────────────────────────────────────────────────────
+    help='"chunks" = train_grid/ (global norm), "full" = train/ (per-scene norm), '
+         '"combined" = both.')
+# MAIN NEW IDEA
 parser.add_argument('--decoder_zs_cross_attn', action='store_true', default=False)
-# ── Per-Gaussian InfoNCE ──────────────────────────────────────────────────────
+# Per-Gaussian InfoNCE
 parser.add_argument('--semantic_mode',        type=str,   default='none',
                     choices=['none','hidden','geometric','dist'])
 parser.add_argument('--segment_loss_weight',  type=float, default=0.0)
@@ -179,22 +277,22 @@ parser.add_argument('--semantic_temperature', type=float, default=0.07)
 parser.add_argument('--semantic_subsample',   type=int,   default=2000)
 parser.add_argument('--sampling_strategy',    type=str,   default='balanced',
                     choices=['random','balanced'])
-# ── Scene z_s InfoNCE ─────────────────────────────────────────────────────────
+# Scene z_s InfoNCE
 parser.add_argument('--z_s_infonce_weight',      type=float, default=0.0)
 parser.add_argument('--z_s_infonce_temperature', type=float, default=0.07)
 parser.add_argument('--z_s_infonce_delta',       type=float, default=0.4)
-# ── Strategy B flags ──────────────────────────────────────────────────────────
+# Strategy B flags
 parser.add_argument('--decoder_layout_cross_attn', action='store_true', default=False)
 parser.add_argument('--decoder_layout_additive',   action='store_true', default=False)
 parser.add_argument('--structured_layout_tokens',  action='store_true', default=False)
 parser.add_argument('--zs_layout_infonce_weight',      type=float, default=0.0)
 parser.add_argument('--zs_layout_infonce_temperature', type=float, default=0.07)
-# ── z_s pool / token InfoNCE ──────────────────────────────────────────────────
+# z_s pool / token InfoNCE
 parser.add_argument('--zs_pool_infonce_weight',      type=float, default=0.0)
 parser.add_argument('--zs_pool_infonce_temperature', type=float, default=0.07)
 parser.add_argument('--zs_token_infonce_weight',      type=float, default=0.0)
 parser.add_argument('--zs_token_infonce_temperature', type=float, default=0.07)
-# ── Core ─────────────────────────────────────────────────────────────────────
+# Core
 parser.add_argument('--color_residual',       action='store_true', default=False)
 parser.add_argument('--mean_color_weight',    type=float, default=1.0)
 parser.add_argument('--scene_semantic_head',  action='store_true', default=False)
@@ -215,14 +313,6 @@ parser.add_argument('--token_cond',           action='store_true', default=False
 parser.add_argument('--token_cond_approach',  type=str,   default='B',
                     choices=['A','B','AB'])
 parser.add_argument('--decoder_fourier_pe',   action='store_true', default=False)
-# ── Token-local decoder (architectural fix for scale plateau) ────────────────
-# When enabled, replaces the flat 777M-param GS_decoder (1024-d bottleneck) with
-# a shared per-token MLP (~1.6M params, no bottleneck). The transformer's [B,512,384]
-# output is decoded per-token: each token produces 79 Gaussians independently using
-# shared weights. This eliminates the information bottleneck that prevented scaling
-# beyond ~300 scenes. Per-Gaussian features for InfoNCE are derived from the per-token
-# mid-MLP activation plus an intra-token positional embedding, so every Gaussian gets
-# a distinct semantic feature.
 parser.add_argument('--token_local_decoder', action='store_true', default=False,
     help='Replace flat GS_decoder with shared per-token MLP. See token_local_decoder.py.')
 parser.add_argument('--token_cond_adaln',     action='store_true', default=False)
@@ -246,17 +336,10 @@ norm_grp.add_argument('--no_canonical_norm',  dest='use_canonical_norm',
 chunk_norm_grp = parser.add_mutually_exclusive_group()
 chunk_norm_grp.add_argument('--chunk_norm_factor', dest='chunk_norm_factor',
     action='store_true', default=True,
-    help='[DEFAULT ON] Use norm_factor.npy global frame for grid chunks. '
-         'All chunks of the same room share one norm_factor.npy computed from '
-         'their union, so every chunk has the same coordinate system. This is '
-         'critical for position loss convergence: without it each chunk is '
-         'normalised into its own local sphere and gradient signals cancel. '
-         'See normalize_with_norm_factor() in gs_dataset_scenesplat.py.')
+    help='[DEFAULT ON] Use norm_factor.npy global frame for grid chunks.')
 chunk_norm_grp.add_argument('--no_chunk_norm_factor', dest='chunk_norm_factor',
     action='store_false',
-    help='Disable norm_factor.npy for chunks: force per-scene normalisation '
-         'even when norm_factor.npy is present. Ablation use only. '
-         'Full scenes are unaffected regardless of this flag.')
+    help='Disable norm_factor.npy for chunks: force per-scene normalisation.')
 color_norm_grp = parser.add_mutually_exclusive_group()
 color_norm_grp.add_argument('--normalize_colors',    dest='normalize_colors',
                             action='store_true', default=True)
@@ -273,27 +356,16 @@ parser.add_argument('--wandb_project',        type=str,   default='Can3Tok-Sceen
 parser.add_argument('--wandb_entity',         type=str,   default='3D-SSC')
 parser.add_argument('--resume_checkpoint',    type=str,   default=None)
 parser.add_argument('--resume_epoch',         type=int,   default=None)
-# ── Multi-dataset support ─────────────────────────────────────────────────────
-# Extra paths let you add ArkitScenes, ScanNet++, or any SceneSplat-format
-# dataset on top of the main --train_data source. Semantics are disabled for
-# extra paths because their label spaces differ from ScanNet72. Reconstruction
-# and geometry losses are completely unaffected. All InfoNCE losses either
-# filter zero-label scenes automatically (per-Gaussian, z_s scene) or are
-# explicitly masked (pool NCE, token NCE — see _sem_valid in training loop).
+# Multi-dataset support
 parser.add_argument('--extra_train_paths',    type=str,   default='',
     help='Colon-separated list of extra scene root directories added on top of '
-         '--train_data. Each must contain scene subdirs with the standard '
-         'SceneSplat layout: coord.npy, color.npy, scale.npy, quat.npy, opacity.npy. '
-         'Semantics disabled automatically (label_dist=zeros, segment=-1). '
-         'Example: "/path/arkitscenes/train:/path/scannetpp/train"')
+         '--train_data. Semantics disabled automatically.')
 parser.add_argument('--extra_train_scenes',   type=str,   default='',
-    help='Colon-separated max scenes per extra path (0 = all scenes). '
-         'Must be empty or match the number of paths in --extra_train_paths. '
-         'Example: "1290:906"')
+    help='Colon-separated max scenes per extra path (0 = all). Example: "1290:906"')
 
 args = parser.parse_args()
 
-# ── Validation ───────────────────────────────────────────────────────────────
+# Validation of flags
 if args.decoder_zs_cross_attn and not args.latent_disentangle:
     raise ValueError("--decoder_zs_cross_attn requires --latent_disentangle")
 if args.cross_recon_weight > 0 and not args.latent_disentangle:
@@ -322,6 +394,12 @@ if args.position_layout_residual and not args.scene_layout_head:
     args.scene_layout_head = True
 if args.token_cond and 'B' in args.token_cond_approach.upper() and not args.scene_layout_head:
     args.scene_layout_head = True
+# Chamfer matches on the position columns as passed. In scaffold / layout-residual
+# modes those columns are residuals, so NN matching would be on residual coords.
+if args.use_chamfer_loss and (args.position_scaffold or args.position_layout_residual):
+    print("[WARNING] --use_chamfer_loss with position_scaffold/position_layout_residual: "
+          "Chamfer matches on residual position columns, which is likely not intended. "
+          "Use chamfer with absolute-position targets (no scaffold/residual).")
 
 need_scaffold_data = args.position_scaffold
 semantic_requested    = (args.semantic_mode != 'none')
@@ -333,29 +411,6 @@ need_segment_labels = (enable_semantic or args.scene_semantic_head or args.predi
 # ============================================================================
 # ACCELERATE
 # ============================================================================
-# find_unused_parameters=FALSE is correct and required here.
-#
-# Root cause of the "marked ready twice" crash:
-#   scene_layout_module is called TWICE inside a single gs_autoencoder() forward:
-#     1. Encoder path:  scene_layout_module(z_s_tokens) → last_scene_layout_pred
-#                       gradient flows: layout_loss → last_scene_layout_pred → slm
-#     2. Decoder path:  decoder uses last_scene_layout_pred (or calls slm directly)
-#                       for layout conditioning → UV_gs_recover → recon_loss → slm
-#   Both paths contribute to total_loss, so backward() accumulates scene_layout_module
-#   gradients from two sources. With find_unused_parameters=True, DDP registers an
-#   AccumulateGrad hook per parameter that fires ONCE PER GRADIENT ACCUMULATION.
-#   Two accumulations = two hook fires = "marked ready twice" crash.
-#
-# Why find_unused_parameters=False is SAFE:
-#   All model parameters are used in every gs_autoencoder() forward — scene_semantic_head,
-#   scene_layout_head, semantic_token_heads, fourier_pe, and the semantic projection head
-#   all run unconditionally. The cross_recon block goes through raw_model (unwrapped),
-#   which DDP cannot see, so it does not create conditional paths from DDP's perspective.
-#   With find_unused_parameters=False, DDP does NOT register AccumulateGrad hooks.
-#   Multiple gradient paths through the same parameter just accumulate normally. No crash.
-#
-# static_graph=False: kept False (True would require identical graph every iteration,
-#   which is incompatible with the semantic sampling variability).
 _ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True, static_graph=False)
 accelerator = Accelerator(kwargs_handlers=[_ddp_kwargs])
 
@@ -381,6 +436,8 @@ if args.use_wandb and accelerator.is_main_process:
             (args.decoder_layout_additive,      "_layAdd"),
             (args.zs_layout_infonce_weight > 0,   "_layNCE"),
             (args.zs_pool_infonce_weight > 0,      "_poolNCE"),
+            (args.morton_order,               "_morton"),
+            (args.use_chamfer_loss,           "_chamfer"),
             (enable_semantic,                 f"_pgNCE{args.segment_loss_weight}"),
         ]
         for flag, label in flags:
@@ -415,6 +472,8 @@ flags = [
     (args.decoder_layout_additive,      "_layAdd"),
     (args.zs_layout_infonce_weight > 0,   "_layNCE"),
     (args.zs_pool_infonce_weight > 0,      "_poolNCE"),
+    (args.morton_order,               "_morton"),
+    (args.use_chamfer_loss,           "_chamfer"),
     (enable_semantic,                 f"_pgNCE"),
 ]
 for flag, label in flags:
@@ -435,9 +494,12 @@ if accelerator.is_main_process:
     print(f"  latent_disentangle={args.latent_disentangle} semantic_dims={args.semantic_dims}")
     print(f"  scene_layout_head={args.scene_layout_head}")
     print(f"  decoder_fourier_pe={args.decoder_fourier_pe}")
-    print(f"  semantic_token_heads={args.semantic_token_heads}")
-    print(f"  zs_pool_infonce_weight={args.zs_pool_infonce_weight}")
-    print(f"  per-Gaussian InfoNCE mode={effective_semantic_mode} weight={args.segment_loss_weight}")
+    print(f"  token_local_decoder={args.token_local_decoder}")
+    print(f"  crop_percentile={args.crop_percentile}")
+    print(f"  morton_order={args.morton_order}"
+          f"{' curve='+args.order_curve.upper()+(' frame=[-%g,%g]'%(args.order_frame_radius,args.order_frame_radius) if args.order_frame_radius>0 else ' frame=per-scene') if args.morton_order else ''}")
+    print(f"  RECON OBJECTIVE = {'CHAMFER (permutation-invariant)' if args.use_chamfer_loss else 'element-wise L2'}"
+          f"{' chunk='+str(args.chamfer_chunk) if args.use_chamfer_loss else ''}")
     print(f"  cross_recon={args.cross_recon_weight} ortho={args.ortho_weight}")
     print(f"  Save: {save_path}")
     print(f"{'='*70}\n")
@@ -538,76 +600,27 @@ def build_lr_lambda(warmup_steps, total_steps, lr_min_ratio):
     return f
 
 def build_lr_lambda_restart(warmup_steps, restart_T0_steps, lr_min_ratio):
-    """
-    Cosine warm restarts with linear warmup.
-
-    Proven superior in Run 3 (1500 chunks, T0≈900 epochs):
-      - LR decays peak→floor over T0_steps after warmup, then RISES back to peak.
-      - The re-ascent lets the optimizer escape whatever basin it settled in and
-        find a lower minimum. Run 3 val L2=6.46 vs Run 1 (no restarts) val L2=29.04
-        with LESS data and LOWER peak LR.
-      - KL spikes during the rise (encoder re-explores latent space) then drops
-        to a LOWER value than before — confirmed healthy re-exploration.
-
-    Schedule:
-      step < warmup_steps        : linear warmup  0 → 1.0
-      step >= warmup_steps       : cosine cycles of length restart_T0_steps
-                                   each cycle: lr_min_ratio → 1.0 (rising half)
-                                               then 1.0 → lr_min_ratio (falling half)
-    The cosine here uses a FULL cosine period (2π) per cycle so LR rises AND falls
-    within one cycle — this matches CosineAnnealingWarmRestarts behaviour.
-    """
+    """Cosine warm restarts with linear warmup."""
     T = max(restart_T0_steps, 1)
     def f(step):
         if warmup_steps > 0 and step < warmup_steps:
             return float(step) / float(warmup_steps)
-        t = (step - warmup_steps) % T          # position within current cycle
-        # Standard cosine: 1.0 at t=0, floor at t=T/2, 1.0 at t=T
-        # This gives peak → floor → peak within one cycle.
+        t = (step - warmup_steps) % T
         cosine_val = 0.5 * (1 + math.cos(math.pi * t / (T / 2)))
         return lr_min_ratio + (1 - lr_min_ratio) * cosine_val
     return f
 
-# NOTE: _bpe, scheduler, and LR print are created AFTER datasets below
-# so _bpe reflects the actual combined dataset size (main + extra_train_paths).
+# NOTE: _bpe, scheduler created AFTER datasets so _bpe reflects combined size.
 
 # ============================================================================
 # DATASETS
 # ============================================================================
-# --train_data controls which scenes are used for TRAINING.
-#
-# NORMALIZATION (critical for correctness):
-#   "chunks"   → norm_factor.npy present → GLOBAL scene frame
-#                All 3888 chunks from the SAME scene share one norm_factor.npy
-#                (written by precompute_norm_from_chunks.py from the union of
-#                all chunk coords). Training chunks (first 3800 sorted) and
-#                held-out val chunks (last 88 sorted) BOTH use the same
-#                norm_factor.npy. The coordinate frame is fully consistent.
-#
-#   "full"     → norm_factor.npy absent → PER-SCENE fallback
-#                Each full scene normalised independently. Correct for
-#                train/ and val/ which contain complete room scans.
-#
-#   "combined" → chunks use global frame, full scenes use per-scene.
-#
-# VAL FULL SCENES (primary metric — thesis target):
-#   Always val/ — 100 held-out full scenes, per-scene normalization.
-#
-# VAL HELD-OUT CHUNKS (in-distribution diagnostic):
-#   When train_data="chunks" or "combined": the chunks sorted AFTER the
-#   training portion (skip_scenes=train_scenes) are used as a second val set.
-#   gs_dataset.skip_scenes handles the split — no file changes needed.
-#   These chunks have norm_factor.npy → same global frame as training chunks.
-# ============================================================================
 from gs_dataset_scenesplat import gs_dataset
 
-# Shared kwargs for all dataset instances
-# Only pass random_subset_seed to TRAINING datasets, not validation.
-# (We don't want randomization on val sets — keep them deterministic.)
 _train_only_kwargs = dict(random_subset_seed=args.random_subset_seed)
 
 _ds_kwargs = dict(
-    resol=200,
+    resol=100,
     sampling_method=args.sampling_method,
     normalize=args.use_canonical_norm,
     normalize_colors=args.normalize_colors,
@@ -620,12 +633,16 @@ _ds_kwargs = dict(
     scene_layout_head=args.scene_layout_head,
     jepa_idea1=args.jepa_idea1,
     position_layout_residual=args.position_layout_residual,
+    crop_percentile=args.crop_percentile,   # spatial crop before opacity sampling
+    morton_order=args.morton_order,         # Z-order reorder of selected Gaussians
+    order_curve=args.order_curve,           # which space-filling curve (hilbert default)
+    order_frame_radius=args.order_frame_radius,  # fixed canonical frame for the sort
 )
 
 _chunk_root = os.path.join(data_path, "train_grid1.0cm_chunk8x8_stride6x6")
 _full_root  = os.path.join(data_path, "train")
 
-# ── Training dataset ──────────────────────────────────────────────────────────
+# Training dataset
 if args.train_data == 'chunks':
     if accelerator.is_main_process:
         print(f"\n--- Training Dataset: CHUNKS ({_chunk_root}) ---")
@@ -633,7 +650,6 @@ if args.train_data == 'chunks':
         root=_chunk_root, random_permute=True, train=True,
         max_scenes=args.train_scenes, skip_scenes=None,
         **_train_only_kwargs, **_ds_kwargs)
-    # Record the actual number of chunks used for training (needed for skip_scenes below)
     _n_train_chunks = len(gs_dataset_train)
 
 elif args.train_data == 'full':
@@ -643,7 +659,7 @@ elif args.train_data == 'full':
         root=_full_root, random_permute=True, train=True,
         max_scenes=args.train_scenes, skip_scenes=None,
         **_train_only_kwargs, **_ds_kwargs)
-    _n_train_chunks = 0   # no chunks used
+    _n_train_chunks = 0
 
 else:  # combined
     _max_full  = max(1, args.train_scenes // 2) if args.train_scenes else None
@@ -659,7 +675,7 @@ else:  # combined
     gs_dataset_train = Data.ConcatDataset([_ds_full, _ds_chunk])
     _n_train_chunks  = len(_ds_chunk)
 
-# ── Val full scenes (PRIMARY — thesis target) ─────────────────────────────────
+# Val full scenes (PRIMARY — thesis target)
 if accelerator.is_main_process:
     print(f"\n--- Validation Dataset: val/ (held-out full scenes) ---")
 gs_dataset_val = gs_dataset(
@@ -667,75 +683,79 @@ gs_dataset_val = gs_dataset(
     random_permute=False, train=False,
     max_scenes=args.val_scenes, skip_scenes=None, **_ds_kwargs)
 
-# ── Val held-out chunks (IN-DISTRIBUTION DIAGNOSTIC) ──────────────────────────
-# These are the chunks sorted AFTER the training portion. They were never seen
-# during training. Because all chunks share norm_factor.npy computed from the
-# full scene union, held-out chunks use the SAME global coordinate frame as the
-# training chunks → normalization is fully consistent, no file changes needed.
-#
-# Gap metric: full_L2 / chunk_L2
-#   ≈ 1.0  → distribution shift is negligible
-#   >> 1.0 → chunks are much easier; the model generalises poorly to full scenes
-#             (which is the point — it quantifies what we knew qualitatively)
+# Val held-out chunks (in-distribution diagnostic)
 gs_dataset_val_chunk  = None
 valChunkDataLoader    = None
 _has_chunk_val        = False
+
+class _ChunkSplitError(Exception):
+    """Chunk train/val split is contaminated (train and val share chunks). Fatal:
+    must never be swallowed by the soft dataset-construction error handler below."""
+    pass
 
 if args.train_data in ('chunks', 'combined') and _n_train_chunks > 0:
     if accelerator.is_main_process:
         print(f"\n--- Validation Dataset: held-out chunks "
               f"(skip_scenes={_n_train_chunks}) ---")
     try:
-        # ── Cap held-out chunk val at args.val_scenes ────────────────────
-        # Without this cap, max_scenes=None loads ALL remaining (3888 -
-        # train_scenes) chunks into RAM at ~3.1 MB each. With train=300
-        # that's 3588 chunks × ~3 MB = 11+ GB per rank. With DDP×4 ranks
-        # it's ~45 GB wasted on a diagnostic val nobody iterates fully.
-        # Capping at val_scenes (typically 50) shrinks this to ~150 MB.
-        #
-        # CAVEAT — random_subset_seed contamination:
-        #   When --random_subset_seed is set, training picks a RANDOM
-        #   permutation of 300 scenes, but this val set still skips the
-        #   alphabetically-first 300 scenes. The chunks selected here may
-        #   therefore overlap with the training set, biasing the chunk-val
-        #   metric optimistically. The val_full split (separate val/ dir)
-        #   remains contamination-free and is the metric to trust.
+        # Clean split: training takes the first --train_scenes sorted chunks, so the
+        # chunks sorted AFTER that (skip_scenes=_n_train_chunks) are disjoint from
+        # training. With 3888 total and train_scenes=3800 this yields the last 88.
+        # chunk_val_scenes=None -> take all remaining; otherwise cap at that many.
         gs_dataset_val_chunk = gs_dataset(
             root=_chunk_root,
             random_permute=False, train=False,
-            skip_scenes=_n_train_chunks,   # skip the first _n_train_chunks (training)
-            max_scenes=args.val_scenes,    # cap at val_scenes (typically 50)
+            skip_scenes=_n_train_chunks,
+            max_scenes=args.chunk_val_scenes,
             **_ds_kwargs)
         if len(gs_dataset_val_chunk) > 0:
             _has_chunk_val = True
+            # ── HARD DISJOINTNESS GUARANTEE ──────────────────────────────────────
+            # Training chunks and held-out val chunks must never overlap. Overlap
+            # occurs when --random_subset_seed is set: training then samples a RANDOM
+            # train_scenes out of all chunks, while val skips the first train_scenes
+            # SORTED — so the skipped range is mostly inside the random training set.
+            # Reject it loudly rather than report a contaminated chunk metric.
+            _train_chunk_dirs = set(
+                gs_dataset_train.scene_dirs if args.train_data == 'chunks'
+                else _ds_chunk.scene_dirs)
+            _overlap = _train_chunk_dirs & set(gs_dataset_val_chunk.scene_dirs)
+            if _overlap:
+                raise _ChunkSplitError(
+                    f"\n{'!'*70}\n"
+                    f"CHUNK SPLIT CONTAMINATED: {len(_overlap)} chunk(s) are in BOTH the "
+                    f"training set and the held-out chunk-val set.\n"
+                    f"Cause: --random_subset_seed={args.random_subset_seed} makes training "
+                    f"sample a RANDOM {args.train_scenes} chunks, while the chunk-val skips "
+                    f"the first {args.train_scenes} SORTED chunks, so they overlap.\n"
+                    f"Fix:   unset --random_subset_seed (set RANDOM_SUBSET_SEED=\"\" in the "
+                    f"job). Training then takes the first {args.train_scenes} sorted chunks "
+                    f"and val takes the remaining {len(gs_dataset_val_chunk)} — disjoint by "
+                    f"construction.\n{'!'*70}")
+            if accelerator.is_main_process:
+                print(f"  Clean chunk split verified: {len(_train_chunk_dirs)} train / "
+                      f"{len(gs_dataset_val_chunk)} val chunks, 0 overlap ✓")
         else:
             if accelerator.is_main_process:
-                print(f"  [INFO] No held-out chunks available "
-                      f"(train_scenes={_n_train_chunks} used all chunks). "
-                      f"Chunk val disabled.")
+                print(f"  [INFO] No held-out chunks available. Chunk val disabled.")
             gs_dataset_val_chunk = None
+    except _ChunkSplitError:
+        raise  # contamination is fatal — never disable-and-continue on a dirty split
     except Exception as e:
         if accelerator.is_main_process:
             print(f"  [WARNING] Could not create held-out chunk val dataset: {e}")
         gs_dataset_val_chunk = None
+        _has_chunk_val = False
 
-# ── Extra training datasets (multi-path support) ──────────────────────────────
-# Scenes from extra paths use disable_semantics=True because ArkitScenes (137
-# classes) and ScanNet++ (100 classes) use label spaces incompatible with the
-# ScanNet72 model heads. Setting disable_semantics=True forces label_dist=zeros
-# and segment=-1 for those scenes, which causes all InfoNCE losses to return 0
-# for them automatically (see _sem_valid masking in the training loop for pool
-# and token NCE which otherwise would misuse argmax(zeros)=0 as a category).
-# All reconstruction and geometry losses are fully unaffected.
+# Extra training datasets (multi-path support)
 _extra_train_datasets = []
 _extra_path_list      = []
-_extra_n_scenes_map   = {}   # path → scene count (for summary print)
+_extra_n_scenes_map   = {}
 
 if args.extra_train_paths:
     _raw_paths  = [p.strip() for p in args.extra_train_paths.split(':') if p.strip()]
     _raw_scenes = ([s.strip() for s in args.extra_train_scenes.split(':') if s.strip()]
                    if args.extra_train_scenes else [])
-    # Pad scene counts with '0' (= all scenes) when fewer entries than paths
     while len(_raw_scenes) < len(_raw_paths):
         _raw_scenes.append('0')
     _raw_scenes = _raw_scenes[:len(_raw_paths)]
@@ -760,31 +780,20 @@ if args.extra_train_paths:
             if accelerator.is_main_process:
                 print(f"  [WARNING] Could not load extra dataset at {_ep}: {_exc}  (skipping)")
 
-# Combine main training dataset with all extra datasets
 if _extra_train_datasets:
     _gs_dataset_train_combined = Data.ConcatDataset(
         [gs_dataset_train] + _extra_train_datasets)
 else:
     _gs_dataset_train_combined = gs_dataset_train
 
-# ── Scheduler (created here so _bpe uses the actual combined dataset size) ────
-# When extra_train_paths are used, the combined dataset is larger than the main
-# dataset alone. Creating the scheduler here gives cosine decay the correct
-# total_steps so the LR floor is reached at epoch num_epochs, not earlier.
+# Scheduler (created here so _bpe uses the actual combined dataset size)
 _bpe = max(1, math.ceil(
     len(_gs_dataset_train_combined) / (args.batch_size * accelerator.num_processes)))
 _total_steps  = _bpe * args.num_epochs
 _elapsed      = _bpe * start_epoch
 
 if args.lr_restart_T0 > 0:
-    # ── Cosine warm restarts ──────────────────────────────────────────────────
-    # T0 is specified in EPOCHS; convert to optimizer steps.
-    # _elapsed warmup adjustment: if we're resuming mid-run, the current cycle
-    # position is (_elapsed % T0_steps). The lambda handles this via modulo
-    # so we pass the CURRENT step offset, not total elapsed.
     _restart_T0_steps = args.lr_restart_T0 * _bpe
-    # For warmup: only apply warmup on the very first cycle (step 0 to warmup_steps).
-    # If resuming after the warmup is already done, warmup_steps_adjusted=0.
     _warmup_adj = max(0, args.warmup_steps - _elapsed)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -796,11 +805,10 @@ if args.lr_restart_T0 > 0:
         print(f"\n  LR: peak={args.lr:.2e} | floor={args.lr*args.lr_min_ratio:.2e}")
         print(f"  Scheduler: COSINE WARM RESTARTS  T0={args.lr_restart_T0} epochs "
               f"({_restart_T0_steps} steps)  _bpe={_bpe}")
-        print(f"  Restart cycle: peak→floor→peak every {args.lr_restart_T0} epochs")
+        print(f"  Restart cycle: peak->floor->peak every {args.lr_restart_T0} epochs")
         print(f"  Expected restarts over {args.num_epochs} epochs: "
               f"{args.num_epochs // args.lr_restart_T0}")
 else:
-    # ── Original single cosine decay ─────────────────────────────────────────
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=build_lr_lambda(
         warmup_steps=max(0, args.warmup_steps - _elapsed),
         total_steps=max(_total_steps - _elapsed, 1),
@@ -810,7 +818,7 @@ else:
         print(f"  Scheduler: single cosine  _bpe={_bpe}  total_steps={_total_steps}  "
               f"combined_train_scenes={len(_gs_dataset_train_combined)}")
 
-# ── DataLoaders ───────────────────────────────────────────────────────────────
+# DataLoaders
 trainDataLoader = Data.DataLoader(
     dataset=_gs_dataset_train_combined, batch_size=args.batch_size,
     shuffle=True, num_workers=9, pin_memory=True, persistent_workers=True)
@@ -827,27 +835,22 @@ if _has_chunk_val:
 # ============================================================================
 # NORMALIZATION VERIFICATION
 # ============================================================================
-# Confirms that norm_factor.npy is present and consistent across all splits.
-# Run this check BEFORE accelerator.prepare to use raw dataset attributes.
-# ============================================================================
 if accelerator.is_main_process:
     print(f"\n{'='*70}")
     print(f"  NORMALIZATION VERIFICATION")
     print(f"{'='*70}")
 
     def _check_nf(label, dirs, expected_present):
-        """Check norm_factor.npy presence and spot-check consistency."""
         sample = min(50, len(dirs))
         nf_ok  = sum(1 for d in dirs[:sample]
                      if os.path.exists(os.path.join(d, 'norm_factor.npy')))
         if expected_present:
-            status = ('✓ ALL PRESENT — global frame' if nf_ok == sample
-                      else f'✗ MISSING in {sample-nf_ok}/{sample} — position WILL NOT converge!')
+            status = ('ALL PRESENT — global frame' if nf_ok == sample
+                      else f'MISSING in {sample-nf_ok}/{sample} — position WILL NOT converge!')
         else:
-            status = ('✓ ABSENT — per-scene fallback (correct for full scenes)'
+            status = ('ABSENT — per-scene fallback (correct for full scenes)'
                       if nf_ok == 0 else f'present in {nf_ok}/{sample} (unusual but OK)')
         print(f"  {label:<30s}: {nf_ok}/{sample}  {status}")
-        # Spot-check: if chunks, verify two chunks from same scene share the same nf
         if expected_present and nf_ok >= 2:
             _ex = dirs[0]
             _nf = np.load(os.path.join(_ex, 'norm_factor.npy'))
@@ -856,9 +859,6 @@ if accelerator.is_main_process:
                   f"scale={_nf[3]:.4f}")
         return nf_ok == sample if expected_present else True
 
-    _is_chunks_train = args.train_data in ('chunks', 'combined')
-
-    # Training chunks
     if args.train_data == 'chunks':
         _ok_train = _check_nf("Training chunks", gs_dataset_train.scene_dirs, True)
     elif args.train_data == 'combined':
@@ -867,40 +867,10 @@ if accelerator.is_main_process:
     else:
         _check_nf("Training full scenes", gs_dataset_train.scene_dirs, False)
 
-    # Val full scenes
     _check_nf("Val full scenes (primary)", gs_dataset_val.scene_dirs, False)
 
-    # Val held-out chunks
     if _has_chunk_val:
         _ok_chunk_val = _check_nf("Val held-out chunks", gs_dataset_val_chunk.scene_dirs, True)
-        # Cross-check: verify a held-out chunk and a training chunk from the same
-        # parent scene share the same norm_factor (the whole point of the fix)
-        _train_dirs = (gs_dataset_train.scene_dirs if args.train_data == 'chunks'
-                       else _ds_chunk.scene_dirs)
-        _train_bases = {os.path.basename(d).rsplit('_', 1)[0] for d in _train_dirs}
-        _found_cross = False
-        for val_dir in gs_dataset_val_chunk.scene_dirs[:20]:
-            _scene_id = os.path.basename(val_dir).rsplit('_', 1)[0]
-            if _scene_id in _train_bases:
-                # Find a training chunk from the same scene
-                _train_match = next(
-                    (d for d in _train_dirs if os.path.basename(d).startswith(_scene_id)),
-                    None)
-                if _train_match:
-                    nf_train = np.load(os.path.join(_train_match, 'norm_factor.npy'))
-                    nf_val   = np.load(os.path.join(val_dir,      'norm_factor.npy'))
-                    _match   = np.allclose(nf_train, nf_val, atol=1e-5)
-                    print(f"  Cross-check (same scene, train vs val chunk):")
-                    print(f"    Train: {os.path.basename(_train_match)} "
-                          f"scale={nf_train[3]:.4f}")
-                    print(f"    Val  : {os.path.basename(val_dir)} "
-                          f"scale={nf_val[3]:.4f}")
-                    print(f"    norm_factor match: {'✓ IDENTICAL' if _match else '✗ DIFFER — BUG!'}")
-                    _found_cross = True
-                    break
-        if not _found_cross:
-            print(f"  Cross-check: no overlapping scene found between train/val chunks "
-                  f"(expected if train used all chunks of those scenes)")
 
     print(f"{'='*70}\n")
 
@@ -916,20 +886,25 @@ if accelerator.is_main_process:
     print(f"  DATASET SUMMARY  (train_data='{args.train_data}')")
     print(f"{'='*70}")
     if _extra_train_datasets:
-        print(f"  Training scenes    : {_n_train_total}  "              f"({_n_train_main} main  +  {_n_train_extra} extra)")
+        print(f"  Training scenes    : {_n_train_total}  "
+              f"({_n_train_main} main  +  {_n_train_extra} extra)")
         for _ep in _extra_path_list:
-            print(f"    + {os.path.basename(_ep)}: {_extra_n_scenes_map[_ep]} scenes  "                  f"(semantics disabled)")
+            print(f"    + {os.path.basename(_ep)}: {_extra_n_scenes_map[_ep]} scenes  "
+                  f"(semantics disabled)")
     else:
         print(f"  Training scenes    : {_n_train_main}")
     print(f"  Val full scenes    : {n_val}  (PRIMARY — thesis target)")
     if _has_chunk_val:
-        print(f"  Val held-out chunks: {len(gs_dataset_val_chunk)}  "              f"(in-distribution diagnostic; skipped first {_n_train_chunks})")
+        print(f"  Val held-out chunks: {len(gs_dataset_val_chunk)}  "
+              f"(CLEAN split: first {_n_train_chunks} sorted = train, "
+              f"remaining = val, disjoint)")
     else:
-        print(f"  Val held-out chunks: N/A  (train_data='{args.train_data}' "              f"or all chunks used for training)")
-    if args.train_data in ('chunks', 'combined'):
-        _cnf_str = "norm_factor.npy GLOBAL frame ✓" if args.chunk_norm_factor else "per-scene fallback (--no_chunk_norm_factor)"
-        print(f"  Chunk norm mode    : {_cnf_str}")
-    print(f"  Batches/epoch      : {_bpe}  "          f"(batch={args.batch_size} × {accelerator.num_processes} GPUs)")
+        print(f"  Val held-out chunks: N/A")
+    print(f"  Gaussian order     : {(args.order_curve.upper()+' curve') if args.morton_order else 'opacity rank'}")
+    print(f"  Recon objective    : {'CHAMFER (order-free)' if args.use_chamfer_loss else 'element-wise L2'}")
+    print(f"  Spatial crop       : {('inner %.0f%%' % args.crop_percentile) if args.crop_percentile < 100 else 'disabled'}")
+    print(f"  Batches/epoch      : {_bpe}  "
+          f"(batch={args.batch_size} x {accelerator.num_processes} GPUs)")
     print(f"{'='*70}\n")
 
 # ============================================================================
@@ -1023,22 +998,34 @@ _ckpt_meta = {
     'scale_norm_mode':            args.scale_norm_mode,
     'train_data':                 args.train_data,
     'n_train_chunks':             _n_train_chunks,
+    'chunk_val_scenes':           args.chunk_val_scenes,
     'kl_anneal_steps':            args.kl_anneal_steps,
+    'crop_percentile':            args.crop_percentile,
+    'morton_order':               args.morton_order,
+    'order_curve':                args.order_curve,
+    'order_frame_radius':         args.order_frame_radius,
+    'use_chamfer_loss':           args.use_chamfer_loss,
+    'chamfer_chunk':              args.chamfer_chunk,
 }
 
 # ============================================================================
 # EVALUATION FUNCTION
 # ============================================================================
 def evaluate_model(model, raw_model, dataloader, device, accelerator,
-                   epoch=None, do_vis=True):
+                   epoch=None, do_vis=True, vis_tag=None):
     """
     Evaluate the autoencoder on a dataloader.
 
-    Parameters
-    ----------
-    do_vis : bool
-        Whether to save PLY / PCA visualisations. Pass False for the
-        held-out chunk eval to avoid doubling visualisation overhead.
+    vis_tag : optional str. When set (e.g. "chunk"), all saved visualisations
+        (reconstructed PLYs, PCA PLYs) go to suffixed folders
+        reconstructed_gaussians_<tag>/ and pca_visualisations_<tag>/ so the
+        held-out-chunk reconstructions do not overwrite the full-scene ones.
+        When None (default), the original folder names are used unchanged.
+
+    REPORTING: avg_l2_error and the per-attribute losses (position/color/...) are
+    reported as the RAW torch.norm per batch, averaged over the number of batches
+    (divide by n_batches, NOT n_scenes). This matches the training-side convention
+    so train and val numbers are on the same scale.
     """
     model.eval()
     _eval_dtype    = _autocast_dtype
@@ -1048,6 +1035,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
     total_anchor = total_layout = total_seg = total_z_s_nce = total_zs_tok_nce = total_zs_lay_nce = 0.0
     per_param    = {k: 0.0 for k in PARAM_SLICES}
     n_scenes     = 0
+    n_batches    = 0   # for raw, training-style averaging of recon / per-param
 
     recon_preds  = []; recon_means  = []
     pca_input    = []; pca_recon    = []
@@ -1055,8 +1043,11 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
     z_s_proj_acc = []; label_dist_acc = []
     zs_tokens_acc = []; zs_layout_acc = []; zs_pool_acc = []
 
-    # Visualisation only on full-scene val and only on the scheduled epochs
     _do_vis    = do_vis
+    # Suffix for output folders so chunk-val visualisations land in their own
+    # directory (reconstructed_gaussians_chunk/ etc.) instead of overwriting the
+    # full-scene ones. Empty string -> original paths (backward compatible).
+    _vsfx      = f"_{vis_tag}" if vis_tag else ""
     do_recon   = (_do_vis and epoch is not None and epoch % args.recon_ply_freq == 0)
     do_pca     = (_do_vis and epoch is not None and epoch % args.pca_vis_freq   == 0)
     do_sem_pca = (do_pca and enable_semantic)
@@ -1113,7 +1104,11 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
                 pred_3d = UV_gs_recover.reshape(B,-1,14)
 
             pred_abs   = UV_gs_recover.reshape(B,-1,14)
-            recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
+            if args.use_chamfer_loss:
+                recon_loss = chamfer_reconstruction_loss(
+                    pred_3d, target, B, args.color_loss_weight, args.chamfer_chunk)
+            else:
+                recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
             kl_loss    = -0.5*torch.sum(1+log_var - mu.pow(2) - log_var.exp(), dim=1)
 
             if mcp is not None and args.color_residual:
@@ -1155,13 +1150,19 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
             total_l2 += recon_loss.item()
             total_kl += kl_loss.sum().item()
             n_scenes  += B
+            n_batches += 1
 
             if n_scenes <= B:
                 _pos_abs_min  = pred_abs[:,:,0:3].cpu().float().min().item()
                 _pos_abs_max  = pred_abs[:,:,0:3].cpu().float().max().item()
                 _pos_gt_range = (UV_gs_batch[:,:,4:7].cpu().max()-UV_gs_batch[:,:,4:7].cpu().min()).item()/2
 
-            ind = compute_individual_losses(pred_3d, target)
+            # Under Chamfer the set is permutation-free, so index-matched per-component
+            # error is meaningless; match by position first. Element-wise keeps slot order.
+            if args.use_chamfer_loss:
+                ind = compute_individual_losses_matched(pred_3d, target, args.chamfer_chunk)
+            else:
+                ind = compute_individual_losses(pred_3d, target)
             for k in per_param: per_param[k] += ind[k]
 
             if do_recon and len(recon_preds) < args.recon_ply_num_scenes:
@@ -1201,22 +1202,23 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
                     if not label_dist_acc:
                         label_dist_acc.append(label_dist_v.cpu().numpy())
 
-    # ── PLY / PCA saves (full-scene val only) ─────────────────────────────────
+    # PLY / PCA saves (full-scene val by default; chunk val when vis_tag="chunk")
     if do_recon and recon_preds and accelerator.is_main_process:
         try:
             all_preds = np.stack(recon_preds, 0)
             if args.color_residual:
                 for si in range(len(all_preds)):
                     all_preds[si,:,3:6] = np.clip(all_preds[si,:,3:6] + recon_means[si], 0, 1)
-            recon_dir = Path(save_path)/"reconstructed_gaussians"/f"epoch_{epoch:03d}"
+            recon_dir = Path(save_path)/f"reconstructed_gaussians{_vsfx}"/f"epoch_{epoch:03d}"
             save_reconstructed_gaussians(predictions=all_preds, output_dir=recon_dir,
                 epoch=epoch, num_scenes=len(all_preds),
                 max_sh_degree=args.recon_ply_max_sh, color_mode="1")
+            print(f"  Recon PLYs{(' ['+vis_tag+']') if vis_tag else ''}: {recon_dir}")
         except Exception as e: print(f"  PLY error: {e}")
 
     if do_pca and pca_input and accelerator.is_main_process:
         try:
-            pca_dir = Path(save_path)/"pca_visualisations"/f"epoch_{epoch:03d}"
+            pca_dir = Path(save_path)/f"pca_visualisations{_vsfx}"/f"epoch_{epoch:03d}"
             pca_dir.mkdir(parents=True, exist_ok=True)
             for si in range(len(pca_input)):
                 coords_in = pca_input[si][:,4:7]
@@ -1237,7 +1239,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
         try:
             all_z_s = np.concatenate(z_s_proj_acc, 0)
             all_ld  = np.concatenate(label_dist_acc, 0)
-            vis_dir = Path(save_path)/"pca_visualisations"
+            vis_dir = Path(save_path)/f"pca_visualisations{_vsfx}"
             vis_dir.mkdir(parents=True, exist_ok=True)
             out = visualize_z_s_space(all_z_s, all_ld,
                 str(vis_dir/f"z_s_space_epoch_{epoch:03d}.ply"), verbose=True)
@@ -1248,7 +1250,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
         try:
             all_toks = np.concatenate(zs_tokens_acc, axis=0)
             all_ld   = np.concatenate(label_dist_acc, axis=0)
-            vis_dir  = Path(save_path) / "pca_visualisations"
+            vis_dir  = Path(save_path) / f"pca_visualisations{_vsfx}"
             vis_dir.mkdir(parents=True, exist_ok=True)
             out_tok = visualize_zs_tokens(zs_tokens=all_toks, label_dists=all_ld,
                 output_path=str(vis_dir / f"zs_tokens_epoch_{epoch:03d}.ply"), verbose=True)
@@ -1260,7 +1262,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
             all_lay = np.concatenate(zs_layout_acc, axis=0)
             all_ld  = np.concatenate(label_dist_acc, axis=0) if label_dist_acc else None
             if all_ld is not None:
-                vis_dir = Path(save_path) / "pca_visualisations"
+                vis_dir = Path(save_path) / f"pca_visualisations{_vsfx}"
                 vis_dir.mkdir(parents=True, exist_ok=True)
                 out_lay = visualize_zs_tokens(zs_tokens=all_lay, label_dists=all_ld,
                     output_path=str(vis_dir / f"zs_layout_epoch_{epoch:03d}.ply"), verbose=True)
@@ -1272,7 +1274,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
             all_pool = np.concatenate(zs_pool_acc, axis=0)
             all_ld   = np.concatenate(label_dist_acc, axis=0) if label_dist_acc else None
             if all_ld is not None:
-                vis_dir = Path(save_path) / 'pca_visualisations'
+                vis_dir = Path(save_path) / f"pca_visualisations{_vsfx}"
                 vis_dir.mkdir(parents=True, exist_ok=True)
                 out_pool = visualize_z_s_space(z_s_proj=all_pool, label_dists=all_ld,
                     output_path=str(vis_dir / f'zs_pool_epoch_{epoch:03d}.ply'), verbose=True)
@@ -1280,9 +1282,12 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
         except Exception as e: print(f'  z_s pool vis error: {e}')
 
     model.train()
-    n = max(n_scenes, 1)
+    n   = max(n_scenes, 1)      # for per-scene auxiliary means (MSE-based heads)
+    _nb = max(n_batches, 1)     # for raw recon / per-attribute norms (matches training)
     return {
-        'avg_l2_error':       total_l2,
+        # avg_l2_error and per-attribute losses: RAW norm per batch, averaged over
+        # batches (NOT per scene) — same convention as the training-side printout.
+        'avg_l2_error':       total_l2 / _nb,
         'avg_kl':             total_kl / n,
         'color_pred_loss':    total_color / n,
         'scene_semantic_kl':  total_scene_sem / n,
@@ -1297,7 +1302,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
         'pos_abs_min':        _pos_abs_min,
         'pos_abs_max':        _pos_abs_max,
         'pos_gt_range':       _pos_gt_range,
-        **{f'{k}_loss': v/n for k, v in per_param.items()},
+        **{f'{k}_loss': v/_nb for k, v in per_param.items()},
     }
 
 # ============================================================================
@@ -1305,110 +1310,38 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
 # ============================================================================
 print(f"\n{'='*70}\nSTARTING TRAINING  (epoch {start_epoch} -> {args.num_epochs-1})\n{'='*70}\n")
 
-# ── KL annealing ──────────────────────────────────────────────────────────────
-# When kl_anneal_steps > 0: kl_weight ramps linearly from 0 → args.kl_weight
-# over the first kl_anneal_steps optimizer steps, then holds at args.kl_weight.
-#
-# Why this prevents the epoch-50 KL explosion:
-#   Without annealing the encoder has kl_anneal_steps=0 → full KL penalty from
-#   step 0, but the gradient is so small (kl_weight=5e-5) that the encoder
-#   ignores it for 40+ epochs. By epoch 46 the posterior is very non-Gaussian
-#   (high mutual information) and the suddenly-relevant KL explodes to 75,502.
-#
-#   With annealing the encoder starts with KL_weight=0 → builds a reconstruction
-#   prior with zero regularisation. As kl_weight ramps up, the encoder receives
-#   an ever-growing gradient signal and adjusts gradually rather than all at once.
-#   The KL rises and falls smoothly instead of spiking.
-#
-# Recommended value: kl_anneal_steps = 20 × batches_per_epoch
-#   4 GPU, 3800 scenes, batch=90 → ~10 steps/epoch → 2000 steps = 200 epoch ramp
-#   1 GPU, 3800 scenes, batch=90 → ~42 steps/epoch → 2000 steps ≈ 48 epoch ramp
-#
-# _kl_step_offset accounts for resumed training so the ramp is relative to
-# the total steps taken across all runs, not just this run's steps.
 _kl_anneal_active = (args.kl_anneal_steps > 0)
-_kl_step_offset   = _bpe * start_epoch  # steps already taken before this run
+_kl_step_offset   = _bpe * start_epoch
 
 if accelerator.is_main_process:
     print(f"  KL annealing : {'ENABLED' if _kl_anneal_active else 'DISABLED (fixed kl_weight)'}")
     if _kl_anneal_active:
         _ramp_epochs = args.kl_anneal_steps / max(_bpe, 1)
         print(f"  kl_anneal_steps={args.kl_anneal_steps}  "
-              f"(≈ {_ramp_epochs:.0f} epochs at {_bpe} steps/epoch)")
-        print(f"  kl_weight ramps: 0.0 → {args.kl_weight:.1e} over first {args.kl_anneal_steps} steps")
+              f"(~ {_ramp_epochs:.0f} epochs at {_bpe} steps/epoch)")
+        print(f"  kl_weight ramps: 0.0 -> {args.kl_weight:.1e} over first {args.kl_anneal_steps} steps")
     else:
         print(f"  kl_weight fixed at {args.kl_weight:.1e} throughout")
     print()
 
-global_step = _kl_step_offset  # continue counting from where we left off
+global_step = _kl_step_offset
 
-# ── DDP FIX: scene_layout_module visibility hook ──────────────────────────────
-#
-# ROOT CAUSE (confirmed from model source code):
-#
-#   In Strategy A with token_cond=False, scene_layout_module (slm) is called
-#   ONCE in forward() — in the structured_layout_tokens encoder branch:
-#     self.last_scene_layout_pred = self.scene_layout_module(z_lay)
-#
-#   The output (last_scene_layout_pred / slp) is stored as a model attribute.
-#   It is NOT returned in the 6-tuple (shape_embed, mu, log_var, z,
-#   UV_gs_recover, per_gaussian_features).
-#
-#   DDP's prepare_for_backward() traverses only the 6 return tensors to find
-#   which parameters were used. slp is NOT reachable from any of them.
-#   → DDP marks slm as UNUSED and IMMEDIATELY PRE-FIRES "ready" for its params.
-#
-#   The training code then computes:
-#     slp  = raw_model.shape_model.last_scene_layout_pred  (has grad_fn → slm)
-#     layout_loss = compute_layout_loss(slp, gt_c, gt_v)
-#   total_loss.backward() fires AccumulateGrad for slm → "ready" AGAIN.
-#   → TWO "ready" signals → "marked ready twice" → crash.
-#
-# FIX: register a forward hook on raw_model.shape_model that adds
-#   per_gaussian_features + slp.sum() * 0.0  (a zero-gradient graph path).
-#
-#   Why this works:
-#   (a) "slp.sum() * 0.0" has grad_fn=MulBackward (graph path exists, value=0).
-#   (b) DDP's prepare_for_backward traverses pf_modified and finds slm.
-#       → DDP marks slm as USED → registers AccumulateGrad hook; no pre-fire.
-#   (c) During backward, layout_loss and the zero-path BOTH trace through the
-#       same slp tensor. PyTorch's autograd engine processes slp ONCE (summing
-#       gradients from both consumers). AccumulateGrad for slm fires ONCE.
-#       DDP hook fires ONCE. No crash.
-#   (d) Gradient to slm = layout_loss gradient + 0 = layout_loss gradient.
-#       Training is completely unaffected.
-
+# DDP visibility hook: connect all side-head outputs to the model output graph
 if raw_model.shape_model is not None:
-    # ALL side-head modules store their outputs as model attributes (last_XXX) that
-    # are NOT in the 6-tuple returned by forward(). DDP's prepare_for_backward()
-    # traverses only the 6 return tensors, so it marks every side head as UNUSED
-    # and pre-fires "ready" for its parameters. Then training losses (layout_loss,
-    # semantic_loss, pool_nce_loss, etc.) trace backward through those same params,
-    # firing "ready" a second time → "marked ready twice" crash.
-    #
-    # Fix: after forward() returns, add zero-gradient connections from every cached
-    # side-head output to per_gaussian_features. "pred.sum() * 0.0" has value=0 but
-    # a live grad_fn, so DDP's graph traversal reaches each side-head module and marks
-    # it USED. During backward, all paths (loss path + zero path) share the SAME cached
-    # tensor, so the autograd engine processes it once → AccumulateGrad fires ONCE.
     _SIDE_HEAD_ATTRS = [
-        'last_mean_color_pred',     # mean_color_head
-        'last_scene_semantic_pred', # scene_semantic_module
-        'last_scene_layout_pred',   # scene_layout_module
-        'last_z_s_infonce_proj',    # z_s_infonce_head
-        'last_zs_pool_proj',        # zs_pool_proj_head (embeddings)
-        'last_zs_pool_hidden',      # zs_pool_proj_head (hidden)
-        'last_z_layout_proj',       # z_layout_infonce_head  (Strategy B)
-        'last_z_layout_pool_proj',  # z_layout_pool_head     (Strategy B)
-        'last_z_layout_pool_hidden',# z_layout_pool_head     (Strategy B)
-        'last_seg_pred',            # seg_pred_head
+        'last_mean_color_pred',
+        'last_scene_semantic_pred',
+        'last_scene_layout_pred',
+        'last_z_s_infonce_proj',
+        'last_zs_pool_proj',
+        'last_zs_pool_hidden',
+        'last_z_layout_proj',
+        'last_z_layout_pool_proj',
+        'last_z_layout_pool_hidden',
+        'last_seg_pred',
     ]
 
     def _all_side_heads_ddp_visibility_hook(module, inp, output):
-        # output = (shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features)
-        # Attach zero-grad terms to UV_gs_recover (index 4) NOT per_gaussian_features
-        # (index 5). UV_gs_recover is always non-None and always in the loss graph; pf
-        # is None when semantic_mode='none', which would silently disable this fix.
         uv = output[4]
         if uv is None:
             return output
@@ -1416,13 +1349,11 @@ if raw_model.shape_model is not None:
         for attr in _SIDE_HEAD_ATTRS:
             pred = getattr(module, attr, None)
             if pred is not None and isinstance(pred, torch.Tensor) and pred.requires_grad:
-                term = pred.sum() * 0.0   # zero value, live grad_fn
+                term = pred.sum() * 0.0
                 zero_sum = term if zero_sum is None else zero_sum + term
         if zero_sum is None:
             return output
         uv_modified = uv + zero_sum
-        # Also propagate to per_gaussian_features when it exists, keeping the original
-        # behaviour when semantic_mode is 'hidden'/'geometric'/'dist'.
         pf = output[5]
         pf_modified = (pf + zero_sum) if (pf is not None) else pf
         return (output[0], output[1], output[2], output[3], uv_modified, pf_modified)
@@ -1431,7 +1362,6 @@ if raw_model.shape_model is not None:
     if accelerator.is_main_process:
         print("  DDP visibility hook registered: ALL side-head outputs connected to "
               "model output graph via zero-gradient paths (fixes 'marked ready twice')")
-# ─────────────────────────────────────────────────────────────────────────────
 
 for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                   disable=not accelerator.is_main_process):
@@ -1452,13 +1382,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         label_dist_v  = batch_data['label_dist'].float().to(device)
         B = UV_gs_batch.shape[0]
 
-        # _sem_valid[b] = True when scene b has at least one known semantic category.
-        # Scenes from extra_train_paths have label_dist=zeros (disable_semantics=True).
-        # Pool NCE and token NCE must be restricted to _sem_valid scenes because
-        # argmax(zeros)=0 assigns ALL no-semantic scenes to category 0, contaminating
-        # that prototype and producing false InfoNCE signal. Per-Gaussian NCE filters
-        # via segment >= 0, and z_s scene NCE is safe because F.normalize(zeros)=zeros
-        # produces zero weights — both handle mixed batches without this mask.
         _sem_valid = label_dist_v.sum(dim=1) > 1e-6   # [B] bool
 
         seg_labels = inst_labels = None
@@ -1472,11 +1395,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
 
         optimizer.zero_grad()
 
-        # ── KL weight for this step (annealed or fixed) ───────────────────────
-        # global_step counts total optimizer steps including any resumed steps.
-        # _kl_current ramps from 0 → args.kl_weight over kl_anneal_steps steps,
-        # then holds at args.kl_weight. When kl_anneal_steps=0 it is always
-        # args.kl_weight (no annealing — backward compatible).
         if _kl_anneal_active and global_step < args.kl_anneal_steps:
             _kl_current = args.kl_weight * (global_step / args.kl_anneal_steps)
         else:
@@ -1513,11 +1431,11 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             target  = target_abs
             pred_3d = UV_gs_recover.reshape(B,-1,14)
 
-        recon_loss  = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
-        # Clamp log_var before KL computation. Without a KL penalty (early annealing)
-        # the encoder can drive log_var to extreme values at high LR. Clamping to [-10, 10]
-        # keeps exp(0.5*log_var) in [0.007, 148] — numerically safe while still expressive.
-        # This has no effect once the KL penalty is large enough to self-regulate log_var.
+        if args.use_chamfer_loss:
+            recon_loss = chamfer_reconstruction_loss(
+                pred_3d, target, B, args.color_loss_weight, args.chamfer_chunk)
+        else:
+            recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
         log_var_clamped = log_var.clamp(-10.0, 10.0)
         KL_loss     = -0.5*torch.sum(1+log_var_clamped-mu.pow(2)-log_var_clamped.exp(), dim=1).mean()
 
@@ -1572,7 +1490,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         if args.zs_token_infonce_weight > 0 and args.latent_disentangle:
             _n_tok       = args.semantic_dims // 32
             _z_s_tok_all = z[:, :args.semantic_dims].reshape(B, _n_tok, 32)
-            # Restrict to scenes with valid semantics — argmax(zeros)=0 hazard.
             _n_sem_tok   = int(_sem_valid.sum().item())
             if _n_sem_tok >= 2:
                 zs_tok_nce_loss, zs_tok_nce_metrics = compute_zs_token_infonce_loss(
@@ -1592,9 +1509,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             _pool_emb = raw_model.shape_model.last_zs_pool_proj
             if _pool_emb is None:
                 _pool_emb = getattr(raw_model.shape_model, 'last_z_layout_pool_proj', None)
-            # Restrict to scenes with valid semantics — argmax(zeros)=0 hazard:
-            # if label_dist is all-zeros, argmax returns 0, causing all no-semantic
-            # scenes to cluster under category 0 and contaminate its prototype.
             _n_sem_pool = int(_sem_valid.sum().item())
             if _pool_emb is not None and _n_sem_pool >= 2:
                 _pe_v        = _pool_emb[_sem_valid]
@@ -1646,19 +1560,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                 _z_layout_shifted = torch.roll(
                     raw_model.shape_model.last_z_layout, shifts=1, dims=0)
 
-            # ── DDP FIX: remove scene_layout_module during cross-recon decode ──────
-            # ROOT CAUSE: scene_layout_module appears in TWO gradient paths in total_loss:
-            #   Path 1 (main forward):  layout_loss → last_scene_layout_pred → slm
-            #   Path 2 (cross_recon):   cross_recon_loss → UV_cross → decode() → slm
-            # With find_unused_parameters=True, DDP registers an AccumulateGrad hook on
-            # each leaf parameter. Leaf AccumulateGrad fires once per gradient accumulation.
-            # Two paths → two firings for the same parameter → "marked ready twice" crash.
-            #
-            # Fix: temporarily set scene_layout_module to None so decode() cannot call it.
-            # The model is built to handle None scene_layout_module (scene_layout_head is
-            # an optional flag). Also detach last_scene_layout_pred to cut any indirect
-            # gradient path decode() might take through the cached layout tensor.
-            # After decode(), both are restored to their original state.
             _saved_slm = raw_model.shape_model.scene_layout_module
             _saved_slp = raw_model.shape_model.last_scene_layout_pred
             raw_model.shape_model.scene_layout_module = None
@@ -1672,7 +1573,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                     scaffold_anchors=sa_gpu, scaffold_token_ids=sti_gpu,
                     z_layout=_z_layout_shifted)
 
-            # Restore both to original state before computing cross_recon_loss
             raw_model.shape_model.scene_layout_module = _saved_slm
             raw_model.shape_model.last_scene_layout_pred = _saved_slp
             pred_cross_3d = UV_cross.reshape(B, -1, 14)
@@ -1722,20 +1622,16 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                       + semantic_loss)
 
         accelerator.backward(total_loss)
-        # Gradient clipping at max_norm=10.
-        # log_var clamping only protects the KL loss value. The reparameterisation
-        # z = mu + exp(0.5*log_var)*eps runs INSIDE the model forward before any
-        # clamping. Without clipping, lr=8e-4 can drive log_var to ~20 in one bad
-        # step: exp(0.5×20)≈22026, z values reach ±66000, BF16 overflows (max 65504)
-        # → NaN. This is exactly the epoch-30 NaN in doc 27.
-        # max_norm=10: at natural ||g||=20 uses 50% of signal (not destructive);
-        # at ||g||=200 (pathological batch) uses 5% (safely dampened).
-        # max_norm=1 only used 2-10% → reconstruction plateau seen in doc 24.
         accelerator.clip_grad_norm_(gs_autoencoder.parameters(), max_norm=10.0)
         optimizer.step()
         scheduler.step()
 
-        ind = compute_individual_losses(pred_3d, target)
+        # Per-component readout: matched-by-position under Chamfer (the set is
+        # permutation-free), index-matched for element-wise (slot order is enforced).
+        if args.use_chamfer_loss:
+            ind = compute_individual_losses_matched(pred_3d, target, args.chamfer_chunk)
+        else:
+            ind = compute_individual_losses(pred_3d, target)
         e['loss']       += total_loss.item()
         e['recon']      += recon_loss.item()
         e['kl']         += KL_loss.item()
@@ -1765,6 +1661,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             print(f"  recon={recon_loss.item():.4f} | KL={KL_loss.item():.4f} | "
                   f"kl_weight={_kl_current:.2e} | KL_contrib={_kl_current*KL_loss.item():.4f} | "
                   f"mu=[{mu.min().item():.3f},{mu.max().item():.3f}]")
+            print(f"  recon objective: {'CHAMFER' if args.use_chamfer_loss else 'element-wise'} | "
+                  f"morton_order={args.morton_order}")
             if _kl_anneal_active:
                 _pct = min(100.0, 100.0 * global_step / args.kl_anneal_steps)
                 print(f"  KL annealing: step {global_step}/{args.kl_anneal_steps} "
@@ -1777,7 +1675,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
 
     nb = len(trainDataLoader)
     lr_now = scheduler.get_last_lr()[0]
-    # kl_weight at the last step of this epoch (for logging)
     _kl_log = _kl_current
     if accelerator.is_main_process:
         print(f"\nEpoch {epoch:04d} | "
@@ -1806,10 +1703,9 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         print(f"  Pos={e['pos']/nb:.3f} | Col={e['col']/nb:.3f} | "
               f"Opa={e['opa']/nb:.3f} | Scl={e['scl']/nb:.3f} | Rot={e['rot']/nb:.3f}")
 
-    # ── EVALUATION ────────────────────────────────────────────────────────────
+    # EVALUATION
     if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
 
-        # PRIMARY: full-scene val (thesis target, used for best model)
         val_metrics = evaluate_model(gs_autoencoder, raw_model, valDataLoader,
                                      device, accelerator, epoch=epoch, do_vis=True)
 
@@ -1834,11 +1730,13 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             if args.zs_layout_infonce_weight > 0:
                 print(f"  LayNCE={val_metrics['zs_lay_infonce_loss']:.4f}")
 
-        # DIAGNOSTIC: held-out chunk val (in-distribution, no vis overhead)
         chunk_metrics = None
         if _has_chunk_val:
+            # do_vis=True + vis_tag="chunk": save held-out-chunk reconstructions to
+            # reconstructed_gaussians_chunk/ (separate from the full-scene PLYs).
             chunk_metrics = evaluate_model(gs_autoencoder, raw_model, valChunkDataLoader,
-                                           device, accelerator, epoch=epoch, do_vis=False)
+                                           device, accelerator, epoch=epoch,
+                                           do_vis=True, vis_tag="chunk")
             if accelerator.is_main_process:
                 print(f"\n--- Val HELD-OUT CHUNKS epoch {epoch} "
                       f"(skip={_n_train_chunks}, n={len(gs_dataset_val_chunk)}) ---")
@@ -1848,24 +1746,19 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                       f"Opa={chunk_metrics['opacity_loss']:.4f}  "
                       f"Scl={chunk_metrics['scale_loss']:.4f}  "
                       f"Rot={chunk_metrics['rotation_loss']:.4f}")
-                # Distribution gap metric: how much harder are full scenes vs chunks?
-                # Values close to 1.0 mean the model generalises well.
-                # Values >> 1.0 mean the training-eval distribution shift is large.
                 if chunk_metrics['avg_l2_error'] > 1e-6:
                     _gap = val_metrics['avg_l2_error'] / chunk_metrics['avg_l2_error']
-                    print(f"  DISTRIBUTION GAP  full_L2 / chunk_L2 = {_gap:.2f}×  "
+                    print(f"  DISTRIBUTION GAP  full_L2 / chunk_L2 = {_gap:.2f}x  "
                           f"({'negligible' if _gap < 1.3 else 'moderate' if _gap < 2.0 else 'large — chunks much easier'})")
 
-        # Best model checkpoint on full-scene val (primary metric)
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']
             best_epoch    = epoch
             if accelerator.is_main_process:
                 ckpt_dict = {
-                    'epoch':                epoch,
-                    'model_state_dict':     raw_model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_l2_error':         val_metrics['avg_l2_error'],
+                    'epoch':            epoch,
+                    'model_state_dict': raw_model.state_dict(),
+                    'val_l2_error':     val_metrics['avg_l2_error'],
                     **_ckpt_meta,
                 }
                 if chunk_metrics is not None:
@@ -1888,12 +1781,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                                                 / chunk_metrics['avg_l2_error'])
             wandb_run.log(log_dict)
 
-    if epoch >= 10 and epoch % 500 == 0 and accelerator.is_main_process:
-        torch.save({'epoch': epoch, 'model_state_dict': raw_model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'train_loss': e['loss']/nb, **_ckpt_meta},
-                   os.path.join(save_path, f"epoch_{epoch}.pth"))
-
 # ============================================================================
 # FINAL SAVE
 # ============================================================================
@@ -1904,14 +1791,14 @@ final_chunk_metrics = None
 if _has_chunk_val:
     final_chunk_metrics = evaluate_model(gs_autoencoder, raw_model, valChunkDataLoader,
                                          device, accelerator, epoch=args.num_epochs-1,
-                                         do_vis=False)
+                                         do_vis=True, vis_tag="chunk")
 
 if accelerator.is_main_process:
     print(f"\nFinal full_L2 : {final_metrics['avg_l2_error']:.4f}")
     if final_chunk_metrics is not None:
         print(f"Final chunk_L2: {final_chunk_metrics['avg_l2_error']:.4f}")
         if final_chunk_metrics['avg_l2_error'] > 1e-6:
-            print(f"Final gap     : {final_metrics['avg_l2_error']/final_chunk_metrics['avg_l2_error']:.2f}×")
+            print(f"Final gap     : {final_metrics['avg_l2_error']/final_chunk_metrics['avg_l2_error']:.2f}x")
     print(f"Best full_L2  : {best_val_loss:.4f}  (epoch {best_epoch})")
 
     final_dict = {
