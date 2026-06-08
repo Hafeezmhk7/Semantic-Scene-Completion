@@ -14,6 +14,15 @@ DECODER STRATEGIES (controlled by flags, all backward-compatible):
 CHANGE vs original: get_decoder_transformer_features() added between encode() and decode()
 for use by Stage 2 Latent Perceptual Loss (LPL).
 See train_stage2.py --lpl_weight flag.
+
+TOKEN-LOCAL DECODER ADDITION (token_local_decoder=True flag):
+  Replaces the flat 777M-param GS_decoder (1024-d bottleneck → memorisation
+  ceiling) with a shared per-token MLP (~1.6M params, no bottleneck). Each
+  of the 512 decoder tokens decodes its own slice of 79 Gaussians using
+  shared weights. Per-Gaussian semantic features for InfoNCE flow through
+  the existing SemanticProjectionHead via a pooled-hidden path that matches
+  the original [B, 1024] interface, so semantic_mode='hidden' works unchanged.
+  All other strategies (A/B/C/D) remain backward-compatible.
 """
 
 import torch
@@ -29,6 +38,7 @@ from model.michelangelo.models.modules.distributions import DiagonalGaussianDist
 from model.michelangelo.models.modules.transformer_blocks import (
     ResidualCrossAttentionBlock, Transformer)
 from .tsal_base import ShapeAsLatentModule
+from .token_local_decoder import TokenLocalDecoder
 
 
 # ============================================================================
@@ -279,7 +289,7 @@ class AnchorPredFromTokens(nn.Module):
         return self.head(transformer_tokens.reshape(B*T, W)).reshape(B, T, 3)
 
 
-_N_GAUSSIANS  = 40_000
+_N_GAUSSIANS  = 10_000
 FIXED_TOKEN_IDS_512 = torch.arange(_N_GAUSSIANS) * 512 // _N_GAUSSIANS
 FIXED_TOKEN_IDS_496 = torch.arange(_N_GAUSSIANS) * 496 // _N_GAUSSIANS
 
@@ -311,7 +321,7 @@ class TokenCondMLP(nn.Module):
         return self.mlp(fe.reshape(B*T, D)).reshape(B, T, -1)
 
 class SemanticProjectionHead(nn.Module):
-    def __init__(self, hidden_dim=1024, num_gaussians=40000, feature_dim=32):
+    def __init__(self, hidden_dim=1024, num_gaussians=10000, feature_dim=32):
         super().__init__()
         self.num_gaussians = num_gaussians
         self.feature_dim   = feature_dim
@@ -337,7 +347,7 @@ class SemanticDistributionHead(nn.Module):
     def forward(self, hidden): return self.head(hidden)
 
 class SemanticProjectionHeadGeometric(nn.Module):
-    def __init__(self, gaussian_dim=14, num_gaussians=40000, feature_dim=32, hidden_dim=128):
+    def __init__(self, gaussian_dim=14, num_gaussians=10000, feature_dim=32, hidden_dim=128):
         super().__init__()
         self.num_gaussians = num_gaussians
         self.projection = nn.Sequential(
@@ -369,15 +379,15 @@ class GS_decoder(nn.Module):
             self.pts_linears.append(nn.Linear(W, W))
             self.pts_linears.append(nn.LayerNorm(W))
             self.pts_linears.append(nn.ReLU())
-        self.output_linear = nn.Linear(W, 40_000 * 14)
+        self.output_linear = nn.Linear(W, 10_000 * 14)
         print(f"  GS_DECODER ({num_tokens} tokens): {num_tokens}×{width}={input_ch} "
-              f"→ 40000×14  "
+              f"→ 10000×14  "
               f"({'residuals' if color_residual else 'clamp(0,1)'})")
 
     def forward(self, x, return_hidden=False):
         for layer in self.pts_linears: x = layer(x)
         hidden = x
-        raw    = self.output_linear(x).reshape(x.shape[0], 40_000, 14)
+        raw    = self.output_linear(x).reshape(x.shape[0], 10_000, 14)
         pos    = raw[:, :, 0:3]
         color  = raw[:, :, 3:6] if self.color_residual else raw[:, :, 3:6].clamp(0., 1.)
         opac   = torch.sigmoid(raw[:, :, 6:7])
@@ -557,7 +567,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  structured_layout_tokens=False,
                  position_layout_residual=False,
                  jepa_idea1=False,
-                 query_decoder=False):
+                 query_decoder=False,
+                 token_local_decoder=False):
 
         super().__init__(
             device=device, dtype=dtype, num_latents=1 + num_latents,
@@ -585,6 +596,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.decoder_layout_cross_attn = decoder_layout_cross_attn
         self.decoder_layout_additive       = decoder_layout_additive
         self.structured_layout_tokens_flag = structured_layout_tokens
+        self.token_local_decoder_flag      = token_local_decoder
 
         _Z_TOKENS         = 16384 // embed_dim
         self._n_zs_tokens = semantic_dims // embed_dim
@@ -606,6 +618,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         print(f"  scene_layout_head={scene_layout_head}  decoder_fourier_pe={decoder_fourier_pe}")
         print(f"  token_cond={token_cond} adaln={token_cond_adaln}")
         print(f"  semantic_token_heads={semantic_token_heads}")
+        print(f"  token_local_decoder={token_local_decoder}  (architectural fix; "
+              f"1.6M-param shared per-token MLP replaces 777M flat GS_decoder)")
         print(f"{'='*70}")
 
         if semantic_token_heads and not latent_disentangle:
@@ -797,13 +811,49 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.semantic_projection_geometric = None
         self.semantic_distribution_head    = None
         if semantic_mode == 'hidden':
-            self.semantic_projection_hidden = SemanticProjectionHead(1024, 40000, 32)
+            self.semantic_projection_hidden = SemanticProjectionHead(1024, 10000, 32)
         elif semantic_mode == 'geometric':
-            self.semantic_projection_geometric = SemanticProjectionHeadGeometric(14, 40000, 32, 128)
+            self.semantic_projection_geometric = SemanticProjectionHeadGeometric(14, 10000, 32, 128)
         elif semantic_mode == 'dist':
             self.semantic_distribution_head = SemanticDistributionHead(1024, 72)
         elif semantic_mode not in ('none', 'attention'):
             raise ValueError(f"Unknown semantic_mode: '{semantic_mode}'")
+
+        # ────────────────────────────────────────────────────────────────────
+        # TOKEN-LOCAL DECODER OVERRIDE
+        # ────────────────────────────────────────────────────────────────────
+        # When token_local_decoder=True, replace every standard GS_decoder
+        # instance (already built above by super().__init__ and the strategy
+        # branches below) with a TokenLocalDecoder. The TokenLocalDecoder
+        # exposes the identical forward(x, return_hidden=False) interface and
+        # output shape [B, 40000*14] as the flat MLP, so decode() and the
+        # semantic-feature pipeline both work unchanged.
+        #
+        # GS_decoder instances that may exist at this point:
+        #   - self.GS_decoder       (512 tokens) → Strategy A / B / C paths
+        #   - self.GS_decoder_B     (512 tokens) → Strategy B1 path
+        #   - self.GS_decoder_new   (_n_zg_tokens) → Strategy D path
+        # Only the relevant decoder is actually used per forward, but consistent
+        # replacement keeps checkpoint compatibility simple.
+        #
+        # Per-Gaussian InfoNCE: the SemanticProjectionHead receives the [B, 1024]
+        # pooled hidden from TokenLocalDecoder.hidden_proj and produces per-
+        # Gaussian features [B, 40000, 32] exactly as before. No changes needed
+        # to the per_gaussian_features pipeline or the 6-tuple forward return.
+        if token_local_decoder:
+            print(f"\n  [TOKEN-LOCAL DECODER] Replacing flat GS_decoder(s) with "
+                  f"shared per-token MLPs:")
+            self.GS_decoder = TokenLocalDecoder(
+                width=width, hidden_dim=512, num_tokens=512,
+                num_gaussians=10_000, color_residual=color_residual)
+            if self.GS_decoder_B is not None:
+                self.GS_decoder_B = TokenLocalDecoder(
+                    width=width, hidden_dim=512, num_tokens=_Z_TOKENS,
+                    num_gaussians=10_000, color_residual=color_residual)
+            if self.GS_decoder_new is not None:
+                self.GS_decoder_new = TokenLocalDecoder(
+                    width=width, hidden_dim=512, num_tokens=self._n_zg_tokens,
+                    num_gaussians=10_000, color_residual=color_residual)
 
         print(f"{'='*70}\n")
 
@@ -1072,7 +1122,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             _fixed_ids = FIXED_TOKEN_IDS_512
 
         if pred_anchors is not None:
-            pred_3d = reconstruction.reshape(B, 40_000, 14)
+            pred_3d = reconstruction.reshape(B, 10_000, 14)
             if scaffold_token_ids is not None:
                 idx_3d = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, 3)
                 dc     = torch.gather(pred_anchors, 1, idx_3d)
@@ -1083,7 +1133,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
 
         self.last_seg_pred = None
         if self.seg_pred_head is not None:
-            self.last_seg_pred = self.seg_pred_head(reconstruction.reshape(B, 40000, 14))
+            self.last_seg_pred = self.seg_pred_head(reconstruction.reshape(B, 10000, 14))
 
         semantic_features = None
         if return_semantic_features and hidden is not None:
@@ -1091,7 +1141,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 semantic_features = self.semantic_projection_hidden(hidden)
             elif self.semantic_mode == 'geometric':
                 semantic_features = self.semantic_projection_geometric(
-                    reconstruction.reshape(B, 40000, 14))
+                    reconstruction.reshape(B, 10000, 14))
             elif self.semantic_mode == 'dist':
                 semantic_features = self.semantic_distribution_head(hidden)
 

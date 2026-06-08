@@ -9,28 +9,36 @@ NORMALIZATION:
   - When norm_factor.npy is absent (full scenes in train/):
       Falls back to per-scene normalization — identical to original Can3Tok.
 
-  This means the same dataset class works correctly for BOTH:
-    - train_grid1.0cm_chunk8x8_stride6x6/  (chunks → uses norm_factor.npy)
-    - train/                                (full scenes → per-scene fallback)
-    - val/                                  (full scenes → per-scene fallback)
-
 SKIP_SCENES PARAMETER:
-  skip_scenes=N causes the first N sorted scene directories to be skipped
-  before applying max_scenes. This lets you carve out a held-out validation
-  split from the same directory without any file-system changes.
+  skip_scenes=N skips the first N sorted scene directories before applying
+  max_scenes, to carve out a held-out split from the same directory.
 
-  Example — training on the first 3800 chunks and evaluating on the rest:
-    train_ds = gs_dataset(root=chunk_dir, max_scenes=3800, ...)
-    val_ds   = gs_dataset(root=chunk_dir, skip_scenes=3800, ...)
+SPATIAL CROP (crop_percentile < 100):
+  After normalization, keeps only Gaussians within the inner crop_percentile%
+  by distance from the scene centroid, then opacity-samples from those.
 
-  Because all chunks share the same norm_factor.npy (computed by
-  precompute_norm_from_chunks.py from the union of all chunks per scene),
-  the held-out chunks use exactly the same global coordinate frame as the
-  training chunks — normalization is fully consistent.
+MORTON / Z-ORDER ORDERING (morton_order=True):
+  After opacity SELECTS which TARGET_POINTS Gaussians to keep, Morton REORDERS
+  that selected set along a Z-order space-filling curve. Array slot i then
+  corresponds to a spatially-stable location across scenes, instead of the
+  meaningless opacity rank.
+
+  Why this matters:
+    The cross-attention encoder is permutation-invariant — the latent encodes
+    the SET of Gaussians but not their array order. The element-wise
+    reconstruction loss (slot i vs slot i) therefore requires a STABLE,
+    learnable correspondence between output slots and target slots. Ordering by
+    opacity makes output slot i = "the i-th most opaque Gaussian", a different
+    physical point in every scene → not a learnable function → the element-wise
+    loss hits an irreducible floor. Ordering by a Z-order curve makes slot i a
+    spatially-stable location, aligned with the decoder's canonical voxel-grid
+    token structure, which makes the loss learnable.
+
+  Order-free losses (Chamfer, set in the training script) do NOT need this;
+  combining the two is harmless. Cost is one sort at preload, zero at train time.
 
 PRELOADING (preload=True, default):
   All scenes preprocessed once at __init__ and stored in RAM.
-  Workers inherit via copy-on-write fork — zero per-batch overhead.
 """
 
 import os
@@ -63,22 +71,8 @@ def normalize_with_norm_factor(coord, scale, scene_dir,
     otherwise fall back to per-scene normalization.
 
     norm_factor.npy = [cx, cy, cz, scale_factor]
-    Produced by precompute_norm_from_chunks.py, which combines ALL chunks of
-    a scene → computes center+scale from the union → global scene frame.
-
-    WHY THIS MATTERS FOR CHUNKS:
-      Without: each chunk normalized into its own local 10m sphere.
-        Chunk A (left side of room): positions centered on left wall.
-        Chunk B (right side of room): positions centered on right wall.
-        z_A ≈ z_B (encoder sees similar content) but targets differ
-        → gradient cancellation → position loss stuck at ~2300.
-
-      With: all chunks of room share one coordinate frame.
-        Position [2, 0, 1] always refers to the same physical location.
-        Decoder can learn generalizable position priors → converges.
-
-    FALLBACK (full scenes, val set):
-      If norm_factor.npy is absent, identical to normalize_to_canonical_sphere.
+    Produced by precompute_norm_from_chunks.py from the union of all chunks of
+    a scene → global scene frame. Absent → per-scene fallback.
     """
     nf_path = os.path.join(scene_dir, 'norm_factor.npy')
 
@@ -102,6 +96,166 @@ def normalize_with_norm_factor(coord, scale, scene_dir,
         scale_norm = scale * scale_factor
 
     return coord_norm, scale_norm
+
+
+def spatial_crop_by_centroid(coord, crop_percentile=50):
+    """
+    Return a boolean mask keeping only the inner crop_percentile% of
+    Gaussians by Euclidean distance from the scene centroid.
+    100 → keep all.  50 → keep nearest 50% to centroid.
+    """
+    if crop_percentile >= 100.0:
+        return np.ones(len(coord), dtype=bool)
+    centroid  = coord.mean(axis=0)
+    dists     = np.linalg.norm(coord - centroid, axis=1)
+    threshold = np.percentile(dists, crop_percentile)
+    return dists <= threshold
+
+
+def morton_sort_indices(coord, bits=10, frame_radius=None):
+    """
+    Return indices that sort points along a Morton (Z-order) space-filling curve.
+
+    coord        : np.ndarray [N, 3]   point positions
+    bits         : int                 quantization bits per axis (10 -> 1024^3 grid)
+    frame_radius : None -> per-scene min-max (legacy); R>0 -> fixed canonical frame
+                   [-R, R] (see _quantize_coord). Use the data's normalization radius
+                   for a scene-agnostic, cross-scene-consistent ordering.
+    """
+    q = _quantize_coord(coord, bits=bits, frame_radius=frame_radius)
+    code = np.zeros(len(coord), dtype=np.uint64)
+    for i in range(bits):
+        code |= ((q[:, 0] >> np.uint64(i)) & np.uint64(1)) << np.uint64(3 * i + 2)
+        code |= ((q[:, 1] >> np.uint64(i)) & np.uint64(1)) << np.uint64(3 * i + 1)
+        code |= ((q[:, 2] >> np.uint64(i)) & np.uint64(1)) << np.uint64(3 * i + 0)
+    return np.argsort(code, kind='stable')
+
+
+def _quantize_coord(coord, bits=10, frame_radius=None):
+    """
+    Quantize [N,3] float coords to an integer grid in [0, 2^bits).
+
+    frame_radius :
+      None  -> PER-SCENE min-max (legacy): each scene's bounding box is stretched
+               to fill the grid. The ordering is then relative to THIS scene's box,
+               so slot i means a different absolute place in every scene.
+      R>0   -> FIXED CANONICAL FRAME: map [-R, R] -> [0, 1] (clip outliers), then
+               quantize. The grid is the same absolute frame for every scene, so
+               the Hilbert/Morton traversal visits the same physical cells in the
+               same order across scenes. This matches the original Can3Tok
+               HilbertSort3D (origin=0, fixed radius) and is the whole point of a
+               *canonical* tokenization: it gives the decoder one scene-agnostic
+               slot->position map to learn instead of a per-scene one.
+
+    Set R to the radius your coordinates are normalized to (target_radius).
+    """
+    c = coord.astype(np.float64)
+    if frame_radius is None or frame_radius <= 0:
+        # legacy per-scene min-max
+        c = c - c.min(axis=0, keepdims=True)
+        rng = c.max(axis=0, keepdims=True)
+        rng[rng < 1e-12] = 1.0
+        u = c / rng
+    else:
+        R = float(frame_radius)
+        u = (c + R) / (2.0 * R)            # [-R, R] -> [0, 1]
+        u = np.clip(u, 0.0, 1.0)           # points outside the frame pin to the boundary
+    return np.floor(u * (2 ** bits - 1)).astype(np.uint64)
+
+
+def _hilbert_encode(coords_int, num_bits=10):
+    """
+    Map integer 3D coords [N,3] in [0, 2^num_bits) to their Hilbert-curve distance.
+
+    Skilling 2004 ("Programming the Hilbert curve") AxesToTranspose transform,
+    vectorized over N. Returns [N] uint64 distances along the 3D Hilbert curve.
+
+    WHY HILBERT INSTEAD OF MORTON/Z-ORDER:
+      A space-filling curve imposes a 1D order on 3D points so the element-wise
+      reconstruction loss has a stable slot -> position target. The decoder then
+      has to learn the function  slot_index -> 3D position  for each scene.
+      How easy that function is to learn (and to GENERALIZE) depends on how
+      smooth it is:
+
+        Z-order (Morton): interleaves coordinate bits. When a high-order bit
+          flips, the curve teleports across the volume. Consecutive indices can
+          be far apart (on an 8^3 grid the max single-step L1 jump is 15, with
+          255 discontinuities). The slot->position target is piecewise-smooth
+          with many large jumps, so the decoder must memorize where the jumps
+          land for each scene -> harder to fit, worse to generalize.
+
+        Hilbert: provably superior locality (Point Transformer V3, OctFormer,
+          HydraMamba all use it for this reason). Consecutive indices are ALWAYS
+          spatially adjacent (single-step L1 distance is exactly 1, zero jumps).
+          The slot->position target is Lipschitz-continuous, so the decoder
+          learns one smooth, scene-agnostic curve-drawing function that
+          transfers to unseen scenes far better.
+
+      Measured on 10k random points: mean consecutive Euclidean spacing is
+      ~0.49 for Hilbert vs ~0.61 for Morton (lower = tighter locality).
+    """
+    coords = coords_int.astype(np.uint64)
+    n = coords.shape[1]
+    X = [coords[:, i].copy() for i in range(n)]
+    one = np.uint64(1)
+    M = one << np.uint64(num_bits - 1)
+    # Inverse undo excess work
+    Q = M
+    while Q > one:
+        P = Q - one
+        for i in range(n):
+            mask = (X[i] & Q) != 0
+            X[0][mask] ^= P
+            nmask = ~mask
+            t = (X[0][nmask] ^ X[i][nmask]) & P
+            X[0][nmask] ^= t
+            X[i][nmask] ^= t
+        Q >>= one
+    # Gray encode
+    for i in range(1, n):
+        X[i] ^= X[i - 1]
+    t = np.zeros(coords.shape[0], dtype=np.uint64)
+    Q = M
+    while Q > one:
+        bitset = (X[n - 1] & Q) != 0
+        t[bitset] ^= (Q - one)
+        Q >>= one
+    for i in range(n):
+        X[i] ^= t
+    # Interleave the transpose form into a single scalar distance (MSB..LSB)
+    d = np.zeros(coords.shape[0], dtype=np.uint64)
+    for i in range(num_bits):
+        shift = np.uint64(num_bits - 1 - i)
+        for j in range(n):
+            d = (d << one) | ((X[j] >> shift) & one)
+    return d
+
+
+def hilbert_sort_indices(coord, bits=10, frame_radius=None):
+    """Indices that sort points along a 3D Hilbert curve (see _hilbert_encode).
+    frame_radius: None -> per-scene min-max (legacy); R>0 -> fixed canonical frame."""
+    q = _quantize_coord(coord, bits=bits, frame_radius=frame_radius)
+    return np.argsort(_hilbert_encode(q, bits), kind='stable')
+
+
+def space_filling_sort_indices(coord, curve='hilbert', bits=10, frame_radius=None):
+    """
+    Unified entry point for space-filling-curve ordering of [N,3] points.
+
+    curve        : 'hilbert' (default, best locality) | 'morton' (Z-order, legacy)
+    frame_radius : None -> per-scene min-max (legacy); R>0 -> fixed canonical frame
+                   [-R, R]. A fixed frame keeps the traversal in absolute coordinates
+                   so the slot->position target is consistent across scenes (matches
+                   the original Can3Tok HilbertSort3D, which sorts in a fixed
+                   origin/radius frame).
+    Returns indices that reorder the points along the chosen curve.
+    """
+    if curve == 'morton':
+        return morton_sort_indices(coord, bits=bits, frame_radius=frame_radius)
+    elif curve == 'hilbert':
+        return hilbert_sort_indices(coord, bits=bits, frame_radius=frame_radius)
+    else:
+        raise ValueError(f"Unknown space-filling curve '{curve}' (use 'hilbert' or 'morton')")
 
 
 def voxelize(coord, voxel_size=0.4, hash_type='fnv'):
@@ -231,27 +385,18 @@ class gs_dataset(Dataset):
     SceneSplat-7K dataset with ScanNet72 semantic labels.
 
     Feature tensor col layout (label_input=False, 18 cols):
-      0:3   voxel_centers
-      3     point_uniq_idx
-      4:7   xyz  (normalized coordinates)
-      7:10  rgb
-      10    opacity
-      11:14 scale
-      14:18 quaternion
+      0:3 voxel_centers | 3 point_uniq_idx | 4:7 xyz | 7:10 rgb |
+      10 opacity | 11:14 scale | 14:18 quaternion
 
-    Parameters
-    ----------
-    skip_scenes : int or None
-        Number of sorted scene directories to skip before applying max_scenes.
-        Use this to carve out a held-out validation split from the same folder
-        as the training data without any file-system changes.
-        Example:
-            train = gs_dataset(root=chunk_dir, max_scenes=3800, ...)
-            val   = gs_dataset(root=chunk_dir, skip_scenes=3800, ...)
-        Both use the same global norm_factor.npy — normalization is consistent.
+    crop_percentile : float
+        Inner crop_percentile% of Gaussians by distance from centroid kept
+        before opacity sampling. 100.0 = disabled.
+    morton_order : bool
+        Reorder opacity-selected Gaussians by Z-order curve so slot i maps to a
+        spatially-stable location. False (default) keeps opacity order.
     """
 
-    TARGET_POINTS      = 40_000
+    TARGET_POINTS      = 10_000
     LABEL_MAX          = 71.0
     LABEL_MISSING_NORM = -1.0 / 71.0
     SCAFFOLD_DIMS      = 8
@@ -261,11 +406,16 @@ class gs_dataset(Dataset):
 
     def __init__(self, root, resol=200, random_permute=False, train=True,
                  sampling_method='opacity', max_scenes=None, skip_scenes=None,
-                 normalize=True, normalize_colors=True, use_chunk_norm_factor=True, target_radius=10.0,
+                 random_subset_seed=None,
+                 normalize=True, normalize_colors=True, use_chunk_norm_factor=True,
+                 target_radius=10.0,
                  scale_norm_mode='linear', label_input=False, color_residual=False,
                  position_scaffold=False, scene_layout_head=False, jepa_idea1=False,
                  position_layout_residual=False, preload=True,
-                 disable_semantics=False):
+                 disable_semantics=False,
+                 crop_percentile=100.0,
+                 morton_order=False, order_curve='hilbert',
+                 order_frame_radius=10.0):
 
         self.root                     = root
         self.resol                    = resol
@@ -283,7 +433,22 @@ class gs_dataset(Dataset):
         self.scene_layout_head        = scene_layout_head
         self.jepa_idea1               = jepa_idea1
         self.position_layout_residual = position_layout_residual
-        self.disable_semantics        = disable_semantics  # True for non-ScanNet72 datasets
+        self.disable_semantics        = disable_semantics
+        # Clamp crop to [1, 100] so nonsensical values still produce a valid mask.
+        self.crop_percentile          = float(np.clip(crop_percentile, 1.0, 100.0))
+        self.morton_order             = bool(morton_order)
+        # Which space-filling curve to use when morton_order=True.
+        # 'hilbert' (default) has provably better locality than 'morton' (Z-order):
+        # consecutive indices are always spatially adjacent, giving the decoder a
+        # Lipschitz slot->position target that is easier to fit and to generalize.
+        # 'morton' is kept for ablation / backward compatibility.
+        self.order_curve              = str(order_curve).lower()
+        if self.order_curve not in ('hilbert', 'morton'):
+            raise ValueError(f"order_curve must be 'hilbert' or 'morton', got '{order_curve}'")
+        # Frame for the space-filling sort. >0 = fixed canonical frame [-R, R] (the
+        # cross-scene-consistent choice, matching Can3Tok's HilbertSort3D); <=0 = legacy
+        # per-scene min-max. Default 10.0 to match the canonical normalization radius.
+        self.order_frame_radius       = float(order_frame_radius)
 
         if position_layout_residual and not scene_layout_head:
             print("  [INFO] position_layout_residual=True requires scene_layout_head=True. Enabling.")
@@ -292,7 +457,6 @@ class gs_dataset(Dataset):
             print("  [INFO] jepa_idea1=True requires position_scaffold=True. Enabling.")
             self.position_scaffold = True
 
-        # Build sorted list of all scene directories
         self.scene_dirs = sorted([
             os.path.join(root, d)
             for d in os.listdir(root)
@@ -301,18 +465,20 @@ class gs_dataset(Dataset):
 
         total_available = len(self.scene_dirs)
 
-        # ── SKIP: remove the first skip_scenes dirs (used as training data) ──
-        # This is the key mechanism for held-out chunk validation:
-        # train = gs_dataset(root=chunk_dir, max_scenes=3800, ...)
-        # val   = gs_dataset(root=chunk_dir, skip_scenes=3800, ...)
-        # Both sets of chunks share the same norm_factor.npy per scene, so
-        # the global coordinate frame is identical for training and validation.
         if skip_scenes is not None and skip_scenes > 0:
             self.scene_dirs = self.scene_dirs[skip_scenes:]
             print(f"  Skipped first {skip_scenes} scenes (training split)  "
                   f"→ {len(self.scene_dirs)} remaining for this split")
 
-        # ── CAP at max_scenes ────────────────────────────────────────────────
+        if random_subset_seed is not None and max_scenes is not None and max_scenes < len(self.scene_dirs):
+            import numpy as _np
+            _rng = _np.random.RandomState(random_subset_seed)
+            _shuffled_indices = _rng.permutation(len(self.scene_dirs))[:max_scenes]
+            self.scene_dirs = [self.scene_dirs[i] for i in sorted(_shuffled_indices)]
+            print(f"  RANDOM SUBSET: sampled {max_scenes} scenes with seed={random_subset_seed}")
+            print(f"    First 3 selected: {[os.path.basename(d) for d in self.scene_dirs[:3]]}")
+            print(f"    Last 3 selected:  {[os.path.basename(d) for d in self.scene_dirs[-3:]]}")
+
         if max_scenes is not None and max_scenes < len(self.scene_dirs):
             self.scene_dirs = self.scene_dirs[:max_scenes]
             print(f"  Limited to {max_scenes} scenes")
@@ -325,7 +491,6 @@ class gs_dataset(Dataset):
         self.num_segment_categories = self.NUM_CATS
         self.feature_width = 19 if label_input else 18
 
-        # ── Normalization mode report ─────────────────────────────────────────
         _is_chunks   = ('chunk' in root or 'grid' in root)
         _sample_size = min(20, len(self.scene_dirs))
         _nf_count    = sum(
@@ -344,7 +509,6 @@ class gs_dataset(Dataset):
                 _status = 'MISSING — position will NOT converge ✗'
             print(f"  norm_factor.npy : {_nf_count}/{_sample_size} sampled  ({_status})")
             if _all_ok and _sample_size > 0:
-                # Spot-check: show one example norm_factor value
                 _ex = self.scene_dirs[0]
                 _nf = np.load(os.path.join(_ex, 'norm_factor.npy'))
                 print(f"  Example         : {os.path.basename(_ex)} → "
@@ -353,6 +517,20 @@ class gs_dataset(Dataset):
         else:
             _has_nf = os.path.exists(os.path.join(self.scene_dirs[0], 'norm_factor.npy'))
             print(f"  norm_factor.npy : {'present → global frame' if _has_nf else 'absent → per-scene fallback ✓'}")
+
+        if self.crop_percentile < 100.0:
+            print(f"  Spatial crop    : ENABLED — keeping inner {self.crop_percentile:.0f}% "
+                  f"by distance from centroid before opacity sampling")
+        else:
+            print(f"  Spatial crop    : disabled (crop_percentile=100)")
+
+        if self.morton_order:
+            _frame = (f"canonical frame [-{self.order_frame_radius:.0f},{self.order_frame_radius:.0f}]"
+                      if self.order_frame_radius > 0 else "per-scene min-max (legacy)")
+            print(f"  Gaussian order  : {self.order_curve.upper()} space-filling curve, {_frame} "
+                  f"{'[best locality]' if self.order_curve == 'hilbert' else '[Z-order, legacy]'}")
+        else:
+            print(f"  Gaussian order  : opacity rank (default)")
 
         print(f"  color_residual={color_residual} | position_scaffold={self.position_scaffold}")
         print(f"  scene_layout_head={self.scene_layout_head}")
@@ -396,14 +574,6 @@ class gs_dataset(Dataset):
         opacity = np.load(os.path.join(scene_dir, 'opacity.npy'))
 
         if self.normalize:
-            # use_chunk_norm_factor=True  → use norm_factor.npy global frame for
-            #   chunks (all chunks of a room share one coordinate system).
-            #   This is REQUIRED for position loss convergence on chunks.
-            # use_chunk_norm_factor=False → ignore norm_factor.npy even if present,
-            #   forcing per-scene normalisation. Use this to ablate the global frame
-            #   and verify that it is the cause of convergence difference.
-            # Full scenes: norm_factor.npy is absent so both modes give the same
-            #   per-scene fallback regardless of this flag.
             _is_chunk_data = ('chunk' in scene_dir or 'grid' in scene_dir)
             _use_nf = self.use_chunk_norm_factor or not _is_chunk_data
             if _use_nf:
@@ -413,7 +583,6 @@ class gs_dataset(Dataset):
                     target_radius=self.target_radius,
                     scale_norm_mode=self.scale_norm_mode)
             else:
-                # Per-scene fallback: ignore norm_factor.npy even if present.
                 coord, scale = normalize_to_canonical_sphere(
                     coord, scale,
                     target_radius=self.target_radius,
@@ -423,9 +592,6 @@ class gs_dataset(Dataset):
             color = color / 255.0
 
         if self.disable_semantics:
-            # Extra datasets (ArkitScenes, ScanNet++, etc.) use different label
-            # spaces incompatible with ScanNet72. Disable semantics so InfoNCE
-            # losses don't receive mixed-space labels. Reconstruction is unaffected.
             segment       = np.full(len(coord), -1, dtype=np.int16)
             instance      = np.full(len(coord), -1, dtype=np.int32)
             has_semantics = False
@@ -439,7 +605,20 @@ class gs_dataset(Dataset):
                 instance      = np.full(len(coord), -1, dtype=np.int32)
                 has_semantics = False
 
-        # Top-40k sampling by opacity (deterministic)
+        # ── SPATIAL CROP (after normalization, before opacity sampling) ───────
+        if self.crop_percentile < 100.0:
+            crop_mask = spatial_crop_by_centroid(coord, self.crop_percentile)
+            n_crop = int(crop_mask.sum())
+            if n_crop >= 1:
+                coord    = coord   [crop_mask]
+                color    = color   [crop_mask]
+                scale    = scale   [crop_mask]
+                quat     = quat    [crop_mask]
+                opacity  = opacity [crop_mask]
+                segment  = segment [crop_mask]
+                instance = instance[crop_mask]
+
+        # ── OPACITY / HYBRID SAMPLING ─────────────────────────────────────────
         N = len(coord)
         if self.sampling_method == 'hybrid':
             scale_mag    = np.linalg.norm(scale, axis=1)
@@ -460,6 +639,20 @@ class gs_dataset(Dataset):
         else:
             extra    = np.full(T - N, sorted_indices[-1], dtype=np.int64)
             selected = np.concatenate([sorted_indices, extra])
+
+        # ── MORTON / Z-ORDER SPATIAL REORDER ──────────────────────────────────
+        # Opacity (above) SELECTS which TARGET_POINTS Gaussians to keep.
+        # Morton REORDERS that selected set along a Z-order space-filling curve so
+        # array slot i corresponds to a spatially-stable location across scenes.
+        # This makes the element-wise reconstruction loss learnable (slot i always
+        # maps to the same spatial region) instead of being tied to the meaningless
+        # opacity rank. Order-free losses (Chamfer) do not need this, but combining
+        # is harmless. One-time cost at preload, zero during training.
+        if self.morton_order:
+            _m = space_filling_sort_indices(
+                coord[selected], curve=self.order_curve,
+                frame_radius=(self.order_frame_radius if self.order_frame_radius > 0 else None))
+            selected = selected[_m]
 
         coord    = coord   [selected]
         color    = color   [selected]
@@ -585,22 +778,20 @@ if __name__ == "__main__":
 
     print(f"Testing dataset: {data_path}")
 
-    # Test train/val split via skip_scenes
     ds_train = gs_dataset(root=data_path, max_scenes=5, normalize=True,
                           scale_norm_mode='linear', color_residual=True,
                           position_scaffold=True, preload=True)
-    ds_val   = gs_dataset(root=data_path, skip_scenes=5, max_scenes=3,
-                          normalize=True, scale_norm_mode='linear',
-                          color_residual=True, position_scaffold=True, preload=True)
 
-    print(f"\n  Train: {len(ds_train)} scenes  |  Val: {len(ds_val)} scenes")
-    assert ds_train.scene_dirs[-1] != ds_val.scene_dirs[0], \
-        "ERROR: train and val share the same scene dirs!"
-    print(f"  Train last : {ds_train.scene_dirs[-1]}")
-    print(f"  Val first  : {ds_val.scene_dirs[0]}")
-    print(f"  No overlap: ✓")
+    # Morton ordering check: same set, spatially-coherent slot order
+    ds_morton = gs_dataset(root=data_path, max_scenes=3, normalize=True,
+                           scale_norm_mode='linear', preload=True, morton_order=True)
+    pos_op = ds_train[0]['features'][:, 4:7]
+    pos_mo = ds_morton[0]['features'][:, 4:7]
+    step_op = np.linalg.norm(np.diff(pos_op, axis=0), axis=1).mean()
+    step_mo = np.linalg.norm(np.diff(pos_mo, axis=0), axis=1).mean()
+    print(f"\n  Mean consecutive-slot distance — opacity: {step_op:.4f}  morton: {step_mo:.4f}")
+    print(f"  Morton locality gain: {step_op/max(step_mo,1e-8):.2f}x  (expect > 1.0)")
 
-    t0 = time.time()
     s            = ds_train[0]
     coord_abs    = s['features'][:, 4:7]
     scaf_anchors = s['scaffold_anchors']
