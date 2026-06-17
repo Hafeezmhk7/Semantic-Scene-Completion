@@ -258,6 +258,73 @@ def space_filling_sort_indices(coord, curve='hilbert', bits=10, frame_radius=Non
         raise ValueError(f"Unknown space-filling curve '{curve}' (use 'hilbert' or 'morton')")
 
 
+# ============================================================================
+# YAW AUGMENTATION  (rotate the whole scene about the vertical/gravity axis)
+# ============================================================================
+# A yaw rotation is a label-preserving augmentation for indoor scenes: it respects
+# the up-direction prior while exposing the model to every horizontal orientation,
+# multiplying the effective dataset by the continuous rotation range. Positions
+# rotate by R (about the scene centroid, so the scene is reoriented in place rather
+# than orbited); each Gaussian's ORIENTATION composes with R (R_g -> R R_g, i.e.
+# Sigma -> R Sigma R^T), so the covariance transforms consistently -- which is
+# exactly what the gauge-invariant Bures/log-Euclidean loss rewards. Applied per
+# access (the augmented dataset disables the preload cache) so the angle is fresh
+# every epoch. Quaternions follow the 3DGS [w, x, y, z] convention.
+
+def _yaw_rotation_matrix(theta, axis='z'):
+    c, s = np.cos(theta), np.sin(theta)
+    if axis == 'z':
+        return np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]], dtype=np.float64)
+    if axis == 'y':
+        return np.array([[c, 0., s], [0., 1., 0.], [-s, 0., c]], dtype=np.float64)
+    if axis == 'x':
+        return np.array([[1., 0., 0.], [0., c, -s], [0., s, c]], dtype=np.float64)
+    raise ValueError(f"aug_yaw_axis must be 'x', 'y' or 'z', got '{axis}'")
+
+def _quat_to_R_np(q):
+    """[N,4] (w,x,y,z), unit-normalised, -> [N,3,3] rotation matrices."""
+    q = q / (np.linalg.norm(q, axis=-1, keepdims=True) + 1e-8)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    R = np.empty((q.shape[0], 3, 3), dtype=np.float64)
+    R[:, 0, 0] = 1 - 2*(y*y + z*z); R[:, 0, 1] = 2*(x*y - w*z);     R[:, 0, 2] = 2*(x*z + w*y)
+    R[:, 1, 0] = 2*(x*y + w*z);     R[:, 1, 1] = 1 - 2*(x*x + z*z); R[:, 1, 2] = 2*(y*z - w*x)
+    R[:, 2, 0] = 2*(x*z - w*y);     R[:, 2, 1] = 2*(y*z + w*x);     R[:, 2, 2] = 1 - 2*(x*x + y*y)
+    return R
+
+def _R_to_quat_np(R):
+    """[N,3,3] rotation matrices -> [N,4] (w,x,y,z). Vectorised Shepperd method."""
+    m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
+    m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
+    m20, m21, m22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
+    tr = m00 + m11 + m22
+    c0 = tr > 0
+    c1 = (~c0) & (m00 >= m11) & (m00 >= m22)
+    c2 = (~c0) & (~c1) & (m11 >= m22)
+    S0 = np.sqrt(np.maximum(tr + 1.0, 1e-12)) * 2
+    qA = np.stack([0.25*S0, (m21-m12)/S0, (m02-m20)/S0, (m10-m01)/S0], axis=-1)
+    S1 = np.sqrt(np.maximum(1.0 + m00 - m11 - m22, 1e-12)) * 2
+    qB = np.stack([(m21-m12)/S1, 0.25*S1, (m01+m10)/S1, (m02+m20)/S1], axis=-1)
+    S2 = np.sqrt(np.maximum(1.0 + m11 - m00 - m22, 1e-12)) * 2
+    qC = np.stack([(m02-m20)/S2, (m01+m10)/S2, 0.25*S2, (m12+m21)/S2], axis=-1)
+    S3 = np.sqrt(np.maximum(1.0 + m22 - m00 - m11, 1e-12)) * 2
+    qD = np.stack([(m10-m01)/S3, (m02+m20)/S3, (m12+m21)/S3, 0.25*S3], axis=-1)
+    q = np.where(c0[:, None], qA, np.where(c1[:, None], qB, np.where(c2[:, None], qC, qD)))
+    return q / (np.linalg.norm(q, axis=-1, keepdims=True) + 1e-8)
+
+def apply_yaw_augmentation(coord, quat, axis='z', max_deg=180.0, rng=None):
+    """Rotate coord (about centroid) and quat by a random yaw in [-max_deg, max_deg].
+    Returns (coord_rot, quat_rot) with the same dtypes as the inputs."""
+    if rng is None:
+        rng = np.random.default_rng()
+    theta = float(rng.uniform(-np.deg2rad(max_deg), np.deg2rad(max_deg)))
+    R = _yaw_rotation_matrix(theta, axis)
+    c = coord.mean(axis=0, keepdims=True)
+    coord_rot = (coord.astype(np.float64) - c) @ R.T + c
+    R_g_new   = R[None] @ _quat_to_R_np(quat)            # Sigma -> R Sigma R^T
+    quat_rot  = _R_to_quat_np(R_g_new)
+    return coord_rot.astype(coord.dtype), quat_rot.astype(quat.dtype)
+
+
 def voxelize(coord, voxel_size=0.4, hash_type='fnv'):
     discrete_coord = np.floor(coord / voxel_size).astype(np.int32)
     if hash_type == 'fnv':
@@ -319,6 +386,232 @@ def compute_position_scaffold(coord, scaffold_dims=8, domain_size=16.0):
 
     position_offsets = (coord - scaffold_anchors[scaffold_token_ids]).astype(np.float32)
     return scaffold_anchors, scaffold_token_ids, position_offsets
+
+
+def compute_hilbert_block_scaffold(coord, num_tokens=512):
+    """Adaptive per-block anchors for an ALREADY space-filling-ordered ``coord``.
+
+    This is the spatially-anchored alternative to the fixed 8x8x8 voxel grid in
+    ``compute_position_scaffold``. It is meant to be called AFTER the Hilbert /
+    Morton reorder (see ``space_filling_sort_indices``), so that array slot ``i``
+    is at a spatially stable location and consecutive slots are spatial neighbours.
+
+    Token ``k`` owns the contiguous block of ``g = ceil(N / num_tokens)`` Gaussians
+    ``[k*g : (k+1)*g]``. This is exactly the slot->token map used by
+    ``TokenLocalDecoder`` (which gives token ``k`` the output slots
+    ``[k*g : (k+1)*g]`` with ``g = ceil(num_gaussians / num_tokens)``), so the
+    anchor that gets added to output Gaussian ``i`` comes from the SAME token that
+    decoded it. With ``N = 40000`` and ``num_tokens = 512`` -> ``g = 79`` ->
+    tokens ``0..506`` carry Gaussians (``507..511`` are empty tail slots that the
+    decoder crops away; their anchors stay at 0 and are harmless).
+
+    Unlike the voxel grid, the anchor here is the REAL per-scene centroid of a
+    spatially-contiguous cluster, so it varies a lot across scenes and carries
+    genuine coarse-layout information (rather than being pinned near a fixed cell
+    centre). This is the property that makes anchor-relative decoding meaningful
+    (Scaffold-GS style: mu_i = anchor_k + local_offset), and it follows scene
+    density automatically because dense regions produce more Hilbert slots, hence
+    more blocks, hence more anchors.
+
+    Returns
+    -------
+    scaffold_anchors   : [num_tokens, 3]  per-token block centroid (0 for empty tail)
+    scaffold_token_ids : [N]              token id per Gaussian (== i // g, clamped)
+    position_offsets   : [N, 3]           coord - anchor[token_id]  (local residual)
+    """
+    coord = np.asarray(coord)
+    N = coord.shape[0]
+    g = int(np.ceil(N / float(num_tokens)))
+    token_ids = np.minimum(np.arange(N) // g, num_tokens - 1).astype(np.int32)
+
+    counts = np.bincount(token_ids, minlength=num_tokens).astype(np.float64)
+    anchors = np.zeros((num_tokens, 3), dtype=np.float64)
+    for d in range(3):
+        anchors[:, d] = np.bincount(
+            token_ids, weights=coord[:, d].astype(np.float64), minlength=num_tokens)
+    occupied = counts > 0
+    anchors[occupied] = anchors[occupied] / counts[occupied, np.newaxis]
+    scaffold_anchors = anchors.astype(np.float32)
+
+    position_offsets = (coord - scaffold_anchors[token_ids]).astype(np.float32)
+    return scaffold_anchors, token_ids, position_offsets
+
+
+def canonical_voxel_merge(coord, color, scale, quat, opacity, segment, instance,
+                          voxel_res=64, frame_radius=10.0, target_points=40000,
+                          snap_to_center=False):
+    """Density-adaptive CANONICAL re-expression of a scene's 3DGS (SparseSplat's
+    'unique mapping' / L3DG-/GaussianCube-style voxel canonicalization).
+
+    WHY: per-Gaussian positions in a raw 3DGS fit are NON-IDENTIFIABLE -- many
+    within-region arrangements render the same, so a large part of each position is
+    fitting gauge, not scene content, and a regression/VAE target built on them has
+    an irreducible floor. This collapses the scene onto a fixed voxel grid in
+    canonical space and keeps ONE representative Gaussian per occupied voxel (the
+    most opaque), so:
+      * position is now (occupied cell -> cell centre) + a small, bounded residual,
+        i.e. an IDENTIFIABLE quantity (which cell is occupied) instead of a gauge,
+      * the voxel Hilbert order gives a deterministic, scene-consistent slot order,
+      * the count is density-adaptive (= number of occupied voxels), padded with
+        zero-opacity / tiny-scale dummies to a fixed `target_points`. Padding is a
+        valid target: the model simply learns opacity 0 there (occupancy), and under
+        a render-primary objective the padding is invisible (no gradient).
+
+    Returns coord, color (RAW, residual handled by the caller), scale, quat, opacity,
+    segment, instance (each length `target_points`) and a float `valid_mask`
+    (1 = real representative, 0 = padding)."""
+    R    = int(voxel_res)
+    half = float(frame_radius) if frame_radius and frame_radius > 0 else \
+        float(np.abs(coord).max() + 1e-6)
+    T    = int(target_points)
+
+    # voxel index per Gaussian (points outside the frame pin to the boundary cell)
+    u  = np.clip((coord.astype(np.float64) + half) / (2.0 * half), 0.0, 1.0)
+    vi = np.clip(np.floor(u * R).astype(np.int64), 0, R - 1)                 # [N,3]
+    vid = vi[:, 0] * R * R + vi[:, 1] * R + vi[:, 2]                         # [N] linear id
+    op  = opacity.reshape(-1).astype(np.float64)
+
+    # one representative per occupied voxel = the highest-opacity Gaussian in it.
+    # lexsort by (vid, opacity) ascending -> within each vid group opacity ascends,
+    # so the LAST element of the group is the max-opacity representative.
+    order  = np.lexsort((op, vid))
+    vid_s  = vid[order]
+    _, first = np.unique(vid_s, return_index=True)
+    last = np.empty_like(first)
+    last[:-1] = first[1:] - 1
+    last[-1]  = len(vid_s) - 1
+    rep = order[last]                                                       # [M] -> original idx
+
+    r_coord = coord[rep].astype(np.float32).copy()
+    if snap_to_center:                                                     # fully grid positions
+        r_coord = (((vi[rep].astype(np.float64) + 0.5) / R) * (2.0 * half) - half).astype(np.float32)
+
+    # if more occupied voxels than the budget, keep the most opaque ones
+    if len(rep) > T:
+        keep    = np.argsort(opacity[rep].reshape(-1))[-T:]
+        rep     = rep[keep]
+        r_coord = r_coord[keep]
+
+    # deterministic canonical slot order = Hilbert curve over the representatives
+    ho      = space_filling_sort_indices(
+        r_coord, curve='hilbert', frame_radius=(frame_radius if frame_radius and frame_radius > 0 else None))
+    rep     = rep[ho]
+    r_coord = r_coord[ho]
+    M       = len(rep)
+    m       = min(M, T)
+
+    out_coord = np.zeros((T, 3), np.float32)
+    out_color = np.zeros((T, 3), np.float32)
+    out_scale = np.full((T, 3), 1e-4, np.float32)                          # tiny -> sub-pixel
+    out_quat  = np.tile(np.array([1, 0, 0, 0], np.float32), (T, 1))        # identity
+    out_opa   = np.zeros((T,), np.float32)                                 # padding opacity 0
+    out_seg   = np.full((T,), -1, np.int16)
+    out_inst  = np.full((T,), -1, np.int32)
+    valid     = np.zeros((T,), np.float32)
+
+    out_coord[:m] = r_coord[:m]
+    out_color[:m] = color[rep][:m]
+    out_scale[:m] = scale[rep][:m]
+    out_quat[:m]  = quat[rep][:m]
+    out_opa[:m]   = opacity[rep].reshape(-1)[:m]
+    out_seg[:m]   = segment[rep][:m]
+    out_inst[:m]  = instance[rep][:m]
+    valid[:m]     = 1.0
+    return out_coord, out_color, out_scale, out_quat, out_opa, out_seg, out_inst, valid
+
+
+def uniform_voxel_sample(coord, opacity, target, voxel_res=96,
+                         frame_radius=None, rng=None, _allow_pad=True):
+    """Density-uniform SELECTION of `target` indices -- a fast Farthest-Point-
+    Sampling approximation (InstantSplat's "grid partitioning + FPS"; HGSC's
+    per-block FPS anchors).
+
+    WHY (vs opacity ranking): opacity ranking selects the top-K most opaque
+    Gaussians, so the chosen set's spatial density mirrors the OPACITY field, not
+    the geometry -- dense, redundant clusters where opacity is high and holes where
+    it is low. A fixed latent then sees wildly non-uniform per-token load (some
+    Hilbert blocks dense, some empty), which it cannot allocate capacity to evenly.
+    FPS instead minimizes the covering radius (a 2-approx k-center), giving a low-
+    discrepancy, ~uniform-density ('blue-noise') sample -> uniform per-token load ->
+    far more learnable. Space-filling SORTING (Hilbert/Morton) fixes token ORDER but
+    not this density problem; SELECTION is the orthogonal lever.
+
+    Implementation: bucket points into a fine voxel grid, keep the highest-opacity
+    point per occupied voxel (uniform coverage + locally-confident), then draw a
+    spatially-uniform random subset of voxels to hit the budget. O(N). Returns
+    exactly `target` indices (pads by resampling only if N < target)."""
+    rng = np.random.default_rng() if rng is None else rng
+    N = len(coord)
+    target = int(target)
+    if N == 0:
+        return np.zeros(0, dtype=np.int64)
+    if N <= target:
+        idx = np.arange(N, dtype=np.int64)
+        if _allow_pad and N < target:
+            idx = np.concatenate([idx, rng.choice(N, target - N, replace=True)])
+        return idx
+    half = float(frame_radius) if (frame_radius and frame_radius > 0) else float(np.abs(coord).max() + 1e-6)
+    R = int(voxel_res)
+    u  = np.clip((coord.astype(np.float64) + half) / (2.0 * half), 0.0, 1.0)
+    vi = np.clip(np.floor(u * R).astype(np.int64), 0, R - 1)
+    vid = vi[:, 0] * R * R + vi[:, 1] * R + vi[:, 2]
+    op  = opacity.reshape(-1).astype(np.float64)
+    order = np.lexsort((op, vid))                      # by voxel, then opacity asc
+    vid_s = vid[order]
+    _, first = np.unique(vid_s, return_index=True)
+    last = np.empty_like(first)
+    last[:-1] = first[1:] - 1
+    last[-1]  = len(vid_s) - 1
+    reps = order[last]                                 # highest-opacity idx per voxel
+    nocc = len(reps)
+    if nocc >= target:
+        return reps[rng.choice(nocc, target, replace=False)]    # uniform voxel subset
+    # too coarse: keep every voxel rep, top up uniformly from the remaining points
+    chosen = np.zeros(N, dtype=bool); chosen[reps] = True
+    pool = np.where(~chosen)[0]
+    need = target - nocc
+    topup = (rng.choice(pool, need, replace=(len(pool) < need)) if len(pool) > 0
+             else rng.choice(reps, need, replace=True))
+    return np.concatenate([reps, topup])
+
+
+def instance_uniform_sample(coord, opacity, instance, target, voxel_res=96,
+                            frame_radius=None, rng=None):
+    """Semantic-/instance-stratified density-uniform selection (the user's idea +
+    FPS): split the `target` budget across instances proportional to their size,
+    then run uniform_voxel_sample WITHIN each instance. The result is object-
+    coherent (each labelled object keeps a contiguous share of slots) AND density-
+    uniform inside each object. Unlabelled points (instance == -1) form their own
+    group. Falls back to plain uniform sampling if labels are absent."""
+    rng = np.random.default_rng() if rng is None else rng
+    N = len(coord); target = int(target)
+    if instance is None or N <= target:
+        return uniform_voxel_sample(coord, opacity, target, voxel_res, frame_radius, rng)
+    labels = instance.reshape(-1)
+    uniq, counts = np.unique(labels, return_counts=True)
+    budget = np.floor(target * counts / counts.sum()).astype(np.int64)   # proportional
+    rem = target - int(budget.sum())
+    if rem > 0:
+        budget[np.argsort(-counts)[:rem]] += 1                           # remainder -> largest
+    sel = []
+    for u, b in zip(uniq, budget):
+        if b <= 0:
+            continue
+        m = np.where(labels == u)[0]
+        sub = uniform_voxel_sample(coord[m], opacity[m], min(int(b), len(m)),
+                                   voxel_res, frame_radius, rng, _allow_pad=False)
+        sel.append(m[sub])
+    sel = np.concatenate(sel) if sel else np.zeros(0, dtype=np.int64)
+    if len(sel) > target:                                                # exact-size fixups
+        sel = sel[rng.choice(len(sel), target, replace=False)]
+    elif len(sel) < target:
+        chosen = np.zeros(N, dtype=bool); chosen[sel] = True
+        pool = np.where(~chosen)[0]
+        need = target - len(sel)
+        topup = (rng.choice(pool, need, replace=(len(pool) < need)) if len(pool) > 0
+                 else rng.choice(N, need, replace=True))
+        sel = np.concatenate([sel, topup])
+    return sel
 
 
 def compute_category_centroids(coord, segment, num_cats=72):
@@ -411,11 +704,14 @@ class gs_dataset(Dataset):
                  target_radius=10.0,
                  scale_norm_mode='linear', label_input=False, color_residual=False,
                  position_scaffold=False, scene_layout_head=False, jepa_idea1=False,
-                 position_layout_residual=False, preload=True,
+                 position_layout_residual=False, scaffold_mode='voxel', preload=True,
                  disable_semantics=False,
                  crop_percentile=100.0,
                  morton_order=False, order_curve='hilbert',
-                 order_frame_radius=10.0):
+                 order_frame_radius=10.0,
+                 canonical_voxel=False, voxel_res=64, voxel_snap=False,
+                 sample_voxel_res=96,
+                 aug_yaw=False, aug_yaw_axis='z', aug_yaw_max_deg=180.0):
 
         self.root                     = root
         self.resol                    = resol
@@ -433,6 +729,19 @@ class gs_dataset(Dataset):
         self.scene_layout_head        = scene_layout_head
         self.jepa_idea1               = jepa_idea1
         self.position_layout_residual = position_layout_residual
+        # Scaffold construction mode (only used when position_scaffold=True):
+        #   'voxel'         : fixed 8x8x8 voxel grid, hard assignment (legacy;
+        #                     anchors ~ cell centres -> low information).
+        #   'hilbert_block' : adaptive per-block centroids over the ALREADY
+        #                     space-filling-ordered points (requires morton_order=True).
+        #                     Token k owns the contiguous Hilbert block matching the
+        #                     TokenLocalDecoder slot->token map; anchors are real
+        #                     per-scene cluster centres. Pairs with the model's
+        #                     anchor_relative_decode for true local decoding.
+        self.scaffold_mode            = str(scaffold_mode).lower()
+        if self.scaffold_mode not in ('voxel', 'hilbert_block'):
+            raise ValueError(
+                f"scaffold_mode must be 'voxel' or 'hilbert_block', got '{scaffold_mode}'")
         self.disable_semantics        = disable_semantics
         # Clamp crop to [1, 100] so nonsensical values still produce a valid mask.
         self.crop_percentile          = float(np.clip(crop_percentile, 1.0, 100.0))
@@ -449,6 +758,21 @@ class gs_dataset(Dataset):
         # cross-scene-consistent choice, matching Can3Tok's HilbertSort3D); <=0 = legacy
         # per-scene min-max. Default 10.0 to match the canonical normalization radius.
         self.order_frame_radius       = float(order_frame_radius)
+        self.canonical_voxel          = bool(canonical_voxel)
+        self.voxel_res                = int(voxel_res)
+        self.voxel_snap               = bool(voxel_snap)
+        self.sample_voxel_res         = int(sample_voxel_res)
+
+        # Yaw augmentation: only meaningful for a training set. Re-randomises per
+        # access, so the preload cache (which would freeze one fixed rotation) is
+        # disabled when it is on.
+        self.aug_yaw         = bool(aug_yaw)
+        self.aug_yaw_axis    = str(aug_yaw_axis).lower()
+        self.aug_yaw_max_deg = float(aug_yaw_max_deg)
+        if self.aug_yaw and preload:
+            print(f"  [aug_yaw] ON (axis={self.aug_yaw_axis}, +/-{self.aug_yaw_max_deg:.0f} deg)"
+                  f" -> preload disabled (fresh rotation each access)")
+            preload = False
 
         if position_layout_residual and not scene_layout_head:
             print("  [INFO] position_layout_residual=True requires scene_layout_head=True. Enabling.")
@@ -456,6 +780,14 @@ class gs_dataset(Dataset):
         if jepa_idea1 and not position_scaffold:
             print("  [INFO] jepa_idea1=True requires position_scaffold=True. Enabling.")
             self.position_scaffold = True
+
+        if (self.scaffold_mode == 'hilbert_block' and self.position_scaffold
+                and not self.morton_order):
+            raise ValueError(
+                "scaffold_mode='hilbert_block' requires morton_order=True so that "
+                "contiguous index blocks are spatial clusters and the block index "
+                "matches the decoder slot->token map. Pass --morton_order "
+                "(with --order_curve hilbert).")
 
         self.scene_dirs = sorted([
             os.path.join(root, d)
@@ -532,6 +864,7 @@ class gs_dataset(Dataset):
         else:
             print(f"  Gaussian order  : opacity rank (default)")
 
+        print(f"  Yaw aug         : {('ON, axis=%s, +/-%.0f deg' % (self.aug_yaw_axis, self.aug_yaw_max_deg)) if self.aug_yaw else 'off'}")
         print(f"  color_residual={color_residual} | position_scaffold={self.position_scaffold}")
         print(f"  scene_layout_head={self.scene_layout_head}")
 
@@ -591,6 +924,14 @@ class gs_dataset(Dataset):
         if self.normalize_colors:
             color = color / 255.0
 
+        # ── YAW AUGMENTATION (after normalization, before crop/sample/sort) ───
+        # Rotates coord (about centroid) and quat by a fresh random yaw so the
+        # space-filling sort below sees the rotated positions and stays consistent.
+        if self.aug_yaw:
+            coord, quat = apply_yaw_augmentation(
+                coord, quat, axis=self.aug_yaw_axis,
+                max_deg=self.aug_yaw_max_deg, rng=np.random.default_rng())
+
         if self.disable_semantics:
             segment       = np.full(len(coord), -1, dtype=np.int16)
             instance      = np.full(len(coord), -1, dtype=np.int32)
@@ -619,61 +960,103 @@ class gs_dataset(Dataset):
                 instance = instance[crop_mask]
 
         # ── OPACITY / HYBRID SAMPLING ─────────────────────────────────────────
-        N = len(coord)
-        if self.sampling_method == 'hybrid':
-            scale_mag    = np.linalg.norm(scale, axis=1)
-            scale_norm_s = ((scale_mag - scale_mag.min()) /
-                            (scale_mag.max() - scale_mag.min() + 1e-8))
-            opacity_norm = ((opacity - opacity.min()) /
-                            (opacity.max() - opacity.min() + 1e-8))
-            importance = 0.8 * opacity_norm + 0.2 * scale_norm_s
-        elif self.sampling_method == 'opacity':
-            importance = opacity
+        if self.canonical_voxel:
+            # CANONICAL VOXEL re-expression (density-adaptive 'unique mapping'): one
+            # representative Gaussian per occupied voxel, Hilbert-ordered, padded to
+            # TARGET_POINTS with zero-opacity dummies. Replaces opacity sampling +
+            # reorder. position becomes (occupied cell -> centre) + small residual,
+            # an identifiable target instead of the non-identifiable raw arrangement.
+            (coord, color, scale, quat, opacity, segment, instance,
+             valid_mask) = canonical_voxel_merge(
+                coord, color, scale, quat, opacity, segment, instance,
+                voxel_res=self.voxel_res, frame_radius=self.order_frame_radius,
+                target_points=self.TARGET_POINTS, snap_to_center=self.voxel_snap)
         else:
-            importance = np.arange(N, dtype=np.float32)
+            N = len(coord)
+            T = self.TARGET_POINTS
+            if self.sampling_method in ('uniform', 'fps'):
+                # density-uniform (FPS-style) selection: equalizes per-region density.
+                # Seeded by scene index so the selection is DETERMINISTIC across epochs
+                # (identical every access) -- a fixed sample even without preload.
+                selected = uniform_voxel_sample(
+                    coord, opacity, T, voxel_res=self.sample_voxel_res,
+                    frame_radius=(self.order_frame_radius if self.order_frame_radius > 0 else None),
+                    rng=np.random.default_rng(idx))
+            elif self.sampling_method in ('uniform_instance', 'fps_instance'):
+                # semantic/instance-stratified uniform selection (object-coherent + uniform);
+                # seeded by scene index -> deterministic, fixed sample across epochs.
+                selected = instance_uniform_sample(
+                    coord, opacity, instance, T, voxel_res=self.sample_voxel_res,
+                    frame_radius=(self.order_frame_radius if self.order_frame_radius > 0 else None),
+                    rng=np.random.default_rng(idx))
+            else:
+                if self.sampling_method == 'hybrid':
+                    scale_mag    = np.linalg.norm(scale, axis=1)
+                    scale_norm_s = ((scale_mag - scale_mag.min()) /
+                                    (scale_mag.max() - scale_mag.min() + 1e-8))
+                    opacity_norm = ((opacity - opacity.min()) /
+                                    (opacity.max() - opacity.min() + 1e-8))
+                    importance = 0.8 * opacity_norm + 0.2 * scale_norm_s
+                elif self.sampling_method == 'opacity':
+                    importance = opacity
+                else:
+                    importance = np.arange(N, dtype=np.float32)
 
-        sorted_indices = np.argsort(importance)
-        T = self.TARGET_POINTS
-        if N >= T:
-            selected = sorted_indices[-T:]
-        else:
-            extra    = np.full(T - N, sorted_indices[-1], dtype=np.int64)
-            selected = np.concatenate([sorted_indices, extra])
+                sorted_indices = np.argsort(importance)
+                if N >= T:
+                    selected = sorted_indices[-T:]
+                else:
+                    extra    = np.full(T - N, sorted_indices[-1], dtype=np.int64)
+                    selected = np.concatenate([sorted_indices, extra])
 
-        # ── MORTON / Z-ORDER SPATIAL REORDER ──────────────────────────────────
-        # Opacity (above) SELECTS which TARGET_POINTS Gaussians to keep.
-        # Morton REORDERS that selected set along a Z-order space-filling curve so
-        # array slot i corresponds to a spatially-stable location across scenes.
-        # This makes the element-wise reconstruction loss learnable (slot i always
-        # maps to the same spatial region) instead of being tied to the meaningless
-        # opacity rank. Order-free losses (Chamfer) do not need this, but combining
-        # is harmless. One-time cost at preload, zero during training.
-        if self.morton_order:
-            _m = space_filling_sort_indices(
-                coord[selected], curve=self.order_curve,
-                frame_radius=(self.order_frame_radius if self.order_frame_radius > 0 else None))
-            selected = selected[_m]
+            # ── MORTON / Z-ORDER SPATIAL REORDER ──────────────────────────────────
+            # Opacity (above) SELECTS which TARGET_POINTS Gaussians to keep.
+            # Morton REORDERS that selected set along a Z-order space-filling curve so
+            # array slot i corresponds to a spatially-stable location across scenes.
+            # This makes the element-wise reconstruction loss learnable (slot i always
+            # maps to the same spatial region) instead of being tied to the meaningless
+            # opacity rank. Order-free losses (Chamfer) do not need this, but combining
+            # is harmless. One-time cost at preload, zero during training.
+            if self.morton_order:
+                _m = space_filling_sort_indices(
+                    coord[selected], curve=self.order_curve,
+                    frame_radius=(self.order_frame_radius if self.order_frame_radius > 0 else None))
+                selected = selected[_m]
 
-        coord    = coord   [selected]
-        color    = color   [selected]
-        scale    = scale   [selected]
-        quat     = quat    [selected]
-        opacity  = opacity [selected]
-        segment  = segment [selected]
-        instance = instance[selected]
+            coord    = coord   [selected]
+            color    = color   [selected]
+            scale    = scale   [selected]
+            quat     = quat    [selected]
+            opacity  = opacity [selected]
+            segment  = segment [selected]
+            instance = instance[selected]
+            valid_mask = np.ones(len(coord), dtype=np.float32)
 
         if self.color_residual:
-            mean_color = color.mean(axis=0).astype(np.float32)
+            if self.canonical_voxel and valid_mask.sum() > 0:
+                # exclude zero-opacity padding from the scene-mean colour
+                mean_color = color[valid_mask > 0].mean(axis=0).astype(np.float32)
+            else:
+                mean_color = color.mean(axis=0).astype(np.float32)
             color      = color - mean_color
         else:
             mean_color = np.zeros(3, dtype=np.float32)
 
         T_pts = len(coord)
         if self.position_scaffold:
-            (scaffold_anchors,
-             scaffold_token_ids,
-             position_offsets) = compute_position_scaffold(
-                coord, scaffold_dims=self.SCAFFOLD_DIMS, domain_size=self.SCAFFOLD_DOMAIN)
+            if self.scaffold_mode == 'hilbert_block':
+                # coord is ALREADY space-filling-ordered at this point (the Hilbert/
+                # Morton reorder ran above), so contiguous blocks are spatial clusters
+                # and the block index matches the decoder's slot->token map.
+                (scaffold_anchors,
+                 scaffold_token_ids,
+                 position_offsets) = compute_hilbert_block_scaffold(
+                    coord, num_tokens=self.SCAFFOLD_TOKENS)
+            else:
+                (scaffold_anchors,
+                 scaffold_token_ids,
+                 position_offsets) = compute_position_scaffold(
+                    coord, scaffold_dims=self.SCAFFOLD_DIMS, domain_size=self.SCAFFOLD_DOMAIN)
         else:
             scaffold_anchors   = np.zeros((self.SCAFFOLD_TOKENS, 3), dtype=np.float32)
             scaffold_token_ids = np.zeros(T_pts, dtype=np.int32)
@@ -751,6 +1134,7 @@ class gs_dataset(Dataset):
             'position_residuals': position_residuals,
             'voxel_label_dists':  voxel_label_dists,
             'voxel_valid':        voxel_valid,
+            'valid_mask':         valid_mask.astype(np.float32),
         }
 
     def get_category_distribution(self, num_scenes=50):

@@ -1,52 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=can3tok_hyptest
+#SBATCH --job-name=can3tok_stage1_final
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=2
-#SBATCH --time=20:00:00
+#SBATCH --gpus=4
+#SBATCH --time=35:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=18
-#SBATCH --mem=90G
-#SBATCH --output=logs_ss1/can3tok_hyptest_%j.out
-#SBATCH --error=logs_ss1/can3tok_hyptest_%j.err
+#SBATCH --cpus-per-task=36
+#SBATCH --mem=180G
+#SBATCH --output=logs_ss1/can3tok_40k_%j.out
+#SBATCH --error=logs_ss1/can3tok_40k_%j.err
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ============================================================================
 # DATASET SELECTION
 # ============================================================================
-# TRAIN_DATA controls which scenes are used for training:
-#
-#   "chunks"   — train_grid1.0cm_chunk8x8_stride6x6/ (3888 total chunks)
-#                NORMALIZATION: GLOBAL scene frame via norm_factor.npy
-#                  precompute_norm_from_chunks.py writes one norm_factor.npy
-#                  per chunk, computed from the UNION of all chunks of that
-#                  scene. All chunks of the same room share one coordinate
-#                  frame. Training chunks and held-out val chunks of the same
-#                  scene therefore use the SAME norm_factor — no mismatch.
-#                  The Python script reads norm_factor.npy automatically via
-#                  normalize_with_norm_factor(). No extra job flags needed.
-#                HELD-OUT CHUNK VAL: the first TRAIN_SCENES sorted chunks go
-#                  to training. The remaining (3888 - TRAIN_SCENES) are used
-#                  as a second validation set (in-distribution diagnostic).
-#                  Set  → 88 held-out chunks for chunk val.
-#                  Set TRAIN_SCENES=3888 (or blank) → no held-out chunks.
-#                PRE-FLIGHT: this script verifies norm_factor.npy presence
-#                  before launching to catch missing precomputation early.
-#
-#   "full"     — train/ (800 full scenes)
-#                NORMALIZATION: per-scene fallback (no norm_factor.npy needed)
-#                  normalize_with_norm_factor() falls back automatically when
-#                  norm_factor.npy is absent. Identical to original Can3Tok.
-#                No held-out chunk val when train_data="full".
-#
-#   "combined" — train/ + train_grid/ concatenated (800 + 3888 = 4688 total)
-#                NORMALIZATION: chunks use norm_factor.npy (global frame);
-#                  full scenes use per-scene fallback. Both handled automatically.
-#                TRAIN_SCENES split evenly: half full scenes, half chunks.
-#                Held-out chunk val: chunks sorted after the chunk portion.
-#
-# Validation always uses val/ (100 held-out full scenes) as the PRIMARY metric
-# regardless of TRAIN_DATA. This is the thesis target.
 TRAIN_DATA="chunks"
 
 # ============================================================================
@@ -59,32 +26,62 @@ RESUME_EPOCH=""
 DECODER_LAYOUT_CROSS_ATTN=False
 DECODER_LAYOUT_ADDITIVE=False
 
-# ── Latent disentanglement ────────────────────────────────────────────────────
+TOKEN_LOCAL_DECODER=True
+
+ANCHOR_RELATIVE_DECODE=True
+SCAFFOLD_MODE="hilbert_block"
+ANCHOR_TEACHER_FORCE=False
+OFFSET_SCALE_INIT=2.0
+# ── GaussianCube-style framed canonical micro-pattern ────────────────────────
+# pos = anchor + R_block.(s_block.c[slot]) + MICRO_OFFSET_SCALE*tanh(residual).
+# Requires SCAFFOLD_MODE=hilbert_block + ANCHOR_RELATIVE_DECODE (auto-enabled).
+# NOTE: this is a RETRAIN, not a fine-tune of the free-offset decoder. The resume
+# checkpoint has no frame head and a different position parametrisation, so it
+# loads strict=False (frame head fresh) and the position branch re-converges. To
+# train cleanly from scratch, blank RESUME_CHECKPOINT below.
+MICRO_PATTERN=False
+MICRO_OFFSET_SCALE=0.3
+MICRO_PATTERN_NO_ROTATION=False        # True = ablate rotation (scale-only frame)
+POSITION_SCAFFOLD=True
+ANCHOR_LOSS_WEIGHT=1.0
+
+LOCAL_ENCODER=True
+LOCAL_WINDOW=1
+STRUCTURED_LATENT=False
+
+# Per-Gaussian InfoNCE (--semantic_mode + --segment_loss_weight). Operates on the
+# per-Gaussian encoder/decoder features and pulls same-ScanNet72-label Gaussians
+# together. ONLY the 3800 chunks contribute (the 3 full-scene sources load with
+# semantics disabled -> segment=-1 -> filtered out), so there is no cross-dataset
+# label-taxonomy collision. Requires SEGMENT_WEIGHT>0 (0 silently disables the head).
+#   "hidden"    = SemanticProjectionHead off the global 1024-d hidden. At
+#                 NUM_GAUSSIANS=40000 the final Linear(256, 40000*32) is ~329M params
+#                 (~5.3 GB GPU, > the rest of the model; trains slowly from scratch).
+#   "geometric" = shared per-Gaussian MLP (14->128->128->32), ~22K params, true
+#                 per-Gaussian function of each Gaussian's attributes. RECOMMENDED
+#                 (far lighter + more principled). Swap the string below to switch.
+SEMANTIC_MODE_OVERRIDE="hidden"
+
 LATENT_DISENTANGLE=True
 SEMANTIC_DIMS=512
 CROSS_RECON_WEIGHT=0.3
 ORTHO_WEIGHT=0.1
 
-# ── Color ─────────────────────────────────────────────────────────────────────
 COLOR_RESIDUAL=True
 MEAN_COLOR_WEIGHT=0.5
 COLOR_LOSS_WEIGHT=2.0
 
-# ── Structured token split ────────────────────────────────────────────────────
-STRUCTURED_LAYOUT_TOKENS=True
+STRUCTURED_LAYOUT_TOKENS=False
 
-# ── Semantic / layout heads ───────────────────────────────────────────────────
-SCENE_SEMANTIC_HEAD=True
+SCENE_SEMANTIC_HEAD=False
 SCENE_SEMANTIC_WEIGHT=0.3
-SCENE_LAYOUT_HEAD=True
+SCENE_LAYOUT_HEAD=False
 LAYOUT_LOSS_WEIGHT=0.3
-SEMANTIC_TOKEN_HEADS=True
+SEMANTIC_TOKEN_HEADS=False
 
-# ── z_s pool InfoNCE ─────────────────────────────────────────────────────────
-ZS_POOL_INFONCE_WEIGHT=0.3
+ZS_POOL_INFONCE_WEIGHT=0.0
 ZS_POOL_INFONCE_TEMPERATURE=0.10
 
-# ── Other InfoNCE (off by default) ───────────────────────────────────────────
 ZS_LAYOUT_INFONCE_WEIGHT=0.0
 ZS_LAYOUT_INFONCE_TEMPERATURE=0.07
 ZS_TOKEN_INFONCE_WEIGHT=0.0
@@ -93,148 +90,159 @@ Z_S_INFONCE_WEIGHT=0.0
 Z_S_INFONCE_TEMPERATURE=0.07
 Z_S_INFONCE_DELTA=0.4
 
-# ── Per-Gaussian InfoNCE ──────────────────────────────────────────────────────
-SEMANTIC_MODE="hidden"
-SEGMENT_WEIGHT=0.3
+SEMANTIC_MODE="$SEMANTIC_MODE_OVERRIDE"
+SEGMENT_WEIGHT=0.4     # weight on the per-Gaussian InfoNCE (0 = disabled). Raise for a stronger semantic pull (watch Recon).
 INSTANCE_WEIGHT=0.0
 SEMANTIC_TEMP=0.10
 SEMANTIC_SUBSAMPLE=10000
 SAMPLING_STRATEGY="balanced"
 
-# ── Decoder PE ────────────────────────────────────────────────────────────────
 DECODER_FOURIER_PE=True
 DECODER_POS_ENC=False
 
-# ── Legacy token conditioning ─────────────────────────────────────────────────
 TOKEN_COND=False
 TOKEN_COND_APPROACH="B"
 TOKEN_COND_ADALN=False
 
-# ── Scale penalty ─────────────────────────────────────────────────────────────
 SCALE_PENALTY_WEIGHT=0.0
 SCALE_PENALTY_THRESHOLD=0.5
 
-# ── Core training ─────────────────────────────────────────────────────────────
-BATCH_SIZE=90
+CROP_PERCENTILE=100.0
+
+MORTON_ORDER=True
+ORDER_CURVE="hilbert"
+ORDER_FRAME_RADIUS=10.0
+# ── CANONICAL VOXEL TARGET (density-adaptive "unique mapping") ─────────────────
+# Re-express each scene as one representative Gaussian per occupied voxel (Hilbert-
+# ordered, padded to NUM_GAUSSIANS with zero-opacity dummies). Converts the
+# non-identifiable raw per-Gaussian arrangement into an identifiable target. Best
+# run WITH the render-primary recipe above (padding is invisible to the render).
+# VOXEL_RES: tune so occupied voxels land near NUM_GAUSSIANS (64 ~= 0.31u cells on
+# a [-10,10] frame). VOXEL_SNAP=True snaps to cell centres (pure grid positions).
+CANONICAL_VOXEL=False
+VOXEL_RES=64
+VOXEL_SNAP=False
+
+USE_CHAMFER_LOSS=False
+CHAMFER_CHUNK=2048
+
+GEOM_LOSS="bures_codiag"
+GEOM_EPS=1e-6
+GEOM_NS_ITERS=15
+GEOM_SHAPE_WEIGHT=5.0
+
+SET_LOSS=True
+SET_SINKHORN_EPS=0.05
+SET_SINKHORN_ITERS=50
+SET_POS_WEIGHT=1.0
+SET_OPA_WEIGHT=1.0
+SET_BLOCK_SIZE=0
+# Opacity-weighted position term (focus positional capacity on VISIBLE Gaussians;
+# reuses the set-loss Sinkhorn matching, weighted by GT opacity). 0 = off. Try
+# ~0.05 to start; raise if visible-position/renders improve without hurting Pos.
+OPACITY_POS_WEIGHT=0.0
+
+# ── VIRTUAL-CAMERA RENDERING LOSS  (--render_loss)  — image-space crispness ────
+RENDER_LOSS=False
+RENDER_LOSS_WEIGHT=0.5
+RENDER_WARMUP_EPOCHS=0
+RENDER_VIEWS=4
+RENDER_IMG=128
+RENDER_MAX_SCENES=8
+RENDER_SSIM_WEIGHT=0.2
+RENDER_LPIPS_WEIGHT=0.0
+RENDER_FOV=50.0
+RENDER_DIST_MULT=2.6
+RENDER_UP_AXIS=2
+RENDER_QUAT_ORDER="wxyz"
+# ── PARAMETER-LOSS WEIGHT (render-primary switch) ─────────────────────────────
+# Multiplies the parameter-space recon loss. 1.0 = parameter-primary (current).
+# RENDER-PRIMARY RECIPE (gauge-invariant objective; supervise the image, not the
+# non-identifiable positions): set PARAM_LOSS_WEIGHT=0.1, RENDER_LOSS_WEIGHT=5.0,
+# RENDER_LPIPS_WEIGHT=1.0, and raise RENDER_VIEWS (e.g. 8) + RENDER_MAX_SCENES so
+# the rendered views cover the scene. Keep anchor/KL as-is. Watch reconstruction
+# PSNR/SSIM, not Pos. LPIPS needs the `lpips` package + pre-downloaded weights
+# (it degrades to L1+D-SSIM if unavailable).
+PARAM_LOSS_WEIGHT=1.0
+
+COV_METRIC=False
+
+AUG_YAW=False
+AUG_YAW_AXIS="z"
+AUG_YAW_MAX_DEG=180.0
+
+BATCH_SIZE=64
 NUM_EPOCHS=2000
-# lr=1e-4: proven optimal in Run 3 (1500 chunks, val L2=6.46).
-# Run 3 had HALF the LR of Run 1 (2e-4) and achieved 4.5x better results.
-# The gain is from warm restarts + lower LR, not higher LR.
+NUM_GAUSSIANS=40000
+POS_COND_HEADS=0
+POS_COND_COLOR=0
+POS_COND_ROTATION=0
+POS_COND_SIGMA=6.0
+POS_COND_POS_SCALE=10.0
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-5
-# KL annealing: ramp kl_weight linearly from 0 → KL_WEIGHT over KL_ANNEAL_STEPS
-# optimizer steps. Prevents the epoch-50 KL explosion caused by the encoder
-# building up a non-Gaussian posterior before the KL penalty becomes relevant.
-#
-# COMPUTING THE RIGHT VALUE:
-#   steps_per_epoch = ceil(TRAIN_SCENES / (BATCH_SIZE × num_GPUs))
-#   4 GPU: ceil(3800 / (90 × 4)) = 11 steps/epoch
-#   1 GPU: ceil(3800 / (90 × 1)) = 43 steps/epoch
-#   Recommended ramp duration: ~200 epochs
-#     4 GPU, 200 epoch ramp: KL_ANNEAL_STEPS = 200 × 11 = 2200  ← used here
-#     1 GPU, 200 epoch ramp: KL_ANNEAL_STEPS = 200 × 43 = 8600
-#   Verified: doc 17 (1 GPU, kl_anneal_steps=2200) reached kl_weight=5e-5
-#   at epoch 51 (2200/43=51) — confirmed correct for that run.
-#   On 4 GPU with kl_anneal_steps=2200: ramp completes at epoch 200 as intended.
-#   Set to 0 to disable annealing (fixed kl_weight, old behaviour).
+# ── LATENT CAPACITY ──────────────────────────────────────────────────────────
+# Per-token latent width. Token count is pinned to the 512-block count, so the
+# structured-latent total = 512 * EMBED_DIM. 32 = baseline (16384). 64 = DOUBLE
+# (32768) and the real lever for the position floor. Changing this is a Stage-1
+# RETRAIN and needs a matching Stage-2 latent size; KL grows ~linearly so watch
+# KL_WEIGHT*KL. Blank/32 reproduces the previous runs exactly.
+EMBED_DIM=32
 KL_ANNEAL_STEPS=0
-# ── Cosine warm restarts ──────────────────────────────────────────────────────
-# PROVEN in Run 3 (1500 chunks, T0≈900 epochs, lr=1e-4):
-#   val L2=6.46 vs Run 1 (3800 chunks, no restarts, lr=2e-4) val L2=29.04.
-#   Run 3 had LESS data and LOWER LR but 4.5x better convergence.
-#   Each restart lets the optimizer escape local minima (encoder KL spikes
-#   briefly then drops lower — confirmed healthy re-exploration).
-#
-# T0 = restart period in EPOCHS (0 = single cosine, old behaviour).
-# Target 3-5 complete cycles over total training budget:
-#   3000 epochs / T0=800 = 3.75 cycles  ← used here for 3800 chunks
-# Schedule within each cycle: peak→floor over T0/2 epochs, floor→peak over T0/2.
-# Floor = lr * lr_min_ratio = 1e-4 * 0.1 = 1e-5.
 LR_RESTART_T0=800
-# EVAL_EVERY=10: doc 17 (1 GPU) showed val full L2 peaked at epoch 50 (134.82)
-# then regressed to 135.26 by epoch 100. EVAL_EVERY=50 would miss the best
-# checkpoint if the peak is sharp. EVAL_EVERY=20 adds ~2% eval overhead but
-# ensures the best model is captured with ±10 epoch resolution.
 EVAL_EVERY=10
 WEIGHT_DECAY=1e-2
 WARMUP_STEPS=300
 LR_MIN_RATIO=0.1
 FAILURE_THRESHOLD=100
 
-# ── Dataset scenes ────────────────────────────────────────────────────────────
-# TRAIN_SCENES controls how many scenes are used for training:
-#   "chunks"   : first TRAIN_SCENES sorted chunks → training
-#                remaining (3888 - TRAIN_SCENES) → held-out chunk val
-#                  TRAIN_SCENES=3800 → 88 held-out chunks (recommended)
-#                  TRAIN_SCENES=3888 → no held-out chunks
-#   "full"     : TRAIN_SCENES capped at 800
-#   "combined" : split evenly (TRAIN_SCENES/2 full + TRAIN_SCENES/2 chunks)
-#
-# VAL_SCENES applies only to the primary val set (val/ full scenes).
-# The held-out chunk count is derived automatically as 3888 - TRAIN_SCENES.
-# ── HYPOTHESIS TEST CONFIGURATION ─────────────────────────────────────────────
-# Training on 300 scenes randomly sampled from the 3800-chunk dataset.
-# Expected: if Pos converges to ~20 (like original 300-scene run), the
-# architectural bottleneck is confirmed as the limiting factor.
-TRAIN_SCENES=300
-
-# Random seed for selecting 300 scenes from the 3800 available.
-# Set to "" to disable randomization (use first 300 alphabetically instead).
-RANDOM_SUBSET_SEED=42
-
-VAL_SCENES=50
+TRAIN_SCENES=3800
+RANDOM_SUBSET_SEED=""
+VAL_SCENES=100        # full-scene val from interior_gs/val (takes min(100, available))
+CHUNK_VAL_SCENES=88
+# Gaussian SELECTION (which num_gaussians to keep per scene). This is the lever for
+# the "model can't fully learn / fewer Gaussians helps" symptom: opacity ranking
+# scatters with non-uniform density (hard to compress); uniform/FPS equalizes it.
+#   opacity          = top-K by opacity (legacy; deterministic; visually cleanest here)
+#   uniform | fps    = density-uniform FPS-style grid sampling (now seeded -> deterministic)
+#   uniform_instance = the above, stratified by instance label (object-coherent)
+# NOTE: val + chunk-val are always preloaded (sampled ONCE, frozen for the run), so the
+# val metric is a fixed measure regardless of method or --no_preload on the train sets.
 SAMPLING_METHOD="opacity"
+SAMPLE_VOXEL_RES=96    # grid resolution for uniform/fps sampling (needs occupied voxels >= NUM_GAUSSIANS)
 
-# ── Extra training datasets ───────────────────────────────────────────────────
-# Colon-separated list of extra scene directories to add on top of TRAIN_DATA.
-# Each directory must contain scene subdirectories with coord.npy, color.npy,
-# scale.npy, quat.npy, opacity.npy (standard SceneSplat layout).
-# Semantics are automatically disabled for extra paths (different label spaces).
-# Reconstruction and geometry losses are completely unaffected.
-#
-# To use all three datasets, uncomment and set:
-#   EXTRA_TRAIN_PATHS=""
-#   EXTRA_TRAIN_SCENES=""   # 0 = all scenes from that path
-#
-# To use only ArkitScenes:
-#   EXTRA_TRAIN_PATHS=""
-#   EXTRA_TRAIN_SCENES=""
-#
-# Leave empty to use only TRAIN_DATA (original behaviour, fully backward compatible):
-EXTRA_TRAIN_PATHS=""
-EXTRA_TRAIN_SCENES=""
+# ── FULL-SCENE DATA MIX (added on top of the 3800 chunks) ─────────────────────
+# Main set = 3800 interior_gs chunks (TRAIN_DATA=chunks, global frame via
+# norm_factor.npy). The three extra roots below are FULL scenes, each PER-SCENE
+# normalised (no norm_factor.npy -> centred + scaled to radius 10, the SAME frame
+# the full-scene val uses). Semantics are auto-disabled for extra paths, so
+# uniform_instance falls back to plain density-uniform sampling on them (object
+# labels are only present on the interior chunks). Counts: 800 + 1290 + 906(->856
+# available) ~= 2946 full scenes; total train ~= 6746.
+#   interior_gs/train  : 800  full scenes (same dataset as the chunks, per-scene norm)
+#   arkitscenes        : 1290 full scenes
+#   scannetpp_v2        : 906 requested (856 on disk)
+EXTRA_TRAIN_PATHS="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train:/home/yli7/scratch/datasets/gaussian_world/preprocessed/arkitscenes_mcmc_3dgs/train:/home/yli7/scratch/datasets/gaussian_world/preprocessed/scannetpp_v2_mcmc_3dgs_lang_large_new/train"
+EXTRA_TRAIN_SCENES="800:1290:906"
+
+# Load scenes on-the-fly instead of caching all of them in RAM. Each DDP rank holds
+# its OWN preload copy, so the ~6746-scene chunks+full mix (~34 GB/rank) plus the
+# epoch-0 eval spike blew past --mem=90G and got SIGKILL-ed (exit -9). False here =
+# no preload -> low host RAM, epochs a bit slower (disk + per-access sampling/sort,
+# overlapped by the dataloader workers). Set True only if you also raise --mem.
+PRELOAD=False
 
 USE_CANONICAL_NORM=True
-
-# ── Chunk normalization ───────────────────────────────────────────────────────
-# Controls whether grid chunks use norm_factor.npy (global coordinate frame).
-#
-# True  [DEFAULT]: all chunks of a room share one norm_factor.npy computed from
-#   their spatial union → same physical location = same target coordinates in
-#   every chunk → position loss converges cleanly.
-#
-# False [ABLATION]: ignore norm_factor.npy even when present. Each chunk is
-#   normalized into its own local sphere. Same physical point → different targets
-#   in different chunks → gradient cancellation → position stalls at ~2300.
-#   Set to False to confirm experimentally that global frame = convergence.
-#
-# Full scenes / ArkitScenes / ScanNet++ are unaffected (no norm_factor.npy).
-# Match the original 300-chunk run that achieved Pos→20:
-#   per-scene normalization (chunk_norm_factor disabled).
-# This is the CRITICAL setting — if we want to replicate the original success,
-# we must match its normalization scheme exactly.
-CHUNK_NORM_FACTOR=False
+CHUNK_NORM_FACTOR=True
 SCALE_NORM_MODE="linear"
 
-# ── Visualisation ─────────────────────────────────────────────────────────────
-PCA_VIS_FREQ=200
+PCA_VIS_FREQ=100
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
-RECON_PLY_FREQ=200
+RECON_PLY_FREQ=100
 RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
-# ── W&B ───────────────────────────────────────────────────────────────────────
 export WANDB_API_KEY="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"
 USE_WANDB=True
 
@@ -250,6 +258,17 @@ if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; 
     echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True"; exit 1
 fi
 
+_CP_CHECK=$(python3 -c "
+v = float('$CROP_PERCENTILE')
+if v <= 0 or v > 100:
+    raise ValueError(f'CROP_PERCENTILE must be in (0, 100], got {v}')
+print('ok')
+" 2>&1)
+if [ "$_CP_CHECK" != "ok" ]; then
+    echo "ERROR: CROP_PERCENTILE=$CROP_PERCENTILE is invalid: $_CP_CHECK"
+    exit 1
+fi
+
 ACTIVE_STRATEGY="C (baseline)"
 if [ "$LATENT_DISENTANGLE" = "True" ] && [ "$_any_B" = "false" ]; then
     ACTIVE_STRATEGY="A — 16+496 in sequence (BEST)"
@@ -263,17 +282,28 @@ fi
 
 echo "========================================================================"
 echo "  CAN3TOK — Strategy: $ACTIVE_STRATEGY"
-echo "  TRAIN_DATA=$TRAIN_DATA  TRAIN_SCENES=$TRAIN_SCENES  VAL_SCENES=$VAL_SCENES"
-if [ "$TRAIN_DATA" = "chunks" ] || [ "$TRAIN_DATA" = "combined" ]; then
-    _TOTAL_CHUNKS=3888
-    _HELD_OUT=$(( _TOTAL_CHUNKS - TRAIN_SCENES ))
-    if [ $_HELD_OUT -gt 0 ]; then
-        echo "  Held-out chunks for in-distribution val: $_HELD_OUT"
-        echo "  (skip_scenes=$TRAIN_SCENES, used automatically by gs_dataset)"
-    else
-        echo "  No held-out chunks (TRAIN_SCENES=$TRAIN_SCENES uses all chunks)"
-    fi
+if [ "$TOKEN_LOCAL_DECODER" = "True" ]; then
+    echo "  TOKEN-LOCAL DECODER ENABLED"
 fi
+_CP_INT=$(python3 -c "print(int(float('$CROP_PERCENTILE')))")
+if [ "$_CP_INT" -lt 100 ]; then
+    echo "  SPATIAL CROP: keeping inner ${CROP_PERCENTILE}% of each scene by"
+    echo "     distance from centroid before opacity sampling."
+else
+    echo "  Spatial crop    : disabled (CROP_PERCENTILE=100)"
+fi
+if [ "$MORTON_ORDER" = "True" ]; then
+    _FRAME_DESC=$(python3 -c "r=float('$ORDER_FRAME_RADIUS'); print(f'canonical frame [-{r:g},{r:g}]' if r>0 else 'per-scene min-max (legacy)')")
+    echo "  GAUSSIAN ORDER  : ${ORDER_CURVE^^} space-filling curve, ${_FRAME_DESC}"
+else
+    echo "  Gaussian order  : opacity rank (default)"
+fi
+if [ "$USE_CHAMFER_LOSS" = "True" ]; then
+    echo "  RECON OBJECTIVE : CHAMFER (permutation-invariant, order-free)  chunk=$CHAMFER_CHUNK"
+else
+    echo "  Recon objective : element-wise L2 (pair with MORTON_ORDER=True)"
+fi
+echo "  TRAIN_DATA=$TRAIN_DATA  TRAIN_SCENES=$TRAIN_SCENES  VAL_SCENES=$VAL_SCENES"
 echo "========================================================================"
 echo ""
 
@@ -282,16 +312,32 @@ echo ""
 # ============================================================================
 
 module purge && module load 2023 && module load CUDA/12.1.1
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+# export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
-cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
+# Force UTF-8. Snellius compute nodes default to an ASCII (C/POSIX) locale, and
+# gsplat's runtime CUDA-kernel compile reads its own source files with Python's
+# default text encoding; a UTF-8 byte in those sources (e.g. an em-dash) then
+# raises UnicodeDecodeError before any CUDA work. PYTHONUTF8=1 forces UTF-8 for
+# file I/O regardless of whether a UTF-8 locale is installed. (Harmless otherwise.)
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+# NOTE (only needed if RENDER_LOSS=True): the rendering loss needs gsplat in this
+# env. Install it ONCE on a LOGIN node (Snellius compute nodes have no internet):
+#     /home/yli11/.conda/envs/can3tok/bin/pip install gsplat
+# gsplat JIT-compiles its CUDA kernels on first import (the CUDA/12.1.1 module above
+# provides nvcc); the single-process pre-compile below triggers and caches it.
+# Also copy render_loss.py into this repo root next to gs_can3tok_2.py.
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
 mkdir -p logs_ss1 checkpoints_stage1
 
 [ "$USE_WANDB" = "True" ] && wandb login $WANDB_API_KEY --relogin 2>/dev/null
 
-# ── point_feats check ─────────────────────────────────────────────────────────
 YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 if [ -f "$YAML_PATH" ]; then
     POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
@@ -299,25 +345,17 @@ if [ -f "$YAML_PATH" ]; then
     echo "  point_feats=11 confirmed"
 fi
 
-# ── norm_factor.npy pre-flight check (chunks/combined only) ──────────────────
-# Normalization for grid chunks requires norm_factor.npy in every chunk dir.
-# This is written by precompute_norm_from_chunks.py using the union of all
-# chunks per scene → global coordinate frame consistent across all chunks.
-# The Python script reads it automatically — no extra flags needed here.
-# This check just catches missing precomputation before wasting GPU hours.
 if [ "$TRAIN_DATA" = "chunks" ] || [ "$TRAIN_DATA" = "combined" ]; then
     CHUNKS_DIR="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
     echo ""
     echo "  Pre-flight: checking norm_factor.npy in chunk dirs..."
 
-    # Sample the first 50 chunks (sorted) and count how many have norm_factor.npy
     _NF_COUNT=$(ls "$CHUNKS_DIR" | sort | head -50 | while read d; do
         [ -f "$CHUNKS_DIR/$d/norm_factor.npy" ] && echo "ok"
     done | wc -l)
 
     if [ "$_NF_COUNT" -eq 50 ]; then
-        echo "  norm_factor.npy: 50/50 sampled chunks OK — global frame confirmed ✓"
-        # Show one example to confirm the values look sensible
+        echo "  norm_factor.npy: 50/50 sampled chunks OK — global frame confirmed"
         _EX_DIR=$(ls "$CHUNKS_DIR" | sort | head -1)
         echo "  Example: $_EX_DIR"
         python3 -c "
@@ -327,19 +365,11 @@ print(f'    center=({nf[0]:.3f}, {nf[1]:.3f}, {nf[2]:.3f})  scale={nf[3]:.4f}')
 if nf[3] <= 0:
     print('ERROR: scale_factor <= 0 — corrupt norm_factor.npy!')
     sys.exit(1)
-if abs(nf[3]) < 0.01 or abs(nf[3]) > 100:
-    print('WARNING: scale_factor out of expected range [0.01, 100]')
 "
     elif [ "$_NF_COUNT" -gt 0 ]; then
         echo "  WARNING: norm_factor.npy found in only $_NF_COUNT/50 sampled chunks."
-        echo "  Run precompute_norm_from_chunks.py before training on chunks."
-        echo "  Continuing (Python will report exact counts and may fail or produce wrong results)."
     else
         echo "  ERROR: norm_factor.npy missing from all 50 sampled chunks!"
-        echo "  Run this first:"
-        echo "    python precompute_norm_from_chunks.py \\"
-        echo "      --chunks_dir $CHUNKS_DIR \\"
-        echo "      --workers 16"
         exit 1
     fi
     echo ""
@@ -351,16 +381,23 @@ echo ""
 # BUILD COMMAND
 # ============================================================================
 
-ACCELERATE_CONFIG="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/job_scripts/accelerate_config.yaml"
+ACCELERATE_CONFIG="/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml"
 TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
 
 TRAIN_CMD="$TRAIN_CMD --train_data $TRAIN_DATA"
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --num_gaussians $NUM_GAUSSIANS"
+if [ "$POS_COND_HEADS" = "1" ]; then
+    TRAIN_CMD="$TRAIN_CMD --pos_cond_heads --pos_cond_color $POS_COND_COLOR --pos_cond_rotation $POS_COND_ROTATION"
+    TRAIN_CMD="$TRAIN_CMD --pos_cond_sigma $POS_COND_SIGMA --pos_cond_pos_scale $POS_COND_POS_SCALE"
+fi
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE --kl_weight $KL_WEIGHT --kl_anneal_steps $KL_ANNEAL_STEPS"
 TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY --warmup_steps $WARMUP_STEPS"
 TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO --lr_restart_T0 $LR_RESTART_T0 --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
+[ -n "$CHUNK_VAL_SCENES" ] && TRAIN_CMD="$TRAIN_CMD --chunk_val_scenes $CHUNK_VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+TRAIN_CMD="$TRAIN_CMD --sample_voxel_res $SAMPLE_VOXEL_RES"
 
 [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_cross_attn"
 [ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_additive"
@@ -398,6 +435,24 @@ TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 
 [ "$DECODER_POS_ENC"    = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_pos_enc"
 [ "$DECODER_FOURIER_PE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
+[ "$TOKEN_LOCAL_DECODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_local_decoder"
+
+[ "$POSITION_SCAFFOLD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scaffold_mode $SCAFFOLD_MODE"
+[ "$ANCHOR_RELATIVE_DECODE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_relative_decode --offset_scale_init $OFFSET_SCALE_INIT"
+if [ "$MICRO_PATTERN" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --micro_pattern --micro_offset_scale $MICRO_OFFSET_SCALE"
+    [ "$MICRO_PATTERN_NO_ROTATION" = "True" ] && TRAIN_CMD="$TRAIN_CMD --micro_pattern_no_rotation"
+    if [ -n "$RESUME_CHECKPOINT" ]; then
+        echo "[job] WARNING: MICRO_PATTERN=True with a RESUME_CHECKPOINT set. The frame"
+        echo "[job]          head loads fresh (strict=False) and the position branch must"
+        echo "[job]          re-converge; this is effectively a retrain. Blank"
+        echo "[job]          RESUME_CHECKPOINT to start clean."
+    fi
+fi
+[ "$ANCHOR_TEACHER_FORCE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_teacher_force"
+[ "$STRUCTURED_LATENT" = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_latent"
+[ "$LOCAL_ENCODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --local_encoder --local_window $LOCAL_WINDOW"
 
 [ "$TOKEN_COND"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond --token_cond_approach $TOKEN_COND_APPROACH"
 [ "$TOKEN_COND_ADALN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_adaln"
@@ -416,18 +471,46 @@ TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
 
 [ "$USE_WANDB" = "True" ] && TRAIN_CMD="$TRAIN_CMD --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC"
 
-# Hypothesis-test flag: random subset selection for training data only.
-# Validation data is unaffected (always uses sorted val scenes).
 [ -n "$RANDOM_SUBSET_SEED" ] && TRAIN_CMD="$TRAIN_CMD --random_subset_seed $RANDOM_SUBSET_SEED"
+
+TRAIN_CMD="$TRAIN_CMD --crop_percentile $CROP_PERCENTILE"
+
+[ "$MORTON_ORDER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --morton_order"
+TRAIN_CMD="$TRAIN_CMD --order_curve $ORDER_CURVE"
+TRAIN_CMD="$TRAIN_CMD --order_frame_radius $ORDER_FRAME_RADIUS"
+TRAIN_CMD="$TRAIN_CMD --param_loss_weight $PARAM_LOSS_WEIGHT"
+if [ "$CANONICAL_VOXEL" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --canonical_voxel --voxel_res $VOXEL_RES"
+    [ "$VOXEL_SNAP" = "True" ] && TRAIN_CMD="$TRAIN_CMD --voxel_snap"
+fi
+
+[ "$USE_CHAMFER_LOSS" = "True" ] && TRAIN_CMD="$TRAIN_CMD --use_chamfer_loss"
+TRAIN_CMD="$TRAIN_CMD --chamfer_chunk $CHAMFER_CHUNK"
+TRAIN_CMD="$TRAIN_CMD --geom_loss $GEOM_LOSS --geom_eps $GEOM_EPS --geom_ns_iters $GEOM_NS_ITERS --geom_shape_weight $GEOM_SHAPE_WEIGHT"
+[ -n "$EMBED_DIM" ] && TRAIN_CMD="$TRAIN_CMD --embed_dim $EMBED_DIM"
+if [ "$SET_LOSS" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --set_loss --set_sinkhorn_eps $SET_SINKHORN_EPS --set_sinkhorn_iters $SET_SINKHORN_ITERS"
+    TRAIN_CMD="$TRAIN_CMD --set_pos_weight $SET_POS_WEIGHT --set_opa_weight $SET_OPA_WEIGHT --set_block_size $SET_BLOCK_SIZE"
+fi
+TRAIN_CMD="$TRAIN_CMD --opacity_pos_weight $OPACITY_POS_WEIGHT"
+if [ "$RENDER_LOSS" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --render_loss --render_loss_weight $RENDER_LOSS_WEIGHT --render_warmup_epochs $RENDER_WARMUP_EPOCHS"
+    TRAIN_CMD="$TRAIN_CMD --render_views $RENDER_VIEWS --render_img $RENDER_IMG --render_max_scenes $RENDER_MAX_SCENES"
+    TRAIN_CMD="$TRAIN_CMD --render_ssim_weight $RENDER_SSIM_WEIGHT --render_fov $RENDER_FOV --render_dist_mult $RENDER_DIST_MULT"
+    TRAIN_CMD="$TRAIN_CMD --render_lpips_weight $RENDER_LPIPS_WEIGHT"
+    TRAIN_CMD="$TRAIN_CMD --render_up_axis $RENDER_UP_AXIS --render_quat_order $RENDER_QUAT_ORDER"
+fi
+[ "$COV_METRIC" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_cov_metric"
+[ "$AUG_YAW" = "True" ] && TRAIN_CMD="$TRAIN_CMD --aug_yaw --aug_yaw_axis $AUG_YAW_AXIS --aug_yaw_max_deg $AUG_YAW_MAX_DEG"
 
 if [ -n "$RESUME_CHECKPOINT" ]; then
     TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
     [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
 fi
 
-# Extra training datasets (only appended when non-empty)
 [ -n "$EXTRA_TRAIN_PATHS"  ] && TRAIN_CMD="$TRAIN_CMD --extra_train_paths $EXTRA_TRAIN_PATHS"
-[ -n "$EXTRA_TRAIN_SCENES" ] && TRAIN_CMD="$TRAIN_CMD --extra_train_scenes $EXTRA_TRAIN_SCENES" 
+[ -n "$EXTRA_TRAIN_SCENES" ] && TRAIN_CMD="$TRAIN_CMD --extra_train_scenes $EXTRA_TRAIN_SCENES"
+[ "$PRELOAD" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_preload"
 
 echo "Command: $TRAIN_CMD"
 echo ""
@@ -437,6 +520,18 @@ echo ""
 # ============================================================================
 
 SECONDS=0
+# Pre-compile gsplat's CUDA extension in a SINGLE process before the multi-GPU
+# launch. The first import JIT-compiles the kernels; if both DDP ranks hit that at
+# once they can race on the shared build dir and fail. Doing it once here (with
+# PYTHONUTF8=1 set above) populates ~/.cache/torch_extensions so the ranks just
+# load the cached .so. Skipped unless RENDER_LOSS=True.
+if [ "$RENDER_LOSS" = "True" ]; then
+    echo "Pre-compiling gsplat CUDA extension (single process)..."
+    python -c "from gsplat.cuda._backend import _C; print('gsplat extension ready')" || {
+        echo "ERROR: gsplat failed to compile. Check that the CUDA module is loaded and"
+        echo "       gsplat is installed in the can3tok env. Aborting before the DDP launch."
+        exit 1; }
+fi
 eval $TRAIN_CMD
 TRAIN_EXIT=$?
 echo ""
@@ -444,20 +539,15 @@ echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End:
 
 if [ $TRAIN_EXIT -eq 0 ]; then
     echo ""
-    echo "COMPLETED. Strategy: $ACTIVE_STRATEGY | Data: $TRAIN_DATA"
+    echo "COMPLETED. Strategy: $ACTIVE_STRATEGY | Data: $TRAIN_DATA | Crop: ${CROP_PERCENTILE}% | Order: ${MORTON_ORDER}/${ORDER_CURVE} | Chamfer: $USE_CHAMFER_LOSS"
     echo ""
     echo "  Useful log greps:"
-    echo "  Best full-scene model  : grep 'NEW BEST' logs_ss1/can3tok_${SLURM_JOB_ID}.out | tail -5"
-    echo "  Val full scenes (L2)   : grep 'Val FULL SCENES' logs_ss1/can3tok_${SLURM_JOB_ID}.out"
-    echo "  Val held-out chunks    : grep 'Val HELD-OUT CHUNKS' logs_ss1/can3tok_${SLURM_JOB_ID}.out"
-    echo "  Distribution gap       : grep 'DISTRIBUTION GAP' logs_ss1/can3tok_${SLURM_JOB_ID}.out"
-    echo "  Normalization check    : grep 'NORMALIZATION VERIFICATION' -A 15 logs_ss1/can3tok_${SLURM_JOB_ID}.out"
-    echo "  Position convergence   : grep 'Pos=' logs_ss1/can3tok_${SLURM_JOB_ID}.out | head -20"
+    echo "  Best full-scene model  : grep 'NEW BEST' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out | tail -5"
+    echo "  Val full scenes (L2)   : grep 'Val FULL SCENES' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
+    echo "  Position convergence   : grep 'Pos=' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out | head -20"
+    echo "  Recon objective        : grep 'RECON OBJECTIVE' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
+    echo "  Gaussian order         : grep 'GAUSSIAN ORDER' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
 else
     echo "FAILED (exit $TRAIN_EXIT)"
-    echo "  Error log: cat logs_ss1/can3tok_${SLURM_JOB_ID}.err"
-    echo "  If missing norm_factor.npy, run:"
-    echo "    python precompute_norm_from_chunks.py \\"
-    echo "      --chunks_dir /home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6 \\"
-    echo "      --workers 16"
+    echo "  Error log: cat logs_ss1/can3tok_10k_${SLURM_JOB_ID}.err"
 fi

@@ -1,35 +1,43 @@
 #!/bin/bash
-#SBATCH --job-name=can3tok_tokenlocal
+#SBATCH --job-name=can3tok_stage1_final
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=2
-#SBATCH --time=10:00:00
+#SBATCH --time=15:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=90G
-#SBATCH --output=logs_ss1/can3tok_chunks_10k_ht_%j.out
-#SBATCH --error=logs_ss1/can3tok_chunks_10k_ht_%j.err
+#SBATCH --output=logs_ss1/can3tok_10k_%j.out
+#SBATCH --error=logs_ss1/can3tok_10k_%j.err
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ============================================================================
 # DATASET SELECTION
 # ============================================================================
-# CLEAN CHUNK SPLIT: train on the first 3800 sorted chunks, hold out the remaining
-# 88 for validation (3888 total). The split is disjoint by construction and the
-# training script hard-fails if it is not (see the contamination guard).
 TRAIN_DATA="chunks"
 
 # ============================================================================
 # FLAGS
 # ============================================================================
 
-RESUME_CHECKPOINT=""
-RESUME_EPOCH=""
+RESUME_CHECKPOINT="/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/checkpoints_stage1/RGB_job_23690444_none_colorresidual_fourierpe_morton_chunks_inferencefixed/best_model.pth"
+RESUME_EPOCH="900"
 
 DECODER_LAYOUT_CROSS_ATTN=False
 DECODER_LAYOUT_ADDITIVE=False
 
-TOKEN_LOCAL_DECODER=False
+TOKEN_LOCAL_DECODER=True
+
+ANCHOR_RELATIVE_DECODE=True
+SCAFFOLD_MODE="hilbert_block"
+ANCHOR_TEACHER_FORCE=False
+OFFSET_SCALE_INIT=2.0
+POSITION_SCAFFOLD=True
+ANCHOR_LOSS_WEIGHT=1.0
+
+LOCAL_ENCODER=True
+LOCAL_WINDOW=1
+STRUCTURED_LATENT=True
 
 SEMANTIC_MODE_OVERRIDE="none"
 
@@ -78,65 +86,54 @@ TOKEN_COND_ADALN=False
 SCALE_PENALTY_WEIGHT=0.0
 SCALE_PENALTY_THRESHOLD=0.5
 
-# ── Spatial crop ──────────────────────────────────────────────────────────────
-# Keep inner CROP_PERCENTILE% of each scene by distance from centroid before
-# opacity sampling. 100.0 = disabled. 50.0 = keep inner half.
-#
-# NOTE on isolating the ORDERING fix below: to see the Morton effect cleanly,
-# set CROP_PERCENTILE=100.0 (disable crop) so the only change vs the failing run
-# is the Gaussian ordering. Mixing crop + morton changes two variables at once.
-CROP_PERCENTILE=100.0   # set to 50.0 to re-enable cropping
+CROP_PERCENTILE=100.0
 
-# ── Gaussian ordering (MORTON / Z-ORDER) ──────────────────────────────────────
-# When True, the dataset reorders the opacity-selected Gaussians along a Z-order
-# space-filling curve so target slot i maps to a spatially-stable location across
-# scenes. This is the primary fix for the element-wise reconstruction floor: with
-# opacity ordering, slot i = "the i-th most opaque Gaussian", a different physical
-# point in every scene, so the per-slot regression target is unlearnable and the
-# loss plateaus. With Morton ordering slot i is a stable spatial location aligned
-# with the decoder's voxel token grid, which makes the element-wise loss learnable.
-# Cost: one sort at preload, zero at train time.
-#
-# Not needed when USE_CHAMFER_LOSS=True (Chamfer is order-free), but harmless.
 MORTON_ORDER=True
-
-# Which space-filling curve to use when MORTON_ORDER=True.
-#   hilbert (default, RECOMMENDED) — provably better locality than Z-order:
-#     consecutive slots are ALWAYS spatially adjacent (single-step L1 distance = 1,
-#     zero jumps), so the decoder learns a smooth Lipschitz slot->position curve.
-#     Measured on 10k random points: mean consecutive spacing 0.49 vs Morton 0.61.
-#     Used by Point Transformer V3, OctFormer, HydraMamba, Voxel Mamba for exactly
-#     this locality reason.
-#   morton — Z-order (bit-interleave). Cheaper conceptually but teleports across the
-#     volume when high bits flip (max single-step L1 jump 15, 255 discontinuities on
-#     an 8^3 grid). Kept for ablation / backward comparison with your last run.
 ORDER_CURVE="hilbert"
-
-# Frame for the space-filling sort (the key fix from the paper's HilbertSort3D).
-#   10.0 (RECOMMENDED) — FIXED canonical frame [-10,10], i.e. the radius your data is
-#     normalized to. The Hilbert curve then traverses the SAME absolute cells in the
-#     SAME order for every scene, so target slot i means a consistent physical place
-#     across scenes and the decoder learns ONE scene-agnostic slot->position map. This
-#     is what the original Can3Tok HilbertSort3D does (fixed origin/radius) and is the
-#     point of a *canonical* tokenization.
-#   <=0 — legacy PER-SCENE min-max: each scene's bounding box is stretched to the grid,
-#     so slot i is scene-idiosyncratic. This is what the earlier Hilbert runs used and
-#     is a likely contributor to the full-scene generalization gap. Set to 0 to A/B.
 ORDER_FRAME_RADIUS=10.0
 
-# ── Reconstruction objective ──────────────────────────────────────────────────
-# USE_CHAMFER_LOSS=False (default): element-wise L2 (torch.norm(pred[i]-tgt[i])).
-#   Pair with MORTON_ORDER=True so the per-slot target is learnable.
-# USE_CHAMFER_LOSS=True: permutation-invariant Chamfer loss (nearest-neighbour
-#   matching on position). Order-free, so MORTON_ORDER is not required. Slower
-#   (NN search per scene). Use this as the principled backup if Morton+element-wise
-#   still shows a gap. When Chamfer is on, the printed "Recon" line is the Chamfer
-#   value; "Pos"/"Col"/... remain index-matched diagnostics.
 USE_CHAMFER_LOSS=False
-CHAMFER_CHUNK=2048   # NN-search chunk size; lower if you hit OOM with Chamfer
+CHAMFER_CHUNK=2048
 
-BATCH_SIZE=90
-NUM_EPOCHS=5000
+GEOM_LOSS="bures_codiag"
+GEOM_EPS=1e-6
+GEOM_NS_ITERS=15
+GEOM_SHAPE_WEIGHT=5.0
+
+SET_LOSS=True
+SET_SINKHORN_EPS=0.05
+SET_SINKHORN_ITERS=50
+SET_POS_WEIGHT=1.0
+SET_OPA_WEIGHT=1.0
+SET_BLOCK_SIZE=0
+
+# ── VIRTUAL-CAMERA RENDERING LOSS  (--render_loss)  — image-space crispness ────
+RENDER_LOSS=True
+RENDER_LOSS_WEIGHT=0.5
+RENDER_WARMUP_EPOCHS=0
+RENDER_VIEWS=4
+RENDER_IMG=128
+RENDER_MAX_SCENES=8
+RENDER_SSIM_WEIGHT=0.2
+RENDER_FOV=50.0
+RENDER_DIST_MULT=2.6
+RENDER_UP_AXIS=2
+RENDER_QUAT_ORDER="wxyz"
+
+COV_METRIC=True
+
+AUG_YAW=False
+AUG_YAW_AXIS="z"
+AUG_YAW_MAX_DEG=180.0
+
+BATCH_SIZE=64
+NUM_EPOCHS=1800
+NUM_GAUSSIANS=40000
+POS_COND_HEADS=0
+POS_COND_COLOR=0
+POS_COND_ROTATION=0
+POS_COND_SIGMA=6.0
+POS_COND_POS_SCALE=10.0
 LEARNING_RATE=1e-4
 KL_WEIGHT=1e-5
 KL_ANNEAL_STEPS=0
@@ -148,21 +145,11 @@ LR_MIN_RATIO=0.1
 FAILURE_THRESHOLD=100
 
 TRAIN_SCENES=3800
-# RANDOM_SUBSET_SEED MUST be empty for a clean chunk split. If set, training samples a
-# RANDOM 3800 of 3888 chunks while the held-out val skips the first 3800 SORTED chunks,
-# so the two overlap (~86 of the 88 "held-out" chunks were trained on). The training
-# script now rejects this with a fatal CHUNK SPLIT CONTAMINATED error.
 RANDOM_SUBSET_SEED=""
-VAL_SCENES=50          # full-scene val (val/ dir) — the PRIMARY thesis metric
-# Held-out chunk count. 3888 total - 3800 train = 88. Empty -> use all remaining chunks
-# after training (also 88 here). These are disjoint from training by construction.
+VAL_SCENES=50
 CHUNK_VAL_SCENES=88
 SAMPLING_METHOD="opacity"
 
-# Extra full-scene datasets are intentionally OFF for the clean chunk experiment so the
-# 3800/88 split is pure interior_gs chunks and the held-out-chunk metric is unambiguous.
-# (They do not affect chunk-val disjointness — different roots — so you can re-enable
-# them if you specifically want chunk+full mixed training.)
 EXTRA_TRAIN_PATHS=""
 EXTRA_TRAIN_SCENES=""
 
@@ -170,10 +157,10 @@ USE_CANONICAL_NORM=True
 CHUNK_NORM_FACTOR=True
 SCALE_NORM_MODE="linear"
 
-PCA_VIS_FREQ=1000
+PCA_VIS_FREQ=100
 PCA_NUM_SCENES=3
 PCA_BRIGHTNESS=1.25
-RECON_PLY_FREQ=1000
+RECON_PLY_FREQ=100
 RECON_PLY_NUM_SCENES=3
 RECON_PLY_MAX_SH=3
 
@@ -192,7 +179,6 @@ if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; 
     echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True"; exit 1
 fi
 
-# Validate CROP_PERCENTILE is numeric and in (0, 100]
 _CP_CHECK=$(python3 -c "
 v = float('$CROP_PERCENTILE')
 if v <= 0 or v > 100:
@@ -220,7 +206,6 @@ echo "  CAN3TOK — Strategy: $ACTIVE_STRATEGY"
 if [ "$TOKEN_LOCAL_DECODER" = "True" ]; then
     echo "  TOKEN-LOCAL DECODER ENABLED"
 fi
-# ── Spatial crop summary ─────────────────────────────────────────────────────
 _CP_INT=$(python3 -c "print(int(float('$CROP_PERCENTILE')))")
 if [ "$_CP_INT" -lt 100 ]; then
     echo "  SPATIAL CROP: keeping inner ${CROP_PERCENTILE}% of each scene by"
@@ -228,7 +213,6 @@ if [ "$_CP_INT" -lt 100 ]; then
 else
     echo "  Spatial crop    : disabled (CROP_PERCENTILE=100)"
 fi
-# ── Ordering + objective summary ─────────────────────────────────────────────
 if [ "$MORTON_ORDER" = "True" ]; then
     _FRAME_DESC=$(python3 -c "r=float('$ORDER_FRAME_RADIUS'); print(f'canonical frame [-{r:g},{r:g}]' if r>0 else 'per-scene min-max (legacy)')")
     echo "  GAUSSIAN ORDER  : ${ORDER_CURVE^^} space-filling curve, ${_FRAME_DESC}"
@@ -253,12 +237,27 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
-cd /home/yli11/scratch-project/Hafeez_thesis/Can3Tok
+# Force UTF-8. Snellius compute nodes default to an ASCII (C/POSIX) locale, and
+# gsplat's runtime CUDA-kernel compile reads its own source files with Python's
+# default text encoding; a UTF-8 byte in those sources (e.g. an em-dash) then
+# raises UnicodeDecodeError before any CUDA work. PYTHONUTF8=1 forces UTF-8 for
+# file I/O regardless of whether a UTF-8 locale is installed. (Harmless otherwise.)
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+# NOTE (only needed if RENDER_LOSS=True): the rendering loss needs gsplat in this
+# env. Install it ONCE on a LOGIN node (Snellius compute nodes have no internet):
+#     /home/yli11/.conda/envs/can3tok/bin/pip install gsplat
+# gsplat JIT-compiles its CUDA kernels on first import (the CUDA/12.1.1 module above
+# provides nvcc); the single-process pre-compile below triggers and caches it.
+# Also copy render_loss.py into this repo root next to gs_can3tok_2.py.
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
 mkdir -p logs_ss1 checkpoints_stage1
 
 [ "$USE_WANDB" = "True" ] && wandb login $WANDB_API_KEY --relogin 2>/dev/null
 
-# ── point_feats check ─────────────────────────────────────────────────────────
 YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
 if [ -f "$YAML_PATH" ]; then
     POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
@@ -266,7 +265,6 @@ if [ -f "$YAML_PATH" ]; then
     echo "  point_feats=11 confirmed"
 fi
 
-# ── norm_factor.npy pre-flight check (chunks/combined only) ──────────────────
 if [ "$TRAIN_DATA" = "chunks" ] || [ "$TRAIN_DATA" = "combined" ]; then
     CHUNKS_DIR="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
     echo ""
@@ -303,11 +301,16 @@ echo ""
 # BUILD COMMAND
 # ============================================================================
 
-ACCELERATE_CONFIG="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/job_scripts/accelerate_config.yaml"
+ACCELERATE_CONFIG="/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml"
 TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
 
 TRAIN_CMD="$TRAIN_CMD --train_data $TRAIN_DATA"
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --num_gaussians $NUM_GAUSSIANS"
+if [ "$POS_COND_HEADS" = "1" ]; then
+    TRAIN_CMD="$TRAIN_CMD --pos_cond_heads --pos_cond_color $POS_COND_COLOR --pos_cond_rotation $POS_COND_ROTATION"
+    TRAIN_CMD="$TRAIN_CMD --pos_cond_sigma $POS_COND_SIGMA --pos_cond_pos_scale $POS_COND_POS_SCALE"
+fi
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE --kl_weight $KL_WEIGHT --kl_anneal_steps $KL_ANNEAL_STEPS"
 TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY --warmup_steps $WARMUP_STEPS"
 TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO --lr_restart_T0 $LR_RESTART_T0 --eval_every $EVAL_EVERY"
@@ -353,6 +356,13 @@ TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 [ "$DECODER_FOURIER_PE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
 [ "$TOKEN_LOCAL_DECODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_local_decoder"
 
+[ "$POSITION_SCAFFOLD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scaffold_mode $SCAFFOLD_MODE"
+[ "$ANCHOR_RELATIVE_DECODE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_relative_decode --offset_scale_init $OFFSET_SCALE_INIT"
+[ "$ANCHOR_TEACHER_FORCE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_teacher_force"
+[ "$STRUCTURED_LATENT" = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_latent"
+[ "$LOCAL_ENCODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --local_encoder --local_window $LOCAL_WINDOW"
+
 [ "$TOKEN_COND"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond --token_cond_approach $TOKEN_COND_APPROACH"
 [ "$TOKEN_COND_ADALN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_adaln"
 
@@ -372,18 +382,27 @@ TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
 
 [ -n "$RANDOM_SUBSET_SEED" ] && TRAIN_CMD="$TRAIN_CMD --random_subset_seed $RANDOM_SUBSET_SEED"
 
-# ── Spatial crop ──────────────────────────────────────────────────────────────
-# When CROP_PERCENTILE=100.0 the dataset disables cropping internally.
 TRAIN_CMD="$TRAIN_CMD --crop_percentile $CROP_PERCENTILE"
 
-# ── Gaussian ordering ─────────────────────────────────────────────────────────
 [ "$MORTON_ORDER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --morton_order"
 TRAIN_CMD="$TRAIN_CMD --order_curve $ORDER_CURVE"
 TRAIN_CMD="$TRAIN_CMD --order_frame_radius $ORDER_FRAME_RADIUS"
 
-# ── Reconstruction objective ──────────────────────────────────────────────────
 [ "$USE_CHAMFER_LOSS" = "True" ] && TRAIN_CMD="$TRAIN_CMD --use_chamfer_loss"
 TRAIN_CMD="$TRAIN_CMD --chamfer_chunk $CHAMFER_CHUNK"
+TRAIN_CMD="$TRAIN_CMD --geom_loss $GEOM_LOSS --geom_eps $GEOM_EPS --geom_ns_iters $GEOM_NS_ITERS --geom_shape_weight $GEOM_SHAPE_WEIGHT"
+if [ "$SET_LOSS" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --set_loss --set_sinkhorn_eps $SET_SINKHORN_EPS --set_sinkhorn_iters $SET_SINKHORN_ITERS"
+    TRAIN_CMD="$TRAIN_CMD --set_pos_weight $SET_POS_WEIGHT --set_opa_weight $SET_OPA_WEIGHT --set_block_size $SET_BLOCK_SIZE"
+fi
+if [ "$RENDER_LOSS" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --render_loss --render_loss_weight $RENDER_LOSS_WEIGHT --render_warmup_epochs $RENDER_WARMUP_EPOCHS"
+    TRAIN_CMD="$TRAIN_CMD --render_views $RENDER_VIEWS --render_img $RENDER_IMG --render_max_scenes $RENDER_MAX_SCENES"
+    TRAIN_CMD="$TRAIN_CMD --render_ssim_weight $RENDER_SSIM_WEIGHT --render_fov $RENDER_FOV --render_dist_mult $RENDER_DIST_MULT"
+    TRAIN_CMD="$TRAIN_CMD --render_up_axis $RENDER_UP_AXIS --render_quat_order $RENDER_QUAT_ORDER"
+fi
+[ "$COV_METRIC" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_cov_metric"
+[ "$AUG_YAW" = "True" ] && TRAIN_CMD="$TRAIN_CMD --aug_yaw --aug_yaw_axis $AUG_YAW_AXIS --aug_yaw_max_deg $AUG_YAW_MAX_DEG"
 
 if [ -n "$RESUME_CHECKPOINT" ]; then
     TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
@@ -401,6 +420,18 @@ echo ""
 # ============================================================================
 
 SECONDS=0
+# Pre-compile gsplat's CUDA extension in a SINGLE process before the multi-GPU
+# launch. The first import JIT-compiles the kernels; if both DDP ranks hit that at
+# once they can race on the shared build dir and fail. Doing it once here (with
+# PYTHONUTF8=1 set above) populates ~/.cache/torch_extensions so the ranks just
+# load the cached .so. Skipped unless RENDER_LOSS=True.
+if [ "$RENDER_LOSS" = "True" ]; then
+    echo "Pre-compiling gsplat CUDA extension (single process)..."
+    python -c "from gsplat.cuda._backend import _C; print('gsplat extension ready')" || {
+        echo "ERROR: gsplat failed to compile. Check that the CUDA module is loaded and"
+        echo "       gsplat is installed in the can3tok env. Aborting before the DDP launch."
+        exit 1; }
+fi
 eval $TRAIN_CMD
 TRAIN_EXIT=$?
 echo ""
@@ -411,12 +442,12 @@ if [ $TRAIN_EXIT -eq 0 ]; then
     echo "COMPLETED. Strategy: $ACTIVE_STRATEGY | Data: $TRAIN_DATA | Crop: ${CROP_PERCENTILE}% | Order: ${MORTON_ORDER}/${ORDER_CURVE} | Chamfer: $USE_CHAMFER_LOSS"
     echo ""
     echo "  Useful log greps:"
-    echo "  Best full-scene model  : grep 'NEW BEST' logs_ss1/can3tok_${SLURM_JOB_ID}.out | tail -5"
-    echo "  Val full scenes (L2)   : grep 'Val FULL SCENES' logs_ss1/can3tok_${SLURM_JOB_ID}.out"
-    echo "  Position convergence   : grep 'Pos=' logs_ss1/can3tok_${SLURM_JOB_ID}.out | head -20"
-    echo "  Recon objective        : grep 'RECON OBJECTIVE' logs_ss1/can3tok_${SLURM_JOB_ID}.out"
-    echo "  Gaussian order         : grep 'GAUSSIAN ORDER' logs_ss1/can3tok_${SLURM_JOB_ID}.out"
+    echo "  Best full-scene model  : grep 'NEW BEST' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out | tail -5"
+    echo "  Val full scenes (L2)   : grep 'Val FULL SCENES' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
+    echo "  Position convergence   : grep 'Pos=' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out | head -20"
+    echo "  Recon objective        : grep 'RECON OBJECTIVE' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
+    echo "  Gaussian order         : grep 'GAUSSIAN ORDER' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
 else
     echo "FAILED (exit $TRAIN_EXIT)"
-    echo "  Error log: cat logs_ss1/can3tok_${SLURM_JOB_ID}.err"
+    echo "  Error log: cat logs_ss1/can3tok_10k_${SLURM_JOB_ID}.err"
 fi

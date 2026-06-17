@@ -289,9 +289,142 @@ class AnchorPredFromTokens(nn.Module):
         return self.head(transformer_tokens.reshape(B*T, W)).reshape(B, T, 3)
 
 
+# ============================================================================
+# GAUSSIANCUBE-STYLE FRAMED MICRO-PATTERN  (scene-level structured residual)
+# ============================================================================
+# GaussianCube (Zhang et al., NeurIPS 2024) gets crisp geometry by snapping
+# Gaussians onto a DENSE regular voxel grid via optimal transport, so position is
+# essentially a grid index (structurally free) plus a small offset. A dense grid
+# is the wrong primitive for SCENES (surfaces are ~2D in a 3D volume, so a dense
+# grid is mostly empty and the bijection drags Gaussians far off-surface). The
+# portable part of the idea is narrow and real: position = structural reference +
+# SMALL residual, so the latent never spends bits on coarse placement.
+#
+# Here the structural reference is, per latent token, a FIXED canonical point set
+# (a low-discrepancy ball, free / shared / no bits) carried by a learned per-token
+# FRAME — an anisotropic scale + rotation predicted from the latent — so the
+# canonical ball can be flattened and oriented to the local surface patch. The
+# decoder then only has to predict a small per-Gaussian residual. This is the
+# sparse, scene-adaptive analogue of GaussianCube's grid, and it sits on top of
+# the existing anchor-relative decode (anchor = block centre, already ~free).
+#
+# Alignment (the reason this is exact, not approximate): in scaffold_mode=
+# 'hilbert_block' the dataset sets token_ids = arange(N) // g (a FIXED array), which
+# is precisely the TokenLocalDecoder's own layout (Gaussian i -> token i//g, slot
+# i%g). So the anchor a Gaussian receives, the decoder slot that produced it, and
+# the canonical-pattern slot c[i%g] all index the same token consistently. The
+# micro-pattern therefore REQUIRES hilbert_block (guarded in the training script).
+
+def _fibonacci_ball(n):
+    """`n` deterministic low-discrepancy points in the unit ball — the canonical
+    per-token micro-pattern (the scene-level stand-in for GaussianCube's voxel
+    grid). Fibonacci-sphere directions on radius cbrt(i/n) shells fill the ball
+    ~uniformly. Returned as float32 [n, 3]."""
+    i = torch.arange(n, dtype=torch.float64) + 0.5
+    golden = math.pi * (3.0 - math.sqrt(5.0))           # golden angle
+    z = 1.0 - 2.0 * i / n                               # in (-1, 1)
+    r = torch.sqrt(torch.clamp(1.0 - z * z, min=0.0))
+    theta = golden * i
+    dirs = torch.stack([r * torch.cos(theta), r * torch.sin(theta), z], dim=-1)
+    radii = (i / n) ** (1.0 / 3.0)                      # ~uniform ball density
+    return (dirs * radii.unsqueeze(-1)).to(torch.float32)   # [n, 3]
+
+
+def _rot6d_to_matrix(r6):
+    """Zhou et al. (CVPR 2019) continuous 6D rotation rep -> [..., 3, 3] rotation
+    matrix via Gram-Schmidt. r6[..., 0:3] and r6[..., 3:6] are the first two
+    (un-orthonormalised) columns; identity rep is [1,0,0, 0,1,0]."""
+    a1 = r6[..., 0:3]
+    a2 = r6[..., 3:6]
+    b1 = F.normalize(a1, dim=-1, eps=1e-8)
+    a2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = F.normalize(a2, dim=-1, eps=1e-8)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack([b1, b2, b3], dim=-1)            # columns (b1,b2,b3)
+
+
+class BlockFramePredFromTokens(nn.Module):
+    """Per-token local FRAME for the canonical micro-pattern: an anisotropic scale
+    (3) and, optionally, a 6D rotation (6) per latent token, predicted from the
+    transformer tokens. Lets each token's fixed canonical ball be flattened (one
+    small scale) and oriented to the local surface, so the decoder predicts only a
+    small residual. Deterministic function of the latent (Stage-2 compatible),
+    exactly like AnchorPredFromTokens. Inits to scale=scale_init, rotation=identity
+    so the first forward is a benign ~isotropic ball of the right size."""
+    def __init__(self, width=384, num_tokens=512, use_rotation=True, scale_init=0.5):
+        super().__init__()
+        self.num_tokens   = num_tokens
+        self.use_rotation = use_rotation
+        self.trunk = nn.Sequential(
+            nn.Linear(width, 128), nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, 64),   nn.LayerNorm(64),  nn.ReLU())
+        self.log_scale_head = nn.Linear(64, 3)
+        nn.init.zeros_(self.log_scale_head.weight)
+        nn.init.constant_(self.log_scale_head.bias, float(math.log(scale_init)))
+        if use_rotation:
+            self.rot6_head = nn.Linear(64, 6)
+            nn.init.zeros_(self.rot6_head.weight)
+            with torch.no_grad():
+                self.rot6_head.bias.copy_(torch.tensor([1., 0., 0., 0., 1., 0.]))
+        else:
+            self.rot6_head = None
+        print(f"[BlockFramePredFromTokens] [B,{num_tokens},{width}] -> scale[B,{num_tokens},3]"
+              f"{' + rot6' if use_rotation else ''} | scale_init={scale_init} | "
+              f"{sum(p.numel() for p in self.parameters()):,} params")
+
+    def forward(self, transformer_tokens):
+        B, T, W = transformer_tokens.shape
+        h = self.trunk(transformer_tokens.reshape(B * T, W))
+        s = self.log_scale_head(h).exp().reshape(B, T, 3)          # [B,T,3] > 0
+        R = (_rot6d_to_matrix(self.rot6_head(h)).reshape(B, T, 3, 3)
+             if self.rot6_head is not None else None)
+        return s, R
+
+
 _N_GAUSSIANS  = 10_000
 FIXED_TOKEN_IDS_512 = torch.arange(_N_GAUSSIANS) * 512 // _N_GAUSSIANS
 FIXED_TOKEN_IDS_496 = torch.arange(_N_GAUSSIANS) * 496 // _N_GAUSSIANS
+
+# Number of LATENT tokens for the structured / local-encoder path. This is the
+# Hilbert-block count (the dataset's compute_hilbert_block_scaffold, the decoder's
+# num_tokens, FIXED_TOKEN_IDS_512 are all 512), so token k <-> block k <-> anchor k
+# end to end. It used to be derived as 16384 // embed_dim, which only equalled 512
+# at embed_dim=32 and HALVED the tokens whenever embed_dim grew. Pinning it to the
+# block count instead makes embed_dim a pure CAPACITY knob: the structured latent
+# total = _N_LATENT_TOKENS * embed_dim (16384 at embed_dim=32, 32768 at 64, ...)
+# while the block structure, scaffold, decoder grouping and micro-pattern are all
+# unchanged.
+_N_LATENT_TOKENS = 512
+
+
+def set_num_gaussians(n):
+    """Override the per-scene Gaussian count (default 10_000) and recompute the
+    fixed token-id buffers. Call ONCE from the training script BEFORE building the
+    model, so every decoder/encoder that reads _N_GAUSSIANS uses the new value. The
+    latent token count (_Z_TOKENS = 16384 // embed_dim) is independent and does NOT
+    change; only Gaussians-per-token g = ceil(_N_GAUSSIANS / num_tokens) scales."""
+    global _N_GAUSSIANS, FIXED_TOKEN_IDS_512, FIXED_TOKEN_IDS_496
+    _N_GAUSSIANS = int(n)
+    FIXED_TOKEN_IDS_512 = torch.arange(_N_GAUSSIANS) * 512 // _N_GAUSSIANS
+    FIXED_TOKEN_IDS_496 = torch.arange(_N_GAUSSIANS) * 496 // _N_GAUSSIANS
+    print(f"[set_num_gaussians] _N_GAUSSIANS = {_N_GAUSSIANS}")
+
+
+# Position-conditioned colour/rotation refinement heads (see position_conditioned_heads.py).
+# Off by default; toggled from the training script before the model is built, so the
+# YAML config does not need to change. enabled=False => exact baseline behaviour.
+_POS_COND = {'enabled': False, 'n_freqs': 32, 'sigma': 6.0, 'pos_scale': 10.0,
+             'hidden': 128, 'color': True, 'rotation': True}
+
+def set_pos_cond_heads(enabled=True, n_freqs=32, sigma=6.0, pos_scale=10.0,
+                       hidden=128, color=True, rotation=True):
+    """Configure the position-conditioned refinement heads. Call ONCE before building
+    the model. pos_scale should be ~ the scene radius so the Fourier frequencies are
+    scene-appropriate."""
+    _POS_COND.update(enabled=bool(enabled), n_freqs=int(n_freqs), sigma=float(sigma),
+                     pos_scale=float(pos_scale), hidden=int(hidden),
+                     color=bool(color), rotation=bool(rotation))
+    print(f"[set_pos_cond_heads] {_POS_COND}")
 
 
 # ============================================================================
@@ -366,7 +499,7 @@ class SemanticProjectionHeadGeometric(nn.Module):
 
 class GS_decoder(nn.Module):
     """
-    Flat MLP: flatten(transformer_output) → 40000×14 Gaussian attributes.
+    Flat MLP: flatten(transformer_output) → 10000×14 Gaussian attributes.
     Instantiated as GS_decoder(D=3, W=1024, num_tokens=512, width=384).
     Parameter count: ~777M  (Linear(196608→1024)=201M + Linear(1024→560000)=574M)
     """
@@ -379,7 +512,7 @@ class GS_decoder(nn.Module):
             self.pts_linears.append(nn.Linear(W, W))
             self.pts_linears.append(nn.LayerNorm(W))
             self.pts_linears.append(nn.ReLU())
-        self.output_linear = nn.Linear(W, 10_000 * 14)
+        self.output_linear = nn.Linear(W, _N_GAUSSIANS * 14)
         print(f"  GS_DECODER ({num_tokens} tokens): {num_tokens}×{width}={input_ch} "
               f"→ 10000×14  "
               f"({'residuals' if color_residual else 'clamp(0,1)'})")
@@ -387,7 +520,7 @@ class GS_decoder(nn.Module):
     def forward(self, x, return_hidden=False):
         for layer in self.pts_linears: x = layer(x)
         hidden = x
-        raw    = self.output_linear(x).reshape(x.shape[0], 10_000, 14)
+        raw    = self.output_linear(x).reshape(x.shape[0], _N_GAUSSIANS, 14)
         pos    = raw[:, :, 0:3]
         color  = raw[:, :, 3:6] if self.color_residual else raw[:, :, 3:6].clamp(0., 1.)
         opac   = torch.sigmoid(raw[:, :, 6:7])
@@ -446,6 +579,172 @@ class CrossAttentionEncoder(nn.Module):
         latents = self.self_attn(latents)
         if self.ln_post: latents = self.ln_post(latents)
         return latents, pc
+
+    def forward(self, pc, feats=None):
+        return checkpoint(self._forward, (pc, feats), self.parameters(), self.use_checkpoint)
+
+
+class LocalCrossAttentionEncoder(nn.Module):
+    """
+    Spatially-LOCAL encoder for the structured per-token latent.
+
+    The input points are space-filling-ordered (Hilbert), so a contiguous block of
+    g = ceil(num_gaussians / K) points is a local spatial cluster -- and block k here
+    is the SAME block k that the decoder's anchor + TokenLocalDecoder reconstruct.
+    Each of the K geometry queries attends only to a local WINDOW of blocks around its
+    own block (k-window .. k+window) instead of attending to the whole scene; one
+    extra global CLS query (index 0) attends to all points (semantic summary). So
+    latent token k encodes the LOCAL geometry of block k. Local patches recur across
+    scenes, so the features are compositional and generalize, unlike a global
+    per-scene code (which memorizes -- the failure mode observed at 3800 scenes).
+
+    No global self-attention runs inside the encoder (that would re-mix tokens and
+    destroy locality); cross-token mixing happens later in the decoder transformer.
+    Returns latents [B, 1+K, width] to match CrossAttentionEncoder's interface.
+    """
+    def __init__(self, *, device, dtype, num_latents, fourier_embedder,
+                 fourier_embedder_ID, point_feats, width, heads,
+                 window=1, num_gaussians=10000, qkv_bias=True,
+                 use_ln_post=False, use_checkpoint=False):
+        super().__init__()
+        assert width % heads == 0, "width must be divisible by heads"
+        self.width            = width
+        self.heads            = heads
+        self.head_dim         = width // heads
+        self.window           = int(window)
+        self.num_latents      = num_latents          # = 1 + K
+        self.K                = num_latents - 1
+        self.num_gaussians    = int(num_gaussians)
+        self.g                = math.ceil(self.num_gaussians / self.K)
+        self.use_checkpoint   = use_checkpoint
+        self.fourier_embedder    = fourier_embedder
+        self.fourier_embedder_ID = fourier_embedder_ID
+
+        self.query = nn.Parameter(
+            torch.randn(num_latents, width, device=device, dtype=dtype) * 0.02)
+        self.input_proj = nn.Linear(
+            fourier_embedder.out_dim + point_feats + fourier_embedder_ID.out_dim,
+            width, device=device, dtype=dtype)
+        self.norm_q   = nn.LayerNorm(width, device=device, dtype=dtype)
+        self.norm_kv  = nn.LayerNorm(width, device=device, dtype=dtype)
+        self.q_proj   = nn.Linear(width, width, bias=qkv_bias, device=device, dtype=dtype)
+        self.k_proj   = nn.Linear(width, width, bias=qkv_bias, device=device, dtype=dtype)
+        self.v_proj   = nn.Linear(width, width, bias=qkv_bias, device=device, dtype=dtype)
+        self.out_proj = nn.Linear(width, width, device=device, dtype=dtype)
+        self.norm_ff  = nn.LayerNorm(width, device=device, dtype=dtype)
+        self.ffn = nn.Sequential(
+            nn.Linear(width, 4 * width, device=device, dtype=dtype), nn.GELU(),
+            nn.Linear(4 * width, width, device=device, dtype=dtype))
+        self.ln_post = (nn.LayerNorm(width, device=device, dtype=dtype)
+                        if use_ln_post else None)
+        _mode = "GLOBAL geometry attn" if self.window < 0 else f"local window=±{self.window}"
+        print(f"[LocalCrossAttentionEncoder] K={self.K} g={self.g} {_mode} "
+              f"heads={heads} width={width} | per-token latent, no global self-attn")
+
+    def _window_gather(self, xb, w):
+        # [B, K, g, H, hd] -> [B, K, (2w+1)*g, H, hd]  (sliding window over the block dim)
+        B, K, g, H, hd = xb.shape
+        F_ = g * H * hd
+        x = xb.reshape(B, K, F_).transpose(1, 2)              # [B, F_, K]
+        x = F.pad(x, (w, w))                                  # [B, F_, K+2w]
+        x = x.unfold(2, 2 * w + 1, 1)                         # [B, F_, K, 2w+1]
+        x = x.permute(0, 2, 3, 1).contiguous()                # [B, K, 2w+1, F_]
+        return x.reshape(B, K, (2 * w + 1) * g, H, hd)        # [B, K, (2w+1)*g, H, hd]
+
+    def _window_valid(self, vb, w):
+        # [B, K, g] bool -> [B, K, (2w+1)*g] bool  (same ordering as _window_gather)
+        B, K, g = vb.shape
+        x = vb.float().transpose(1, 2)                        # [B, g, K]
+        x = F.pad(x, (w, w))                                  # [B, g, K+2w]
+        x = x.unfold(2, 2 * w + 1, 1)                         # [B, g, K, 2w+1]
+        x = x.permute(0, 2, 3, 1).contiguous()                # [B, K, 2w+1, g]
+        return (x.reshape(B, K, (2 * w + 1) * g) > 0.5)       # [B, K, (2w+1)*g]
+
+    def _forward(self, pc, feats):
+        B, N, _ = pc.shape
+        K, g, w, H, hd, Wd = self.K, self.g, self.window, self.heads, self.head_dim, self.width
+
+        data = torch.cat([
+            self.fourier_embedder(pc[:, :, 4:7]),
+            self.fourier_embedder_ID(pc[:, :, 0:3]),
+            feats[:, :, 7:],
+        ], dim=-1).to(dtype=torch.float32)
+        data = self.input_proj(data)                          # [B, N, Wd]
+        data = self.norm_kv(data)
+
+        Kg = K * g
+        if N < Kg:
+            pad   = data.new_zeros(B, Kg - N, Wd)
+            dat_p = torch.cat([data, pad], dim=1)             # [B, Kg, Wd]
+            valid = torch.cat([
+                torch.ones(B, N, device=data.device, dtype=torch.bool),
+                torch.zeros(B, Kg - N, device=data.device, dtype=torch.bool)], dim=1)
+        else:
+            dat_p = data[:, :Kg]
+            valid = torch.ones(B, Kg, device=data.device, dtype=torch.bool)
+
+        kp = self.k_proj(dat_p)                               # [B, Kg, Wd]
+        vp = self.v_proj(dat_p)
+
+        q_raw = self.query.unsqueeze(0).expand(B, -1, -1)     # [B, 1+K, Wd]
+        q     = self.q_proj(self.norm_q(q_raw))               # [B, 1+K, Wd]
+
+        # ── CLS query (index 0): GLOBAL attention over all N real points ───────
+        q_cls = q[:, 0:1].reshape(B, 1, H, hd).transpose(1, 2)            # [B, H, 1, hd]
+        k_cls = kp[:, :N].reshape(B, N, H, hd).transpose(1, 2)           # [B, H, N, hd]
+        v_cls = vp[:, :N].reshape(B, N, H, hd).transpose(1, 2)           # [B, H, N, hd]
+        o_cls = F.scaled_dot_product_attention(q_cls, k_cls, v_cls)       # [B, H, 1, hd]
+        o_cls = o_cls.transpose(1, 2).reshape(B, 1, Wd)                   # [B, 1, Wd]
+
+        # ── geometry queries (1..K) ────────────────────────────────────────────
+        if w < 0:
+            # GLOBAL ablation (Run B): every geometry query attends to ALL points,
+            # exactly like the CLS query. Everything else is identical to the
+            # windowed encoder -- same 512 per-token queries, same per-token latent
+            # (no global remix), still NO encoder global self-attention -- so this
+            # isolates attention SCOPE (global vs local window) as the only variable.
+            # No padding mask (all N input points are real), so SDPA uses the
+            # flash/mem-efficient path and never materializes the [K, N] scores.
+            qg    = q[:, 1:].reshape(B, K, H, hd).transpose(1, 2)   # [B, H, K, hd]
+            ka    = kp[:, :N].reshape(B, N, H, hd).transpose(1, 2)  # [B, H, N, hd]
+            va    = vp[:, :N].reshape(B, N, H, hd).transpose(1, 2)  # [B, H, N, hd]
+            o_geo = F.scaled_dot_product_attention(qg, ka, va)      # [B, H, K, hd]
+            o_geo = o_geo.transpose(1, 2).reshape(B, K, Wd)         # [B, K, Wd]
+        else:
+            # ── LOCAL windowed attention (window>=0) ───────────────────────────
+            kb   = kp.reshape(B, K, g, H, hd)
+            vb   = vp.reshape(B, K, g, H, hd)
+            vblk = valid.reshape(B, K, g)
+            if w > 0:
+                kb    = self._window_gather(kb, w)                # [B, K, S, H, hd]
+                vb    = self._window_gather(vb, w)
+                vmask = self._window_valid(vblk, w)               # [B, K, S]
+            else:
+                vmask = vblk                                      # [B, K, g]
+            S = kb.shape[2]
+            # empty tail blocks (whose whole window is padding) would give all-masked
+            # rows -> NaN softmax; force each such row to attend to slot 0 (the decoder
+            # never reads these blocks). Use a shape-safe slice assignment: vmask[...,0]
+            # and all_masked are both [B, K], so this works regardless of vmask rank and
+            # avoids the version-dependent vmask[empty, 0] advanced-index semantics that
+            # raised IndexError on the cluster's torch.
+            all_masked = ~vmask.any(dim=-1)                       # [B, K]
+            if bool(all_masked.any()):
+                vmask = vmask.clone()
+                vmask[..., 0] = vmask[..., 0] | all_masked        # [B,K] | [B,K]
+            q_geo = q[:, 1:].reshape(B, K, H, hd).unsqueeze(3)    # [B, K, H, 1, hd]
+            k_geo = kb.permute(0, 1, 3, 2, 4)                     # [B, K, H, S, hd]
+            v_geo = vb.permute(0, 1, 3, 2, 4)                     # [B, K, H, S, hd]
+            m_geo = vmask.reshape(B, K, 1, 1, S)                  # [B, K, 1, 1, S]
+            o_geo = F.scaled_dot_product_attention(q_geo, k_geo, v_geo, attn_mask=m_geo)
+            o_geo = o_geo.squeeze(3).reshape(B, K, Wd)            # [B, K, Wd]
+
+        attn   = torch.cat([o_cls, o_geo], dim=1)             # [B, 1+K, Wd]
+        tokens = q_raw + self.out_proj(attn)                  # residual cross-attn
+        tokens = tokens + self.ffn(self.norm_ff(tokens))      # residual FFN
+        if self.ln_post is not None:
+            tokens = self.ln_post(tokens)
+        return tokens, pc
 
     def forward(self, pc, feats=None):
         return checkpoint(self._forward, (pc, feats), self.parameters(), self.use_checkpoint)
@@ -568,7 +867,16 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  position_layout_residual=False,
                  jepa_idea1=False,
                  query_decoder=False,
-                 token_local_decoder=False):
+                 token_local_decoder=False,
+                 anchor_relative_decode=False,
+                 anchor_teacher_force=False,
+                 offset_scale_init=2.0,
+                 structured_latent=False,
+                 local_encoder=False,
+                 local_window=1,
+                 micro_pattern=False,
+                 micro_pattern_rotation=True,
+                 micro_offset_scale=0.3):
 
         super().__init__(
             device=device, dtype=dtype, num_latents=1 + num_latents,
@@ -598,7 +906,44 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.structured_layout_tokens_flag = structured_layout_tokens
         self.token_local_decoder_flag      = token_local_decoder
 
-        _Z_TOKENS         = 16384 // embed_dim
+        # ── STRUCTURED PER-TOKEN LATENT / LOCAL ENCODER ─────────────────────────
+        # local_encoder implies structured_latent (a local encoder is pointless if the
+        # per-token structure is then globally re-mixed). structured_latent uses the
+        # per-token posterior directly as z and SKIPS the dense kl_emb_proj_mean(_g)
+        # remix, so latent token k corresponds to encoder token k (= Hilbert block k).
+        # Both rely on dropping the global remix + the 16/496 disentangle split, so
+        # latent_disentangle is forced off here (the training script likewise zeroes
+        # cross_recon / ortho / z_s-InfoNCE when disentangle is off).
+        if local_encoder:
+            structured_latent = True
+        self.structured_latent = structured_latent
+        self.local_encoder     = local_encoder
+        self.local_window      = int(local_window)
+        if structured_latent and latent_disentangle:
+            print("  [INFO] structured_latent/local_encoder: forcing latent_disentangle=False")
+            latent_disentangle      = False
+            self.latent_disentangle = False
+
+        if local_encoder:
+            # The structured latent has _Z_TOKENS = 16384 // embed_dim tokens (the
+            # decoder / scaffold token count), which can DIFFER from the encoder
+            # bottleneck self.num_latents-1 (the original model maps between them with
+            # the dense kl_emb_proj_mean). The local encoder must emit one local token
+            # per LATENT token, so it gets _Z_TOKENS geometry queries (+1 CLS) and
+            # g = N / _Z_TOKENS Gaussians per Hilbert block, aligning encoder block k
+            # == decoder block k == scaffold anchor k end to end.
+            _n_latent_tokens = _N_LATENT_TOKENS
+            self.encoder = LocalCrossAttentionEncoder(
+                device=device, dtype=dtype,
+                num_latents=_n_latent_tokens + 1,      # _Z_TOKENS geometry queries + 1 CLS
+                fourier_embedder=self.fourier_embedder,
+                fourier_embedder_ID=self.fourier_embedder_ID,
+                point_feats=point_feats, width=width, heads=heads,
+                window=self.local_window, num_gaussians=_N_GAUSSIANS,
+                qkv_bias=qkv_bias, use_ln_post=use_ln_post,
+                use_checkpoint=use_checkpoint)
+
+        _Z_TOKENS         = _N_LATENT_TOKENS
         self._n_zs_tokens = semantic_dims // embed_dim
         self._n_zg_tokens = _Z_TOKENS - self._n_zs_tokens
 
@@ -648,6 +993,18 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.last_mean_color_pred = None
         if color_residual:
             self.mean_color_head = MeanColorHead(in_dim=_color_in)
+
+        # Position-conditioned per-Gaussian colour/rotation refinement (optional).
+        # Conditions a shared MLP on (per-token feature H_out, Fourier(final position))
+        # and adds a high-frequency residual to colour/quaternion inside decode().
+        self.pos_cond_heads = None
+        if _POS_COND['enabled']:
+            from .position_conditioned_heads import PositionConditionedHeads
+            self.pos_cond_heads = PositionConditionedHeads(
+                token_feat_dim=width, n_freqs=_POS_COND['n_freqs'],
+                sigma=_POS_COND['sigma'], pos_scale=_POS_COND['pos_scale'],
+                hidden=_POS_COND['hidden'], do_color=_POS_COND['color'],
+                do_rotation=_POS_COND['rotation'])
 
         self.scene_semantic_module    = None
         self.last_scene_semantic_pred = None
@@ -711,6 +1068,67 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         if position_scaffold:
             n_tok = self._n_zg_tokens if decoder_zs_cross_attn else _Z_TOKENS
             self.anchor_pred_from_tokens = AnchorPredFromTokens(width=width, num_tokens=n_tok)
+
+        # ── ANCHOR-RELATIVE LOCAL DECODING (spatially-anchored latent) ──────────
+        # Scaffold-GS-style local decoding: each Gaussian's position is decoded as
+        #     pos = anchor[token] + offset_scale * tanh(raw_offset)
+        # The tanh BOUND is the locality pressure that the plain position_scaffold
+        # path lacks. In the legacy path pos = raw + anchor with raw UNBOUNDED, so
+        # "anchor + offset" is just a reparametrised absolute position and the anchor
+        # carries no information the decoder is forced to use. Bounding the offset
+        # makes it physically a LOCAL displacement, so the per-token anchor must
+        # carry the coarse position. Paired with the adaptive Hilbert-block anchors
+        # from the dataset (scaffold_mode='hilbert_block'), token k then owns a real
+        # per-scene local cluster (Scaffold-GS: mu_i = x + O_i*l). offset_scale is a
+        # single learnable, strictly-positive global parameter (exp-parameterised),
+        # so the bound adapts to the typical within-block spread automatically.
+        self.anchor_relative_decode = anchor_relative_decode
+        self.anchor_teacher_force   = anchor_teacher_force
+        self.log_offset_scale       = None
+        if anchor_relative_decode:
+            if self.anchor_pred_from_tokens is None:
+                raise ValueError(
+                    "anchor_relative_decode=True requires position_scaffold=True "
+                    "(it provides the per-token anchor head). Enable position_scaffold.")
+            self.log_offset_scale = nn.Parameter(
+                torch.tensor(float(math.log(offset_scale_init))))
+            print(f"  [ANCHOR-RELATIVE DECODE] pos = anchor + "
+                  f"{offset_scale_init:.2f}*tanh(offset) | "
+                  f"teacher_force={anchor_teacher_force} | learnable offset_scale")
+
+        # ── GAUSSIANCUBE-STYLE FRAMED MICRO-PATTERN ─────────────────────────────
+        # On top of the anchor-relative decode, replace the free within-block
+        # offset with: framed canonical point set + SMALL residual, i.e.
+        #     pos = anchor + R_block · (s_block · c[slot]) + micro_scale·tanh(resid)
+        # c is a fixed unit-ball point set (no bits); (s_block, R_block) is the
+        # per-token frame from BlockFramePredFromTokens; resid reuses the decoder's
+        # position output, now bounded SMALL. Requires anchor_relative_decode (for
+        # the per-token anchor + the raw-offset slot) and hilbert_block ids.
+        self.micro_pattern          = micro_pattern
+        self.micro_pattern_rotation = micro_pattern_rotation
+        self.block_frame_pred       = None
+        self.log_micro_offset_scale = None
+        if micro_pattern:
+            if not anchor_relative_decode:
+                raise ValueError(
+                    "micro_pattern=True requires anchor_relative_decode=True (it "
+                    "provides the per-token anchor and the raw-offset slot).")
+            _mp_ntok = self._n_zg_tokens if decoder_zs_cross_attn else _Z_TOKENS
+            _mp_g    = -(-_N_GAUSSIANS // _mp_ntok)      # ceil(N / n_tokens) = g/token
+            # register_buffer must NOT be preceded by a plain `self.canonical_pattern`
+            # attribute (PyTorch raises "attribute already exists"), so it is only set
+            # here (buffer) or in the else branch (None).
+            self.register_buffer("canonical_pattern",
+                                 _fibonacci_ball(_mp_g), persistent=False)   # [g,3]
+            self.block_frame_pred = BlockFramePredFromTokens(
+                width=width, num_tokens=_mp_ntok, use_rotation=micro_pattern_rotation)
+            self.log_micro_offset_scale = nn.Parameter(
+                torch.tensor(float(math.log(micro_offset_scale))))
+            print(f"  [MICRO-PATTERN] pos = anchor + "
+                  f"R_block·(s_block·c[{_mp_g}]) + {micro_offset_scale:.2f}*tanh(resid)"
+                  f" | rotation={micro_pattern_rotation} | learnable residual scale")
+        else:
+            self.canonical_pattern = None
 
         self.zs_cond_decoder = None
         self.post_kl_g       = None
@@ -811,9 +1229,9 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.semantic_projection_geometric = None
         self.semantic_distribution_head    = None
         if semantic_mode == 'hidden':
-            self.semantic_projection_hidden = SemanticProjectionHead(1024, 10000, 32)
+            self.semantic_projection_hidden = SemanticProjectionHead(1024, _N_GAUSSIANS, 32)
         elif semantic_mode == 'geometric':
-            self.semantic_projection_geometric = SemanticProjectionHeadGeometric(14, 10000, 32, 128)
+            self.semantic_projection_geometric = SemanticProjectionHeadGeometric(14, _N_GAUSSIANS, 32, 128)
         elif semantic_mode == 'dist':
             self.semantic_distribution_head = SemanticDistributionHead(1024, 72)
         elif semantic_mode not in ('none', 'attention'):
@@ -826,7 +1244,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         # instance (already built above by super().__init__ and the strategy
         # branches below) with a TokenLocalDecoder. The TokenLocalDecoder
         # exposes the identical forward(x, return_hidden=False) interface and
-        # output shape [B, 40000*14] as the flat MLP, so decode() and the
+        # output shape [B, 10000*14] as the flat MLP, so decode() and the
         # semantic-feature pipeline both work unchanged.
         #
         # GS_decoder instances that may exist at this point:
@@ -838,22 +1256,22 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         #
         # Per-Gaussian InfoNCE: the SemanticProjectionHead receives the [B, 1024]
         # pooled hidden from TokenLocalDecoder.hidden_proj and produces per-
-        # Gaussian features [B, 40000, 32] exactly as before. No changes needed
+        # Gaussian features [B, 10000, 32] exactly as before. No changes needed
         # to the per_gaussian_features pipeline or the 6-tuple forward return.
         if token_local_decoder:
             print(f"\n  [TOKEN-LOCAL DECODER] Replacing flat GS_decoder(s) with "
                   f"shared per-token MLPs:")
             self.GS_decoder = TokenLocalDecoder(
                 width=width, hidden_dim=512, num_tokens=512,
-                num_gaussians=10_000, color_residual=color_residual)
+                num_gaussians=_N_GAUSSIANS, color_residual=color_residual)
             if self.GS_decoder_B is not None:
                 self.GS_decoder_B = TokenLocalDecoder(
                     width=width, hidden_dim=512, num_tokens=_Z_TOKENS,
-                    num_gaussians=10_000, color_residual=color_residual)
+                    num_gaussians=_N_GAUSSIANS, color_residual=color_residual)
             if self.GS_decoder_new is not None:
                 self.GS_decoder_new = TokenLocalDecoder(
                     width=width, hidden_dim=512, num_tokens=self._n_zg_tokens,
-                    num_gaussians=10_000, color_residual=color_residual)
+                    num_gaussians=_N_GAUSSIANS, color_residual=color_residual)
 
         print(f"{'='*70}\n")
 
@@ -876,6 +1294,24 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
     def encode(self, pc, feats=None, sample_posterior=True):
         shape_embed, latents    = self.encode_latents(pc, feats)
         self._shape_embed_cache = shape_embed
+
+        if self.structured_latent:
+            # Per-token latent: token k of z == encoder token k == Hilbert block k.
+            # Use the per-token posterior DIRECTLY and skip the dense kl_emb_proj_mean(_g)
+            # remix that would flatten + globally mix the 512 tokens (destroying the
+            # spatial structure the local encoder just produced).
+            moments   = self.pre_kl(latents)                     # [B, K, 2*embed_dim]
+            posterior = DiagonalGaussianDistribution(moments, feat_dim=-1)
+            z_tok     = posterior.sample() if sample_posterior else posterior.mode()  # [B,K,embed_dim]
+            mean, logvar = moments.chunk(2, dim=-1)              # each [B, K, embed_dim]
+            self._mu_s_cache = None
+            self._mu_g_cache = None
+            Bsz     = z_tok.shape[0]
+            mu      = mean.reshape(Bsz, -1)                      # [B, K*embed_dim]
+            log_var = logvar.reshape(Bsz, -1)
+            z       = z_tok.reshape(Bsz, -1)
+            return shape_embed, mu, log_var, z, posterior
+
         kl_embed, posterior     = self.encode_kl_embed(latents, sample_posterior)
         kl_flat                 = kl_embed.reshape(kl_embed.shape[0], -1)
 
@@ -1121,8 +1557,69 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 reconstruction = self.GS_decoder(latents_flat)
             _fixed_ids = FIXED_TOKEN_IDS_512
 
-        if pred_anchors is not None:
-            pred_3d = reconstruction.reshape(B, 10_000, 14)
+        if self.anchor_relative_decode and pred_anchors is not None:
+            # ── Anchor-relative LOCAL decoding (Scaffold-GS style) ──────────────
+            #     pos = anchor[token] + offset_scale * tanh(raw_offset)
+            # raw_offset is the decoder's raw position output (pred_3d[...,0:3]).
+            # The offset is BOUNDED, so the anchor carries the coarse position.
+            # Anchor source:
+            #   - teacher-forced GT block centroids (diagnostic upper bound) when
+            #     anchor_teacher_force and scaffold_anchors is provided; isolates
+            #     the decoder from the encoder's ability to predict anchors.
+            #   - else the per-token PREDICTED anchors (Stage-2-compatible: they are
+            #     a deterministic function of the latent, so the Stage-2 DiT that
+            #     generates the latent also controls them).
+            # The OUTPUT is absolute positions, so the training recon loss uses the
+            # absolute target (see --anchor_relative_decode branch in gs_can3tok_2).
+            pred_3d = reconstruction.reshape(B, _N_GAUSSIANS, 14)
+            raw_off = pred_3d[:, :, 0:3]
+            if self.anchor_teacher_force:
+                assert scaffold_anchors is not None, (
+                    "anchor_teacher_force=True needs scaffold_anchors forwarded to "
+                    "decode(); if the wrapper does not pass it, run with predicted "
+                    "anchors (anchor_teacher_force=False).")
+                anchor_src = scaffold_anchors
+            else:
+                anchor_src = pred_anchors
+            if scaffold_token_ids is not None:
+                idx_3d    = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, 3)
+                anchor_pg = torch.gather(anchor_src, 1, idx_3d)
+            else:
+                anchor_pg = anchor_src[:, _fixed_ids.to(anchor_src.device), :]
+            pred_3d = pred_3d.clone()
+            if self.micro_pattern and self.block_frame_pred is not None:
+                # ── Framed canonical micro-pattern + small residual ─────────────
+                #     pos = anchor + R_block·(s_block·c[slot]) + micro·tanh(resid)
+                # Frame is per latent token; gather it by the SAME token map as the
+                # anchor. Canonical slot = i % g aligns with the decoder's layout
+                # (hilbert_block: token = i // g). raw_off is the decoder's position
+                # output, here used as the SMALL residual.
+                s_tok, R_tok = self.block_frame_pred(H_out)         # [B,T,3], [B,T,3,3]|None
+                if scaffold_token_ids is not None:
+                    sid = scaffold_token_ids.long()                 # [B,N]
+                else:
+                    sid = _fixed_ids.to(raw_off.device).unsqueeze(0).expand(B, -1)
+                s_pg = torch.gather(s_tok, 1, sid.unsqueeze(-1).expand(-1, -1, 3))
+                g_pt = self.canonical_pattern.shape[0]
+                slot = torch.arange(_N_GAUSSIANS, device=raw_off.device) % g_pt
+                c_pg = self.canonical_pattern.to(raw_off.dtype)[slot].unsqueeze(0).expand(B, -1, -1)
+                framed = s_pg * c_pg                                # anisotropic scale
+                if R_tok is not None:
+                    R_pg = torch.gather(
+                        R_tok.reshape(B, R_tok.shape[1], 9), 1,
+                        sid.unsqueeze(-1).expand(-1, -1, 9)
+                    ).reshape(B, _N_GAUSSIANS, 3, 3)
+                    framed = torch.einsum('bnij,bnj->bni', R_pg, framed)   # orient to surface
+                micro = self.log_micro_offset_scale.exp()
+                pred_3d[:, :, 0:3] = anchor_pg + framed + micro * torch.tanh(raw_off)
+            else:
+                scale = self.log_offset_scale.exp()
+                pred_3d[:, :, 0:3] = anchor_pg + scale * torch.tanh(raw_off)
+            reconstruction = pred_3d.reshape(B, -1)
+
+        elif pred_anchors is not None:
+            # ── Legacy position_scaffold path (UNBOUNDED additive anchor) ───────
+            pred_3d = reconstruction.reshape(B, _N_GAUSSIANS, 14)
             if scaffold_token_ids is not None:
                 idx_3d = scaffold_token_ids.long().unsqueeze(-1).expand(-1, -1, 3)
                 dc     = torch.gather(pred_anchors, 1, idx_3d)
@@ -1131,9 +1628,21 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             pred_3d[:, :, 0:3] += dc
             reconstruction = pred_3d.reshape(B, -1)
 
+        # Position-conditioned refinement of per-Gaussian colour / rotation, using the
+        # FINAL positions just assembled and the per-token feature H_out broadcast to each
+        # of its g Gaussians (matching the token-local decoder's token->Gaussian mapping).
+        if self.pos_cond_heads is not None:
+            _T  = H_out.shape[1]
+            _g  = (_N_GAUSSIANS + _T - 1) // _T
+            _Wd = H_out.shape[2]
+            tok_pg = (H_out.unsqueeze(2).expand(B, _T, _g, _Wd)
+                          .reshape(B, _T * _g, _Wd)[:, :_N_GAUSSIANS, :])
+            reconstruction = self.pos_cond_heads(
+                reconstruction.reshape(B, _N_GAUSSIANS, 14), tok_pg).reshape(B, -1)
+
         self.last_seg_pred = None
         if self.seg_pred_head is not None:
-            self.last_seg_pred = self.seg_pred_head(reconstruction.reshape(B, 10000, 14))
+            self.last_seg_pred = self.seg_pred_head(reconstruction.reshape(B, _N_GAUSSIANS, 14))
 
         semantic_features = None
         if return_semantic_features and hidden is not None:
@@ -1141,7 +1650,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 semantic_features = self.semantic_projection_hidden(hidden)
             elif self.semantic_mode == 'geometric':
                 semantic_features = self.semantic_projection_geometric(
-                    reconstruction.reshape(B, 10000, 14))
+                    reconstruction.reshape(B, _N_GAUSSIANS, 14))
             elif self.semantic_mode == 'dist':
                 semantic_features = self.semantic_distribution_head(hidden)
 
@@ -1163,7 +1672,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.last_zs_pool_proj   = None
         self.last_zs_pool_hidden = None
         if self.zs_pool_proj_head is not None:
-            _z_s_toks = z.reshape(z.shape[0], 512, 32)[:, :self._n_zs_tokens, :]
+            _z_s_toks = z.reshape(z.shape[0], _N_LATENT_TOKENS, self.embed_dim)[:, :self._n_zs_tokens, :]
             self.last_zs_pool_proj, self.last_zs_pool_hidden = \
                 self.zs_pool_proj_head(_z_s_toks)
 
@@ -1228,7 +1737,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             self.last_scene_layout_pred = (
                 self.scene_layout_module(_se) if self.scene_layout_module else None)
 
-        latents = z.reshape(z.shape[0], 512, 32)
+        latents = z.reshape(z.shape[0], _N_LATENT_TOKENS, self.embed_dim)
         _rsf = self.training if return_semantic_features is None else return_semantic_features
 
         UV_gs_recover, per_gaussian_features = self.decode(
