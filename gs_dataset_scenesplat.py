@@ -781,13 +781,10 @@ class gs_dataset(Dataset):
             print("  [INFO] jepa_idea1=True requires position_scaffold=True. Enabling.")
             self.position_scaffold = True
 
-        if (self.scaffold_mode == 'hilbert_block' and self.position_scaffold
-                and not self.morton_order):
-            raise ValueError(
-                "scaffold_mode='hilbert_block' requires morton_order=True so that "
-                "contiguous index blocks are spatial clusters and the block index "
-                "matches the decoder slot->token map. Pass --morton_order "
-                "(with --order_curve hilbert).")
+        if (self.scaffold_mode == 'hilbert_block' and self.position_scaffold and not self.morton_order):
+            print("  [WARNING] scaffold_mode='hilbert_block' WITHOUT morton_order=True: "
+                "anchors are centroids of opacity‑ranked index blocks (not spatially "
+                "coherent). This is allowed for ablation but NOT suitable for Stage‑2.")
 
         self.scene_dirs = sorted([
             os.path.join(root, d)

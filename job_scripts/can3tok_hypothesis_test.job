@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=can3tok_stage1_final
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=4
-#SBATCH --time=35:00:00
+#SBATCH --gpus=2
+#SBATCH --time=25:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=36
-#SBATCH --mem=180G
-#SBATCH --output=logs_ss1/can3tok_40k_%j.out
-#SBATCH --error=logs_ss1/can3tok_40k_%j.err
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=90G
+#SBATCH --output=logs_ss1/can3tok_40k_R8_%j.out
+#SBATCH --error=logs_ss1/can3tok_40k_R8_%j.err
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
@@ -26,67 +26,82 @@ RESUME_EPOCH=""
 DECODER_LAYOUT_CROSS_ATTN=False
 DECODER_LAYOUT_ADDITIVE=False
 
+# Token-local decoder: REQUIRED here. It replaces the 775M-param flat GS_decoder
+# (impractical at 40000 gaussians) with a 1.6M shared per-token MLP, and it is the
+# memory headroom that lets the local encoder run at batch 64. Each of the 512
+# decoder tokens reconstructs its own Hilbert block of g=ceil(40000/512)=79 Gaussians.
 TOKEN_LOCAL_DECODER=True
 
-ANCHOR_RELATIVE_DECODE=True
-SCAFFOLD_MODE="hilbert_block"
-ANCHOR_TEACHER_FORCE=False
-OFFSET_SCALE_INIT=2.0
-# ── GaussianCube-style framed canonical micro-pattern ────────────────────────
-# pos = anchor + R_block.(s_block.c[slot]) + MICRO_OFFSET_SCALE*tanh(residual).
-# Requires SCAFFOLD_MODE=hilbert_block + ANCHOR_RELATIVE_DECODE (auto-enabled).
-# NOTE: this is a RETRAIN, not a fine-tune of the free-offset decoder. The resume
-# checkpoint has no frame head and a different position parametrisation, so it
-# loads strict=False (frame head fresh) and the position branch re-converges. To
-# train cleanly from scratch, blank RESUME_CHECKPOINT below.
-MICRO_PATTERN=False
-MICRO_OFFSET_SCALE=0.3
-MICRO_PATTERN_NO_ROTATION=False        # True = ablate rotation (scale-only frame)
-POSITION_SCAFFOLD=True
+# ── POSITION SCAFFOLD / ANCHORS ──────────────────────────────────────────────
+# This run does NOT use the anchor scaffold: positions decode directly from the
+# 512 local z_g tokens. local_disentangle does not need the scaffold (it adds the
+# global z_s by cross-attention, independent of anchors). POSITION_SCAFFOLD=False
+# is Stage-2 feasible (no per-Gaussian anchor assignment to reproduce); there are
+# simply no anchors to predict. SCAFFOLD_MODE is therefore inert here, kept only so
+# the value is documented. To bring anchors back later, set POSITION_SCAFFOLD=True
+# with SCAFFOLD_MODE=hilbert_block (NOT voxel, which is not Stage-2 feasible).
+POSITION_SCAFFOLD=False
+SCAFFOLD_MODE="hilbert_block"  # inert while POSITION_SCAFFOLD=False
+ANCHOR_RELATIVE_DECODE=False
+ANCHOR_TEACHER_FORCE=False     # diagnostic only (feeds GT anchors); must stay False for Stage 2
+OFFSET_SCALE_INIT=2.0          # only used when ANCHOR_RELATIVE_DECODE=True
 ANCHOR_LOSS_WEIGHT=1.0
 
+# ── LOCAL ENCODER + LOCAL DISENTANGLEMENT ────────────────────────────────────
+# LOCAL_ENCODER: windowed spatially-local encoder. Geometry query k attends to a
+# window of Hilbert blocks around block k. REQUIRES Hilbert-ordered input, i.e.
+# MORTON_ORDER=True below (otherwise the blocks are opacity-rank groups, not spatial,
+# and the local premise is broken). Implies STRUCTURED_LATENT internally.
 LOCAL_ENCODER=True
 LOCAL_WINDOW=1
-STRUCTURED_LATENT=False
+STRUCTURED_LATENT=False         # auto-forced True by LOCAL_ENCODER; left as-is
+
+# LOCAL_DISENTANGLE: adds a separate global layout latent z_s (16 tokens from the
+# CLS) on top of the local per-token z_g, conditioning the decoder via cross-attention,
+# KL-regularised, supervised by the scene-semantic / scene-layout / colour heads plus
+# cross_recon + ortho. This is the flag that gives disentanglement WITH the local
+# encoder (--latent_disentangle is incompatible here and is auto-forced off). The
+# disentanglement is actually enforced by CROSS_RECON_WEIGHT (swap z_s across the
+# batch, geometry must not change) and ORTHO_WEIGHT (decorrelate z_s from z_g) below.
+LOCAL_DISENTANGLE=True
 
 # Per-Gaussian InfoNCE (--semantic_mode + --segment_loss_weight). Operates on the
 # per-Gaussian encoder/decoder features and pulls same-ScanNet72-label Gaussians
 # together. ONLY the 3800 chunks contribute (the 3 full-scene sources load with
 # semantics disabled -> segment=-1 -> filtered out), so there is no cross-dataset
 # label-taxonomy collision. Requires SEGMENT_WEIGHT>0 (0 silently disables the head).
-#   "hidden"    = SemanticProjectionHead off the global 1024-d hidden. At
-#                 NUM_GAUSSIANS=40000 the final Linear(256, 40000*32) is ~329M params
-#                 (~5.3 GB GPU, > the rest of the model; trains slowly from scratch).
-#   "geometric" = shared per-Gaussian MLP (14->128->128->32), ~22K params, true
-#                 per-Gaussian function of each Gaussian's attributes. RECOMMENDED
-#                 (far lighter + more principled). Swap the string below to switch.
-SEMANTIC_MODE_OVERRIDE="hidden"
+SEMANTIC_MODE_OVERRIDE="hidden"  # "hidden" = per-Gaussian hidden features, "decoder" = per-Gaussian decoder features
 
-LATENT_DISENTANGLE=True
-SEMANTIC_DIMS=512
-CROSS_RECON_WEIGHT=0.3
-ORTHO_WEIGHT=0.1
+LATENT_DISENTANGLE=False        # incompatible with the local encoder; auto-forced off
+SEMANTIC_DIMS=512               # z_s = 16 tokens x 32
+CROSS_RECON_WEIGHT=0.3          # disentanglement loss (active now that LOCAL_DISENTANGLE=True)
+ORTHO_WEIGHT=0.1                # disentanglement loss (active now that LOCAL_DISENTANGLE=True)
 
 COLOR_RESIDUAL=True
 MEAN_COLOR_WEIGHT=0.5
 COLOR_LOSS_WEIGHT=2.0
 
-STRUCTURED_LAYOUT_TOKENS=False
+# STRUCTURED_LAYOUT_TOKENS: carve z_s into dedicated token groups -- token 0 = colour,
+# tokens 1-8 = semantic, tokens 9-15 = layout -- so each head reads its own slice of
+# z_s instead of a shared pool. Pairs with the two heads below.
+STRUCTURED_LAYOUT_TOKENS=True
 
-SCENE_SEMANTIC_HEAD=False
+# Scene heads that supervise z_s (give it semantic + layout meaning). Under
+# LOCAL_DISENTANGLE these build the z_s-reading variants, so their gradients land on z_s.
+SCENE_SEMANTIC_HEAD=True
 SCENE_SEMANTIC_WEIGHT=0.3
-SCENE_LAYOUT_HEAD=False
+SCENE_LAYOUT_HEAD=True
 LAYOUT_LOSS_WEIGHT=0.3
-SEMANTIC_TOKEN_HEADS=False
+SEMANTIC_TOKEN_HEADS=False      # requires latent_disentangle; must stay False on the local path
 
 ZS_POOL_INFONCE_WEIGHT=0.0
 ZS_POOL_INFONCE_TEMPERATURE=0.10
 
-ZS_LAYOUT_INFONCE_WEIGHT=0.0
+ZS_LAYOUT_INFONCE_WEIGHT=0.0    # this is the one contrastive z_s term that works with local_disentangle
 ZS_LAYOUT_INFONCE_TEMPERATURE=0.07
-ZS_TOKEN_INFONCE_WEIGHT=0.0
+ZS_TOKEN_INFONCE_WEIGHT=0.0     # requires latent_disentangle; auto-disabled here
 ZS_TOKEN_INFONCE_TEMPERATURE=0.07
-Z_S_INFONCE_WEIGHT=0.0
+Z_S_INFONCE_WEIGHT=0.0          # requires latent_disentangle; auto-disabled here
 Z_S_INFONCE_TEMPERATURE=0.07
 Z_S_INFONCE_DELTA=0.4
 
@@ -109,70 +124,30 @@ SCALE_PENALTY_THRESHOLD=0.5
 
 CROP_PERCENTILE=100.0
 
+# ── GAUSSIAN REORDERING (space-filling curve) ────────────────────────────────
+# MORTON_ORDER is the master switch for REORDERING the selected Gaussians along a
+# space-filling curve, so slot i maps to a spatially-stable location. ORDER_CURVE
+# picks WHICH curve: "hilbert" (recommended, best locality) or "morton" (Z-order).
+# NOTE on the naming: the flag is MORTON_ORDER for historical reasons but it only
+# ENABLES reordering; the curve itself is chosen by ORDER_CURVE. So
+# MORTON_ORDER=True + ORDER_CURVE="hilbert" means "reorder using the Hilbert curve"
+# (NOT Morton). ORDER_FRAME_RADIUS>0 uses a FIXED canonical frame [-R,R] so the
+# slot->position target is consistent across scenes.
+# REQUIRED here: (a) the LOCAL_ENCODER and the TOKEN_LOCAL_DECODER both assume the
+# points are Hilbert-ordered (block k = a local spatial cluster), and (b) the
+# element-wise L2 recon is only learnable when slot i is spatially stable across
+# scenes. With MORTON_ORDER=False the local blocks are opacity-rank groups and the
+# whole structured/local design is undermined.
 MORTON_ORDER=True
 ORDER_CURVE="hilbert"
 ORDER_FRAME_RADIUS=10.0
-# ── CANONICAL VOXEL TARGET (density-adaptive "unique mapping") ─────────────────
-# Re-express each scene as one representative Gaussian per occupied voxel (Hilbert-
-# ordered, padded to NUM_GAUSSIANS with zero-opacity dummies). Converts the
-# non-identifiable raw per-Gaussian arrangement into an identifiable target. Best
-# run WITH the render-primary recipe above (padding is invisible to the render).
-# VOXEL_RES: tune so occupied voxels land near NUM_GAUSSIANS (64 ~= 0.31u cells on
-# a [-10,10] frame). VOXEL_SNAP=True snaps to cell centres (pure grid positions).
-CANONICAL_VOXEL=False
-VOXEL_RES=64
-VOXEL_SNAP=False
-
-USE_CHAMFER_LOSS=False
-CHAMFER_CHUNK=2048
-
-GEOM_LOSS="bures_codiag"
-GEOM_EPS=1e-6
-GEOM_NS_ITERS=15
-GEOM_SHAPE_WEIGHT=5.0
-
-SET_LOSS=True
-SET_SINKHORN_EPS=0.05
-SET_SINKHORN_ITERS=50
-SET_POS_WEIGHT=1.0
-SET_OPA_WEIGHT=1.0
-SET_BLOCK_SIZE=0
-# Opacity-weighted position term (focus positional capacity on VISIBLE Gaussians;
-# reuses the set-loss Sinkhorn matching, weighted by GT opacity). 0 = off. Try
-# ~0.05 to start; raise if visible-position/renders improve without hurting Pos.
-OPACITY_POS_WEIGHT=0.0
-
-# ── VIRTUAL-CAMERA RENDERING LOSS  (--render_loss)  — image-space crispness ────
-RENDER_LOSS=False
-RENDER_LOSS_WEIGHT=0.5
-RENDER_WARMUP_EPOCHS=0
-RENDER_VIEWS=4
-RENDER_IMG=128
-RENDER_MAX_SCENES=8
-RENDER_SSIM_WEIGHT=0.2
-RENDER_LPIPS_WEIGHT=0.0
-RENDER_FOV=50.0
-RENDER_DIST_MULT=2.6
-RENDER_UP_AXIS=2
-RENDER_QUAT_ORDER="wxyz"
-# ── PARAMETER-LOSS WEIGHT (render-primary switch) ─────────────────────────────
-# Multiplies the parameter-space recon loss. 1.0 = parameter-primary (current).
-# RENDER-PRIMARY RECIPE (gauge-invariant objective; supervise the image, not the
-# non-identifiable positions): set PARAM_LOSS_WEIGHT=0.1, RENDER_LOSS_WEIGHT=5.0,
-# RENDER_LPIPS_WEIGHT=1.0, and raise RENDER_VIEWS (e.g. 8) + RENDER_MAX_SCENES so
-# the rendered views cover the scene. Keep anchor/KL as-is. Watch reconstruction
-# PSNR/SSIM, not Pos. LPIPS needs the `lpips` package + pre-downloaded weights
-# (it degrades to L1+D-SSIM if unavailable).
-PARAM_LOSS_WEIGHT=1.0
-
-COV_METRIC=False
 
 AUG_YAW=False
 AUG_YAW_AXIS="z"
 AUG_YAW_MAX_DEG=180.0
 
 BATCH_SIZE=64
-NUM_EPOCHS=2000
+NUM_EPOCHS=500
 NUM_GAUSSIANS=40000
 POS_COND_HEADS=0
 POS_COND_COLOR=0
@@ -215,13 +190,10 @@ SAMPLE_VOXEL_RES=96    # grid resolution for uniform/fps sampling (needs occupie
 # Main set = 3800 interior_gs chunks (TRAIN_DATA=chunks, global frame via
 # norm_factor.npy). The three extra roots below are FULL scenes, each PER-SCENE
 # normalised (no norm_factor.npy -> centred + scaled to radius 10, the SAME frame
-# the full-scene val uses). Semantics are auto-disabled for extra paths, so
-# uniform_instance falls back to plain density-uniform sampling on them (object
-# labels are only present on the interior chunks). Counts: 800 + 1290 + 906(->856
-# available) ~= 2946 full scenes; total train ~= 6746.
-#   interior_gs/train  : 800  full scenes (same dataset as the chunks, per-scene norm)
-#   arkitscenes        : 1290 full scenes
-#   scannetpp_v2        : 906 requested (856 on disk)
+# the full-scene val uses). Semantics are auto-disabled for extra paths, so the
+# scene-semantic / scene-layout / per-Gaussian heads are driven ONLY by the 3800
+# chunks; the full scenes contribute 0 to those losses (valid masks are empty).
+# Counts: 800 + 1290 + 906(->856 available) ~= 2946 full scenes; total train ~= 6746.
 EXTRA_TRAIN_PATHS="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train:/home/yli7/scratch/datasets/gaussian_world/preprocessed/arkitscenes_mcmc_3dgs/train:/home/yli7/scratch/datasets/gaussian_world/preprocessed/scannetpp_v2_mcmc_3dgs_lang_large_new/train"
 EXTRA_TRAIN_SCENES="800:1290:906"
 
@@ -258,6 +230,32 @@ if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; 
     echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True"; exit 1
 fi
 
+if [ "$LOCAL_DISENTANGLE" = "True" ] && [ "$LOCAL_ENCODER" != "True" ]; then
+    echo "ERROR: LOCAL_DISENTANGLE=True requires LOCAL_ENCODER=True"; exit 1
+fi
+
+# hilbert_block scaffold groups the Hilbert-ordered points into blocks, so it is only
+# meaningful when the points are actually reordered. Warn (do not hard-fail) so that
+# scaffold-without-reordering ablations are still possible.
+if [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCAFFOLD_MODE" = "hilbert_block" ] && [ "$MORTON_ORDER" != "True" ]; then
+    echo "══════════════════════════════════════════════════════════════════════"
+    echo "  WARNING: SCAFFOLD_MODE=hilbert_block WITHOUT MORTON_ORDER=True"
+    echo "  The per-block centroids will be computed on OPACITY-RANKED groups."
+    echo "  This is NOT spatially coherent and NOT suitable for Stage-2."
+    echo "  (Allowed for ablation/debugging. To silence this, set MORTON_ORDER=True)."
+    echo "══════════════════════════════════════════════════════════════════════"
+fi
+
+# The local encoder/decoder assume Hilbert-ordered input. Warn if reordering is off.
+if [ "$LOCAL_ENCODER" = "True" ] && [ "$MORTON_ORDER" != "True" ]; then
+    echo "══════════════════════════════════════════════════════════════════════"
+    echo "  WARNING: LOCAL_ENCODER=True WITHOUT MORTON_ORDER=True"
+    echo "  The encoder's 512 blocks will be opacity-rank groups, not spatial"
+    echo "  clusters, so the local/compositional premise is broken. Set"
+    echo "  MORTON_ORDER=True with ORDER_CURVE=hilbert."
+    echo "══════════════════════════════════════════════════════════════════════"
+fi
+
 _CP_CHECK=$(python3 -c "
 v = float('$CROP_PERCENTILE')
 if v <= 0 or v > 100:
@@ -279,11 +277,19 @@ elif [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ]; then
 elif [ "$DECODER_LAYOUT_ADDITIVE" = "True" ]; then
     ACTIVE_STRATEGY="B2 — 512 geom + additive bias"
 fi
+# local_disentangle is its own strategy (local z_g + global z_s); report it accurately.
+if [ "$LOCAL_DISENTANGLE" = "True" ]; then
+    ACTIVE_STRATEGY="LD — local z_g (512) + global z_s (16, cross-attn)"
+fi
 
 echo "========================================================================"
 echo "  CAN3TOK — Strategy: $ACTIVE_STRATEGY"
 if [ "$TOKEN_LOCAL_DECODER" = "True" ]; then
     echo "  TOKEN-LOCAL DECODER ENABLED"
+fi
+if [ "$LOCAL_DISENTANGLE" = "True" ]; then
+    echo "  LOCAL DISENTANGLE: z_s(16) cross-attn | cross_recon=$CROSS_RECON_WEIGHT ortho=$ORTHO_WEIGHT"
+    echo "  z_s supervision  : scene_semantic=$SCENE_SEMANTIC_HEAD scene_layout=$SCENE_LAYOUT_HEAD structured_tokens=$STRUCTURED_LAYOUT_TOKENS"
 fi
 _CP_INT=$(python3 -c "print(int(float('$CROP_PERCENTILE')))")
 if [ "$_CP_INT" -lt 100 ]; then
@@ -298,10 +304,11 @@ if [ "$MORTON_ORDER" = "True" ]; then
 else
     echo "  Gaussian order  : opacity rank (default)"
 fi
-if [ "$USE_CHAMFER_LOSS" = "True" ]; then
-    echo "  RECON OBJECTIVE : CHAMFER (permutation-invariant, order-free)  chunk=$CHAMFER_CHUNK"
+echo "  Recon objective : element-wise L2 (slot-aligned; needs MORTON_ORDER=True)"
+if [ "$POSITION_SCAFFOLD" = "True" ]; then
+    echo "  Position scaffold: ON  mode=$SCAFFOLD_MODE  anchor_relative=$ANCHOR_RELATIVE_DECODE  teacher_force=$ANCHOR_TEACHER_FORCE"
 else
-    echo "  Recon objective : element-wise L2 (pair with MORTON_ORDER=True)"
+    echo "  Position scaffold: OFF (positions decode directly from z_g; no anchors)"
 fi
 echo "  TRAIN_DATA=$TRAIN_DATA  TRAIN_SCENES=$TRAIN_SCENES  VAL_SCENES=$VAL_SCENES"
 echo "========================================================================"
@@ -317,21 +324,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 
-# Force UTF-8. Snellius compute nodes default to an ASCII (C/POSIX) locale, and
-# gsplat's runtime CUDA-kernel compile reads its own source files with Python's
-# default text encoding; a UTF-8 byte in those sources (e.g. an em-dash) then
-# raises UnicodeDecodeError before any CUDA work. PYTHONUTF8=1 forces UTF-8 for
-# file I/O regardless of whether a UTF-8 locale is installed. (Harmless otherwise.)
+# Force UTF-8 for file I/O regardless of the node's locale. Snellius compute nodes
+# default to an ASCII (C/POSIX) locale, under which Python reads source/text files
+# with the ASCII codec and a stray UTF-8 byte raises UnicodeDecodeError. PYTHONUTF8=1
+# forces UTF-8 regardless of whether a UTF-8 locale is installed. (Harmless otherwise.)
 export PYTHONUTF8=1
 export LC_ALL=C.UTF-8
 export LANG=C.UTF-8
-
-# NOTE (only needed if RENDER_LOSS=True): the rendering loss needs gsplat in this
-# env. Install it ONCE on a LOGIN node (Snellius compute nodes have no internet):
-#     /home/yli11/.conda/envs/can3tok/bin/pip install gsplat
-# gsplat JIT-compiles its CUDA kernels on first import (the CUDA/12.1.1 module above
-# provides nvcc); the single-process pre-compile below triggers and caches it.
-# Also copy render_loss.py into this repo root next to gs_can3tok_2.py.
 
 cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
 mkdir -p logs_ss1 checkpoints_stage1
@@ -403,6 +402,7 @@ TRAIN_CMD="$TRAIN_CMD --sample_voxel_res $SAMPLE_VOXEL_RES"
 [ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_additive"
 
 [ "$LATENT_DISENTANGLE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
+[ "$LOCAL_DISENTANGLE"  = "True" ] && TRAIN_CMD="$TRAIN_CMD --local_disentangle"
 TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
 TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT --ortho_weight $ORTHO_WEIGHT"
 
@@ -440,16 +440,6 @@ TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
 [ "$POSITION_SCAFFOLD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --scaffold_mode $SCAFFOLD_MODE"
 [ "$ANCHOR_RELATIVE_DECODE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_relative_decode --offset_scale_init $OFFSET_SCALE_INIT"
-if [ "$MICRO_PATTERN" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --micro_pattern --micro_offset_scale $MICRO_OFFSET_SCALE"
-    [ "$MICRO_PATTERN_NO_ROTATION" = "True" ] && TRAIN_CMD="$TRAIN_CMD --micro_pattern_no_rotation"
-    if [ -n "$RESUME_CHECKPOINT" ]; then
-        echo "[job] WARNING: MICRO_PATTERN=True with a RESUME_CHECKPOINT set. The frame"
-        echo "[job]          head loads fresh (strict=False) and the position branch must"
-        echo "[job]          re-converge; this is effectively a retrain. Blank"
-        echo "[job]          RESUME_CHECKPOINT to start clean."
-    fi
-fi
 [ "$ANCHOR_TEACHER_FORCE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_teacher_force"
 [ "$STRUCTURED_LATENT" = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_latent"
 [ "$LOCAL_ENCODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --local_encoder --local_window $LOCAL_WINDOW"
@@ -478,29 +468,9 @@ TRAIN_CMD="$TRAIN_CMD --crop_percentile $CROP_PERCENTILE"
 [ "$MORTON_ORDER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --morton_order"
 TRAIN_CMD="$TRAIN_CMD --order_curve $ORDER_CURVE"
 TRAIN_CMD="$TRAIN_CMD --order_frame_radius $ORDER_FRAME_RADIUS"
-TRAIN_CMD="$TRAIN_CMD --param_loss_weight $PARAM_LOSS_WEIGHT"
-if [ "$CANONICAL_VOXEL" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --canonical_voxel --voxel_res $VOXEL_RES"
-    [ "$VOXEL_SNAP" = "True" ] && TRAIN_CMD="$TRAIN_CMD --voxel_snap"
-fi
 
-[ "$USE_CHAMFER_LOSS" = "True" ] && TRAIN_CMD="$TRAIN_CMD --use_chamfer_loss"
-TRAIN_CMD="$TRAIN_CMD --chamfer_chunk $CHAMFER_CHUNK"
-TRAIN_CMD="$TRAIN_CMD --geom_loss $GEOM_LOSS --geom_eps $GEOM_EPS --geom_ns_iters $GEOM_NS_ITERS --geom_shape_weight $GEOM_SHAPE_WEIGHT"
 [ -n "$EMBED_DIM" ] && TRAIN_CMD="$TRAIN_CMD --embed_dim $EMBED_DIM"
-if [ "$SET_LOSS" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --set_loss --set_sinkhorn_eps $SET_SINKHORN_EPS --set_sinkhorn_iters $SET_SINKHORN_ITERS"
-    TRAIN_CMD="$TRAIN_CMD --set_pos_weight $SET_POS_WEIGHT --set_opa_weight $SET_OPA_WEIGHT --set_block_size $SET_BLOCK_SIZE"
-fi
-TRAIN_CMD="$TRAIN_CMD --opacity_pos_weight $OPACITY_POS_WEIGHT"
-if [ "$RENDER_LOSS" = "True" ]; then
-    TRAIN_CMD="$TRAIN_CMD --render_loss --render_loss_weight $RENDER_LOSS_WEIGHT --render_warmup_epochs $RENDER_WARMUP_EPOCHS"
-    TRAIN_CMD="$TRAIN_CMD --render_views $RENDER_VIEWS --render_img $RENDER_IMG --render_max_scenes $RENDER_MAX_SCENES"
-    TRAIN_CMD="$TRAIN_CMD --render_ssim_weight $RENDER_SSIM_WEIGHT --render_fov $RENDER_FOV --render_dist_mult $RENDER_DIST_MULT"
-    TRAIN_CMD="$TRAIN_CMD --render_lpips_weight $RENDER_LPIPS_WEIGHT"
-    TRAIN_CMD="$TRAIN_CMD --render_up_axis $RENDER_UP_AXIS --render_quat_order $RENDER_QUAT_ORDER"
-fi
-[ "$COV_METRIC" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_cov_metric"
+
 [ "$AUG_YAW" = "True" ] && TRAIN_CMD="$TRAIN_CMD --aug_yaw --aug_yaw_axis $AUG_YAW_AXIS --aug_yaw_max_deg $AUG_YAW_MAX_DEG"
 
 if [ -n "$RESUME_CHECKPOINT" ]; then
@@ -520,18 +490,6 @@ echo ""
 # ============================================================================
 
 SECONDS=0
-# Pre-compile gsplat's CUDA extension in a SINGLE process before the multi-GPU
-# launch. The first import JIT-compiles the kernels; if both DDP ranks hit that at
-# once they can race on the shared build dir and fail. Doing it once here (with
-# PYTHONUTF8=1 set above) populates ~/.cache/torch_extensions so the ranks just
-# load the cached .so. Skipped unless RENDER_LOSS=True.
-if [ "$RENDER_LOSS" = "True" ]; then
-    echo "Pre-compiling gsplat CUDA extension (single process)..."
-    python -c "from gsplat.cuda._backend import _C; print('gsplat extension ready')" || {
-        echo "ERROR: gsplat failed to compile. Check that the CUDA module is loaded and"
-        echo "       gsplat is installed in the can3tok env. Aborting before the DDP launch."
-        exit 1; }
-fi
 eval $TRAIN_CMD
 TRAIN_EXIT=$?
 echo ""
@@ -539,15 +497,16 @@ echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End:
 
 if [ $TRAIN_EXIT -eq 0 ]; then
     echo ""
-    echo "COMPLETED. Strategy: $ACTIVE_STRATEGY | Data: $TRAIN_DATA | Crop: ${CROP_PERCENTILE}% | Order: ${MORTON_ORDER}/${ORDER_CURVE} | Chamfer: $USE_CHAMFER_LOSS"
+    echo "COMPLETED. Strategy: $ACTIVE_STRATEGY | Data: $TRAIN_DATA | Crop: ${CROP_PERCENTILE}% | Order: ${MORTON_ORDER}/${ORDER_CURVE} | Scaffold: $SCAFFOLD_MODE"
     echo ""
     echo "  Useful log greps:"
-    echo "  Best full-scene model  : grep 'NEW BEST' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out | tail -5"
-    echo "  Val full scenes (L2)   : grep 'Val FULL SCENES' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
-    echo "  Position convergence   : grep 'Pos=' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out | head -20"
-    echo "  Recon objective        : grep 'RECON OBJECTIVE' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
-    echo "  Gaussian order         : grep 'GAUSSIAN ORDER' logs_ss1/can3tok_10k_${SLURM_JOB_ID}.out"
+    echo "  Best full-scene model  : grep 'NEW BEST' logs_ss1/can3tok_40k_R6_${SLURM_JOB_ID}.out | tail -5"
+    echo "  Val full scenes (L2)   : grep 'Val FULL SCENES' logs_ss1/can3tok_40k_R6_${SLURM_JOB_ID}.out"
+    echo "  Position convergence   : grep 'Pos=' logs_ss1/can3tok_40k_R6_${SLURM_JOB_ID}.out | head -20"
+    echo "  CrossRecon / Ortho     : grep 'CrossRecon' logs_ss1/can3tok_40k_R6_${SLURM_JOB_ID}.out | head -20"
+    echo "  Local disentangle      : grep 'local_disentangle' logs_ss1/can3tok_40k_R6_${SLURM_JOB_ID}.out"
+    echo "  Gaussian order         : grep 'GAUSSIAN ORDER' logs_ss1/can3tok_40k_R6_${SLURM_JOB_ID}.out"
 else
     echo "FAILED (exit $TRAIN_EXIT)"
-    echo "  Error log: cat logs_ss1/can3tok_10k_${SLURM_JOB_ID}.err"
+    echo "  Error log: cat logs_ss1/can3tok_40k_R6_${SLURM_JOB_ID}.err"
 fi

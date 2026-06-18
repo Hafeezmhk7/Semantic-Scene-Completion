@@ -9,13 +9,12 @@ DATASET MODES (--train_data):
   "combined" — both sources concatenated (4688 total)
   Validation always uses val/ (held-out full scenes).
 
-RECONSTRUCTION OBJECTIVE (--use_chamfer_loss):
-  element-wise (default): torch.norm(pred[i] - target[i]) per slot. Requires a
-      stable slot<->target correspondence. Pair with --morton_order so target
+RECONSTRUCTION OBJECTIVE:
+  element-wise L2: torch.norm(pred[i] - target[i]) per slot (position/colour/
+      opacity/scale/rotation, with --color_loss_weight on colour). Requires a
+      stable slot<->target correspondence, so pair with --morton_order so target
       slot i is a spatially-stable location (otherwise opacity rank makes the
       per-slot target unlearnable and the loss plateaus).
-  chamfer (--use_chamfer_loss): permutation-invariant nearest-neighbour matching
-      on position. Order-free, so --morton_order is not required.
 
 REPORTING CONVENTION (raw, matches training):
   Both training AND validation now report the raw torch.norm per batch, averaged
@@ -55,11 +54,6 @@ except ImportError:
     def visualize_zs_tokens(*args, **kwargs):
         return None
 from gs_ply_reconstructor import save_reconstructed_gaussians
-try:
-    from render_loss import compute_render_loss
-except Exception as _rl_e:  # render_loss.py or its deps missing -> only matters if --render_loss
-    compute_render_loss = None
-    _RENDER_LOSS_IMPORT_ERROR = _rl_e
 from accelerate import Accelerator, DistributedDataParallelKwargs
 
 import sys
@@ -92,462 +86,9 @@ def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0
           + torch.norm(prediction[:,:,6:]  - target[:,:,6:],  p=2)) / batch_size
 
 
-def _chunked_nn_indices(src, ref, chunk=2048):
-    """
-    For each point in src [Ns,3], the index of its nearest point in ref [Nr,3].
-    Chunked over src so the [Ns,Nr] distance matrix is never materialized in full.
-    argmin is non-differentiable (correct for Chamfer — gradients flow through the
-    gathered values, not the indices).
-    """
-    Ns = src.shape[0]
-    out = torch.empty(Ns, dtype=torch.long, device=src.device)
-    for s in range(0, Ns, chunk):
-        e = min(s + chunk, Ns)
-        d = torch.cdist(src[s:e].unsqueeze(0), ref.unsqueeze(0)).squeeze(0)  # [c, Nr]
-        out[s:e] = d.argmin(dim=1)
-    return out
-
-
-def chamfer_reconstruction_loss(prediction, target, batch_size, color_weight=1.0, chunk=2048):
-    """
-    Permutation-invariant reconstruction loss.
-
-    Matches predicted and target Gaussians by nearest neighbour IN POSITION
-    (columns 0:3), then applies the SAME channel weighting as
-    compute_reconstruction_loss on the matched pairs
-    (position + color*color_weight + rest[6:]). No opacity-specific scaling.
-    Bidirectional (pred->target and target->pred). The matching is
-    non-differentiable; gradients flow through the gathered values.
-
-    NOTE: matches on the position columns AS PASSED IN. Intended for absolute
-    position targets (default path; no position_scaffold / position_layout_residual).
-    A warning is printed at startup if combined with those residual modes.
-    """
-    B = prediction.shape[0]
-    total = prediction.new_zeros(())
-    for b in range(B):
-        pp = prediction[b]            # [N,14]
-        tt = target[b]                # [N,14]
-        with torch.no_grad():
-            idx_p2t = _chunked_nn_indices(pp[:, 0:3], tt[:, 0:3], chunk)  # pred -> nearest target
-            idx_t2p = _chunked_nn_indices(tt[:, 0:3], pp[:, 0:3], chunk)  # target -> nearest pred
-        matched_t = tt.index_select(0, idx_p2t)   # [N,14]
-        matched_p = pp.index_select(0, idx_t2p)   # [N,14]
-        loss_fwd = (torch.norm(pp[:, 0:3] - matched_t[:, 0:3], p=2)
-                  + torch.norm(pp[:, 3:6] - matched_t[:, 3:6], p=2) * color_weight
-                  + torch.norm(pp[:, 6:]  - matched_t[:, 6:],  p=2))
-        loss_bwd = (torch.norm(tt[:, 0:3] - matched_p[:, 0:3], p=2)
-                  + torch.norm(tt[:, 3:6] - matched_p[:, 3:6], p=2) * color_weight
-                  + torch.norm(tt[:, 6:]  - matched_p[:, 6:],  p=2))
-        total = total + 0.5 * (loss_fwd + loss_bwd)
-    return total / batch_size
-
-
-# ============================================================================
-# GAUGE-INVARIANT COVARIANCE RECONSTRUCTION  (--geom_loss)
-# ============================================================================
-# A 3D Gaussian is N(mu, Sigma) with Sigma = R diag(s^2) R^T, a 3x3 SPD matrix.
-# The data stores the GAUGE-DEPENDENT factorisation (quaternion q, scale s), and
-# the default element-wise L2 penalises differences in (q, s) that leave Sigma --
-# hence the Gaussian itself -- unchanged: the quaternion double cover (q == -q),
-# axis relabelling (permute s together with R's columns), column sign flips, and
-# near-isotropy (R nearly unconstrained). That gauge term is unlearnable, which is
-# why rotation never converges under L2. These losses compare the Gaussians via
-# gauge-invariant distances on Sigma instead:
-#   bures        : exact 2-Wasserstein / Bures shape term,
-#                  tr(Sp + St - 2 (St^1/2 Sp St^1/2)^1/2)
-#   bures_codiag : co-diagonalisation upper bound  ||Sp^1/2 - St^1/2||_F^2
-#                  (equals Bures when Sp, St commute; cheaper and very stable)
-#   logeuclid    : log-Euclidean metric  ||log Sp - log St||_F^2
-#   quat_antipodal: keeps s and q SEPARATE but uses the double-cover-aware rotation
-#                  distance min(||q-q'||^2, ||q+q'||^2)  (cheap ablation baseline)
-#
-# SPD square roots use a Newton-Schulz iteration (pure matmul -> differentiable and
-# stable at coincident eigenvalues) under trace normalisation, which guarantees
-# convergence because the eigenvalues of A/tr(A) lie in (0,1). logeuclid needs a
-# matrix log and falls back to eigh (slower, less stable near equal eigenvalues).
-# All covariance math runs in fp32 with autocast disabled.
-#
-# Position / colour / opacity terms are IDENTICAL to compute_reconstruction_loss
-# (same torch.norm reduction), so the loss magnitude and the KL / cross-recon /
-# ortho balance are preserved; only the scale+rotation block is replaced. The
-# per-component Pos/Col/Opa/Scl/Rot diagnostics are computed separately and are
-# unaffected. Requires --scale_norm_mode linear (covariance assembly needs s>0).
-
-def _build_R_from_quat(q, eps=1e-8):
-    """[...,4] (w,x,y,z), unit-normalised, -> rotation matrix [...,3,3] (3DGS order)."""
-    q = q / (q.norm(dim=-1, keepdim=True) + eps)
-    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    R = torch.stack([
-        1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y),
-        2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x),
-        2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y),
-    ], dim=-1).reshape(q.shape[:-1] + (3, 3))
-    return R
-
-def _assemble_sigma(scale, quat, eps=1e-6):
-    """Sigma = R diag(scale^2) R^T + eps*I; invariant to the (scale,quat) gauge."""
-    R     = _build_R_from_quat(quat)
-    s2    = scale * scale                       # [...,3]
-    RS    = R * s2.unsqueeze(-2)                 # scale the columns of R
-    Sigma = RS @ R.transpose(-1, -2)
-    eye   = torch.eye(3, device=Sigma.device, dtype=Sigma.dtype)
-    return Sigma + eps * eye
-
-def _ns_spd_sqrt(A, iters=10):
-    """SPD matrix square root of A [...,3,3] via Newton-Schulz (trace-normalised).
-    Pure matmul: differentiable and stable even at coincident/degenerate eigenvalues."""
-    eye = torch.eye(3, device=A.device, dtype=A.dtype).expand_as(A)
-    tr  = torch.diagonal(A, dim1=-2, dim2=-1).sum(-1).clamp(min=1e-12)
-    Y   = A / tr[..., None, None]                # eigenvalues now in (0,1) -> converges
-    Z   = eye.clone()
-    for _ in range(iters):
-        T = 0.5 * (3.0 * eye - Z @ Y)
-        Y = Y @ T
-        Z = T @ Z
-    return Y * tr[..., None, None].sqrt()
-
-def _spd_log_eigh(A, eps=1e-6):
-    """Matrix log of SPD A [...,3,3] via eigendecomposition (fp32).
-
-    Hardened for a *diagnostic* (eval-only): sanitise non-finite entries, symmetrise,
-    and floor the matrix to SPD before the solve, then fall back to a CPU eigh if the
-    GPU cuSOLVER path still errors (it throws CUSOLVER_STATUS_INVALID_VALUE on any
-    non-finite / near-degenerate batch, e.g. random init at epoch 0)."""
-    eye = torch.eye(3, device=A.device, dtype=A.dtype)
-    A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
-    A = 0.5 * (A + A.transpose(-1, -2)) + eps * eye        # symmetric + SPD floor
-    try:
-        evals, evecs = torch.linalg.eigh(A)
-    except Exception:                                       # cuSOLVER fragility -> CPU LAPACK
-        evals, evecs = torch.linalg.eigh(A.detach().double().cpu())
-        evals = evals.to(A.device, A.dtype)
-        evecs = evecs.to(A.device, A.dtype)
-    evals = evals.clamp(min=eps)
-    return (evecs * evals.log().unsqueeze(-2)) @ evecs.transpose(-1, -2)
-
-def _trace_last2(X):
-    return torch.diagonal(X, dim1=-2, dim2=-1).sum(-1)
-
-def _shape_term(sp, qp, st, qt, mode, eps, ns_iters, shape_weight):
-    """Norm-like scalar for the scale+rotation / covariance block of the loss.
-    sp/st: per-Gaussian scale [...,3]; qp/qt: per-Gaussian quaternion [...,4]."""
-    with torch.autocast(device_type='cuda', enabled=False):
-        sp = sp.float(); qp = qp.float(); st = st.float(); qt = qt.float()
-        if mode == 'quat_antipodal':
-            scale_n = torch.norm(sp - st, p=2)
-            qpn = qp / (qp.norm(dim=-1, keepdim=True) + 1e-8)
-            qtn = qt / (qt.norm(dim=-1, keepdim=True) + 1e-8)
-            d2  = torch.minimum(((qpn - qtn) ** 2).sum(-1),
-                                ((qpn + qtn) ** 2).sum(-1))         # per Gaussian
-            return scale_n + shape_weight * d2.sum().clamp(min=0).sqrt()
-        Sp = _assemble_sigma(sp, qp, eps)
-        St = _assemble_sigma(st, qt, eps)
-        if mode == 'logeuclid':
-            d2 = ((_spd_log_eigh(Sp, eps) - _spd_log_eigh(St, eps)) ** 2
-                  ).flatten(start_dim=-2).sum(-1)
-        elif mode == 'bures_codiag':
-            d2 = ((_ns_spd_sqrt(Sp, ns_iters) - _ns_spd_sqrt(St, ns_iters)) ** 2
-                  ).flatten(start_dim=-2).sum(-1)
-        elif mode == 'bures':
-            At = _ns_spd_sqrt(St, ns_iters)
-            sM = _ns_spd_sqrt(At @ Sp @ At, ns_iters)
-            d2 = (_trace_last2(Sp) + _trace_last2(St) - 2.0 * _trace_last2(sM)).clamp(min=0)
-        else:
-            raise ValueError(f"unknown geom_loss shape mode: {mode}")
-        return shape_weight * d2.sum().clamp(min=0).sqrt()
-
-def compute_reconstruction_loss_geom(prediction, target, batch_size, color_weight,
-                                     geom_loss, eps=1e-6, ns_iters=10, shape_weight=1.0):
-    """Element-wise (slot-aligned) reconstruction with a gauge-invariant scale+rotation
-    term. Position/colour/opacity match compute_reconstruction_loss exactly."""
-    p, t = prediction, target
-    pos = torch.norm(p[:, :, 0:3] - t[:, :, 0:3], p=2)
-    col = torch.norm(p[:, :, 3:6] - t[:, :, 3:6], p=2)
-    opa = torch.norm(p[:, :, 6:7] - t[:, :, 6:7], p=2)
-    shape = _shape_term(p[:, :, 7:10], p[:, :, 10:14],
-                        t[:, :, 7:10], t[:, :, 10:14],
-                        geom_loss, eps, ns_iters, shape_weight)
-    return (pos + color_weight * col + opa + shape) / batch_size
-
-def chamfer_reconstruction_loss_geom(prediction, target, batch_size, color_weight,
-                                     geom_loss, chunk=2048, eps=1e-6, ns_iters=10,
-                                     shape_weight=1.0):
-    """Chamfer assignment (nearest neighbour by position) with the gauge-invariant
-    scale+rotation term. Bidirectional; matching is non-differentiable."""
-    B = prediction.shape[0]
-    total = prediction.new_zeros(())
-    for b in range(B):
-        pp, tt = prediction[b], target[b]
-        with torch.no_grad():
-            idx_p2t = _chunked_nn_indices(pp[:, 0:3], tt[:, 0:3], chunk)
-            idx_t2p = _chunked_nn_indices(tt[:, 0:3], pp[:, 0:3], chunk)
-        matched_t = tt.index_select(0, idx_p2t)
-        matched_p = pp.index_select(0, idx_t2p)
-        loss_fwd = (torch.norm(pp[:, 0:3] - matched_t[:, 0:3], p=2)
-                  + torch.norm(pp[:, 3:6] - matched_t[:, 3:6], p=2) * color_weight
-                  + torch.norm(pp[:, 6:7] - matched_t[:, 6:7], p=2)
-                  + _shape_term(pp[:, 7:10], pp[:, 10:14],
-                                matched_t[:, 7:10], matched_t[:, 10:14],
-                                geom_loss, eps, ns_iters, shape_weight))
-        loss_bwd = (torch.norm(tt[:, 0:3] - matched_p[:, 0:3], p=2)
-                  + torch.norm(tt[:, 3:6] - matched_p[:, 3:6], p=2) * color_weight
-                  + torch.norm(tt[:, 6:7] - matched_p[:, 6:7], p=2)
-                  + _shape_term(tt[:, 7:10], tt[:, 10:14],
-                                matched_p[:, 7:10], matched_p[:, 10:14],
-                                geom_loss, eps, ns_iters, shape_weight))
-        total = total + 0.5 * (loss_fwd + loss_bwd)
-    return total / batch_size
-
-
-# ============================================================================
-# PERMUTATION-INVARIANT SET RECONSTRUCTION LOSS  (--set_loss)
-# ============================================================================
-# Why: rendering depends only on the SET of Gaussians, not their order, and
-# within a token block the assignment of which colour / orientation belongs to
-# which Gaussian is a gauge freedom of the 3DGS fit (diagnostic_oracle_field.py:
-# within-block colour/normal is NOT a function of within-block position, held-out
-# CV-R2 < 0). A slot-aligned (element-wise) loss forces the decoder to break that
-# gauge, which it cannot, so it emits the per-block mean -> washed colour + round
-# blobs. This loss instead MATCHES predicted and target Gaussians WITHIN each
-# token block by entropic optimal transport (Sinkhorn) and scores the matched
-# pairs, so the decoder is graded on producing the right *set* of colours /
-# orientations, not the (arbitrary) per-slot assignment. This is the point-cloud
-# reconstruction principle (CD/EMD are permutation-invariant; "MSE cannot be
-# directly applied to point clouds") brought to parameter-space 3DGS attributes.
-#
-# Efficiency: bures_codiag's covariance sqrt is available in closed form,
-# Sigma^1/2 = R diag(|s|) R^T, so position/colour/opacity and the gauge-invariant
-# shape term fold into ONE 16-dim per-Gaussian feature whose squared Euclidean
-# distance IS the weighted (pos + colour + opacity + Bures-shape) cost. Matching
-# is per block (g x g, g ~ 20-79; Hilbert order already fixes between-block
-# assignment) and the sqrt is computed g times per block, never g^2.
-
-def _sqrt_sigma_flat(scale, quat):
-    """Sigma^{1/2} = R diag(|s|) R^T flattened to [...,9]. Exact PSD square root
-    of Sigma = R diag(s^2) R^T (no Newton-Schulz needed); equals bures_codiag's
-    sqrt up to the eps floor, which is irrelevant for a matching cost."""
-    R  = _build_R_from_quat(quat)
-    RS = R * scale.abs().unsqueeze(-2)                  # scale columns of R by |s|
-    H  = RS @ R.transpose(-1, -2)                       # symmetric PSD
-    return H.flatten(start_dim=-2)                      # [...,9]
-
-def _gaussian_set_features(g14, m_pos, m_col, m_opa, m_shape):
-    """[...,14] -> [...,16] feature with ||f_i - f_j||^2 =
-    m_pos^2|dpos|^2 + m_col^2|dcol|^2 + m_opa^2|dopa|^2 + m_shape^2|dSigma^1/2|_F^2."""
-    return torch.cat([
-        g14[..., 0:3] * m_pos,
-        g14[..., 3:6] * m_col,
-        g14[..., 6:7] * m_opa,
-        _sqrt_sigma_flat(g14[..., 7:10], g14[..., 10:14]) * m_shape,
-    ], dim=-1)
-
-def _log_sinkhorn(cost, eps, iters):
-    """Entropic-OT transport plan for batched square cost [...,n,n] with uniform
-    marginals (mass 1/n each), computed in the log domain for stability. Returns
-    P [...,n,n] with row and column sums 1/n (total mass 1). Detach at call site:
-    matching is fixed, gradient flows through the differentiable cost (DETR recipe)."""
-    n = cost.shape[-1]
-    log_m = cost.new_full(cost.shape[:-1], -math.log(n))     # [...,n] uniform (log)
-    C = cost / eps
-    f = torch.zeros_like(log_m)
-    g = torch.zeros_like(log_m)
-    for _ in range(iters):
-        f = log_m - torch.logsumexp(g.unsqueeze(-2) - C, dim=-1)
-        g = log_m - torch.logsumexp(f.unsqueeze(-1) - C, dim=-2)
-    return (f.unsqueeze(-1) + g.unsqueeze(-2) - C).exp()
-
-def compute_reconstruction_loss_set(prediction, target, batch_size, color_weight,
-                                    shape_weight, block_size, pos_weight=1.0, opa_weight=1.0,
-                                    sinkhorn_eps=0.05, sinkhorn_iters=50,
-                                    return_components=False, return_opos=False):
-    """Permutation-invariant per-block set reconstruction loss (Sinkhorn EMD).
-
-    Same global scale / form as compute_reconstruction_loss (an L2 residual norm
-    divided by batch), but each predicted Gaussian is assigned to a target by the
-    within-block optimal-transport plan instead of slot order. The identity plan
-    recovers the element-wise loss exactly; any reassignment can only lower it.
-    block_size = g = Gaussians the decoder packs per token (= ceil(N / n_tokens))."""
-    p = prediction.float(); t = target.float()
-    B, N, _ = p.shape
-    g = int(block_size)
-    n_full = (N // g) * g
-    total_sq = p.new_zeros(())
-    opos = p.new_zeros(())          # opacity-weighted mean-sq position error (visible Gaussians)
-    comp = {k: p.new_zeros(()) for k in ('pos', 'col', 'opa', 'shape')}
-
-    if n_full >= g:
-        nb = N // g
-        pf = p[:, :n_full].reshape(B, nb, g, 14)
-        tf = t[:, :n_full].reshape(B, nb, g, 14)
-        with torch.autocast(device_type='cuda', enabled=False):
-            with torch.no_grad():                               # matching is detached
-                Fp = _gaussian_set_features(pf, pos_weight, color_weight, opa_weight, shape_weight)
-                Ft = _gaussian_set_features(tf, pos_weight, color_weight, opa_weight, shape_weight)
-                cost = torch.cdist(Fp, Ft) ** 2                 # [B,nb,g,g] weighted sq dist
-                cnorm = cost / (cost.mean(dim=(-2, -1), keepdim=True) + 1e-9)
-                P = _log_sinkhorn(cnorm, sinkhorn_eps, sinkhorn_iters)
-                idx = P.argmax(dim=-1)                          # [B,nb,g] best target per pred
-            # hard-gather the matched target, then weighted L2 (= 0 at pred==target, no
-            # target averaging; gradient flows through the prediction only, DETR-style)
-            mt = torch.gather(tf, 2, idx.unsqueeze(-1).expand(-1, -1, -1, 14))
-            dpos = (pf[..., 0:3] - mt[..., 0:3]).pow(2).sum() * (pos_weight ** 2)
-            dcol = (pf[..., 3:6] - mt[..., 3:6]).pow(2).sum() * (color_weight ** 2)
-            dopa = (pf[..., 6:7] - mt[..., 6:7]).pow(2).sum() * (opa_weight ** 2)
-            Hp = _sqrt_sigma_flat(pf[..., 7:10], pf[..., 10:14])
-            Hm = _sqrt_sigma_flat(mt[..., 7:10], mt[..., 10:14])
-            dsh = (Hp - Hm).pow(2).sum() * (shape_weight ** 2)
-            total_sq = total_sq + dpos + dcol + dopa + dsh
-            if return_components:
-                comp['pos'], comp['col'], comp['opa'], comp['shape'] = dpos, dcol, dopa, dsh
-            if return_opos:
-                # Opacity-weighted position error: focus the limited positional capacity
-                # on VISIBLE Gaussians. Weight each Sinkhorn-matched pair's squared
-                # position error by the MATCHED-TARGET opacity (GT visibility, in [0,1];
-                # using GT not pred opacity so the model cannot dodge the term by dimming
-                # mis-placed Gaussians). Normalised weighted mean -> scale-stable scalar,
-                # differentiable through the predicted positions only (mt is a constant).
-                w_opa  = mt[..., 6:7].clamp(0.0, 1.0)                       # [B,nb,g,1]
-                sq_pos = (pf[..., 0:3] - mt[..., 0:3]).pow(2).sum(-1, keepdim=True)
-                opos   = (w_opa * sq_pos).sum() / (w_opa.sum() + 1e-6)
-
-    if n_full < N:                                              # tiny remainder: slot-aligned
-        pr = p[:, n_full:]; tr = t[:, n_full:]
-        Hp = _sqrt_sigma_flat(pr[..., 7:10], pr[..., 10:14])
-        Ht = _sqrt_sigma_flat(tr[..., 7:10], tr[..., 10:14])
-        total_sq = total_sq + (pr[..., 0:3] - tr[..., 0:3]).pow(2).sum() * (pos_weight ** 2) \
-                            + (pr[..., 3:6] - tr[..., 3:6]).pow(2).sum() * (color_weight ** 2) \
-                            + (pr[..., 6:7] - tr[..., 6:7]).pow(2).sum() * (opa_weight ** 2) \
-                            + (Hp - Ht).pow(2).sum() * (shape_weight ** 2)
-
-    loss = total_sq.clamp(min=0).sqrt() / batch_size
-    if return_components:
-        comps = {k: (v.clamp(min=0).sqrt() / batch_size).item() for k, v in comp.items()}
-        return (loss, comps, opos) if return_opos else (loss, comps)
-    if return_opos:
-        return loss, opos
-    return loss
-
-
-@torch.no_grad()
-def set_matched_individual_losses(prediction, target, block_size, color_weight, shape_weight,
-                                  pos_weight=1.0, opa_weight=1.0, eps=0.05, iters=50):
-    """Per-attribute reconstruction error UNDER THE SET (Sinkhorn) MATCHING.
-
-    This is the meaningful per-component readout when --set_loss is on: the index-matched
-    compute_individual_losses() compares predicted slot i to target slot i and is BLIND to
-    the within-block permutation the set loss introduces (so its Col / Rot look frozen).
-    This matches each predicted Gaussian to its set-assigned target and reports the same
-    raw norms (same scale as compute_individual_losses). Scale+rotation also live in the
-    gauge-invariant covariance ('shape'); 'rotation' is reported as the mean thin-axis
-    (surface-normal) angular error in DEGREES under the matching, which is gauge-aware
-    (sign-invariant) unlike a raw quaternion L2."""
-    p = prediction.float(); t = target.float()
-    B, N, _ = p.shape; g = int(block_size); n_full = (N // g) * g
-    out = {k: 0.0 for k in ('position', 'color', 'opacity', 'scale', 'rotation', 'shape')}
-
-    def _thin_normal(scale, quat):
-        R = _build_R_from_quat(quat)
-        k = scale.abs().argmin(dim=-1)                              # smallest-scale (thin) axis
-        n = torch.gather(R, -1, k[..., None, None].expand(*k.shape, 3, 1)).squeeze(-1)
-        return n / (n.norm(dim=-1, keepdim=True) + 1e-9)
-
-    if n_full >= g:
-        nb = N // g
-        pf = p[:, :n_full].reshape(B, nb, g, 14); tf = t[:, :n_full].reshape(B, nb, g, 14)
-        Fp = _gaussian_set_features(pf, pos_weight, color_weight, opa_weight, shape_weight)
-        Ft = _gaussian_set_features(tf, pos_weight, color_weight, opa_weight, shape_weight)
-        cost = torch.cdist(Fp, Ft) ** 2
-        cnorm = cost / (cost.mean(dim=(-2, -1), keepdim=True) + 1e-9)
-        idx = _log_sinkhorn(cnorm, eps, iters).argmax(dim=-1)
-        mt = torch.gather(tf, 2, idx.unsqueeze(-1).expand(-1, -1, -1, 14))
-        out['position'] = (pf[..., 0:3] - mt[..., 0:3]).pow(2).sum().sqrt().item()
-        out['color']    = (pf[..., 3:6] - mt[..., 3:6]).pow(2).sum().sqrt().item()
-        out['opacity']  = (pf[..., 6:7] - mt[..., 6:7]).pow(2).sum().sqrt().item()
-        out['scale']    = (pf[..., 7:10] - mt[..., 7:10]).pow(2).sum().sqrt().item()
-        Hp = _sqrt_sigma_flat(pf[..., 7:10], pf[..., 10:14])
-        Hm = _sqrt_sigma_flat(mt[..., 7:10], mt[..., 10:14])
-        out['shape']    = (Hp - Hm).pow(2).sum().sqrt().item()
-        # gauge-aware orientation: angle between predicted and matched-target thin-axis normals
-        cos = (_thin_normal(pf[..., 7:10], pf[..., 10:14]) *
-               _thin_normal(mt[..., 7:10], mt[..., 10:14])).sum(-1).abs().clamp(max=1.0)
-        out['rotation'] = torch.rad2deg(torch.arccos(cos)).mean().item()   # mean degrees
-    return out
-
-
-@torch.no_grad()
-def compute_covariance_diagnostics(prediction, target, use_chamfer=False, chunk=2048,
-                                   eps=1e-6, ns_iters=10):
-    """GAUGE-INVARIANT validation metric (diagnostic only, no grad).
-
-    Returns the mean per-Gaussian distance between predicted and target COVARIANCES
-    Sigma = R diag(s^2) R^T, which -- unlike the raw quaternion/scale L2 -- is blind
-    to the double-cover / axis-permutation gauge and therefore actually measures
-    whether orientation+shape are reconstructed. Also reports the target's mean
-    anisotropy (max/min scale-axis ratio): if this is ~1, orientation is moot.
-
-      cov_bures    : mean sqrt(Bures^2) over Gaussians (Newton-Schulz sqrt)
-      cov_logeuclid: mean ||log Sp - log St||_F over Gaussians (eigh)
-      aniso        : mean (s_max / s_min) of the TARGET Gaussians
-
-    Matching mirrors the per-component readout: nearest-neighbour by position under
-    Chamfer, slot-aligned (index) otherwise. Computed in fp32, autocast disabled.
-    """
-    B = prediction.shape[0]
-    with torch.autocast(device_type='cuda', enabled=False):
-        p = prediction.float(); t = target.float()
-        if use_chamfer:
-            mt = []
-            for b in range(B):
-                idx = _chunked_nn_indices(p[b, :, 0:3], t[b, :, 0:3], chunk)
-                mt.append(t[b].index_select(0, idx))
-            T = torch.stack(mt, 0)
-        else:
-            T = t
-        sp, qp = p[:, :, 7:10], p[:, :, 10:14]
-        st, qt = T[:, :, 7:10], T[:, :, 10:14]
-        Sp = _assemble_sigma(sp, qp, eps)
-        St = _assemble_sigma(st, qt, eps)
-        At = _ns_spd_sqrt(St, ns_iters)
-        sM = _ns_spd_sqrt(At @ Sp @ At, ns_iters)
-        bures = (_trace_last2(Sp) + _trace_last2(St) - 2.0 * _trace_last2(sM)
-                 ).clamp(min=0).sqrt().mean()
-        le = ((_spd_log_eigh(Sp, eps) - _spd_log_eigh(St, eps)) ** 2
-              ).flatten(start_dim=-2).sum(-1).sqrt().mean()
-        s_sorted = st.abs().clamp(min=1e-8).sort(dim=-1).values
-        aniso = (s_sorted[..., -1] / s_sorted[..., 0]).mean()
-    return {'cov_bures': bures.item(), 'cov_logeuclid': le.item(), 'aniso': aniso.item()}
-
-
 def compute_individual_losses(prediction, target):
     return {k: torch.norm(prediction[:,:,sl] - target[:,:,sl], p=2).item()
             for k, sl in PARAM_SLICES.items()}
-
-def compute_individual_losses_matched(prediction, target, chunk=2048):
-    """
-    Per-attribute reconstruction error UNDER NEAREST-NEIGHBOUR MATCHING (by position).
-
-    WHY THIS EXISTS: with Chamfer loss the model is trained to match the predicted
-    SET to the target SET, with no constraint that predicted slot i corresponds to
-    target slot i. The index-matched compute_individual_losses() therefore reports
-    garbage for position (and a misleading "looks converged" for near-constant
-    channels like opacity/scale) because it compares pred[i] to target[i] across two
-    differently-ordered sets. This version matches each predicted Gaussian to its
-    nearest target Gaussian in position (cols 0:3) and reports per-attribute norms on
-    those matched pairs, which is the meaningful per-component readout for Chamfer.
-    Diagnostic only (no grad). Direction: pred -> nearest target.
-    """
-    B = prediction.shape[0]
-    out = {k: 0.0 for k in PARAM_SLICES}
-    with torch.no_grad():
-        for b in range(B):
-            pp = prediction[b]
-            tt = target[b]
-            idx = _chunked_nn_indices(pp[:, 0:3], tt[:, 0:3], chunk)  # pred -> nearest target
-            matched_t = tt.index_select(0, idx)
-            for k, sl in PARAM_SLICES.items():
-                out[k] += torch.norm(pp[:, sl] - matched_t[:, sl], p=2).item()
-    return out
 
 def scene_semantic_kl_loss(p_hat, p_s, eps=1e-8):
     return (p_s * (torch.log(p_s + eps) - torch.log(p_hat.clamp(min=eps)))).sum(-1).mean()
@@ -645,121 +186,6 @@ parser.add_argument('--order_frame_radius', type=float, default=10.0,
          'consistent across scenes (matches the original Can3Tok HilbertSort3D). '
          '<=0 = legacy PER-SCENE min-max (each scene stretched to the grid; ordering is '
          'scene-idiosyncratic, which hurts cross-scene generalization).')
-parser.add_argument('--canonical_voxel', action='store_true', default=False,
-    help="Re-express each scene as a CANONICAL density-adaptive voxel set before training: "
-         "keep one representative (most opaque) Gaussian per occupied voxel of an "
-         "order_frame_radius-framed grid, Hilbert-ordered, padded to --num_gaussians with "
-         "zero-opacity dummies. Converts the non-identifiable raw per-Gaussian arrangement "
-         "into an identifiable target (occupied cell + small offset). Best paired with a "
-         "render-PRIMARY objective (padding is invisible to the render). Replaces opacity "
-         "sampling + reorder.")
-parser.add_argument('--voxel_res', type=int, default=64,
-    help="Canonical voxel grid resolution per axis (--canonical_voxel). Higher = more, "
-         "smaller cells = less merging, more detail, more representatives (closer to the raw "
-         "count). 64 over a [-10,10] frame ~= 0.31-unit cells. Tune so occupied voxels are "
-         "near --num_gaussians.")
-parser.add_argument('--voxel_snap', action='store_true', default=False,
-    help="With --canonical_voxel, SNAP each representative to its voxel centre (position "
-         "becomes a pure grid, fully determined by occupancy; GaussianCube-style). Off = keep "
-         "the representative's true sub-voxel position (retains fine offset).")
-# Reconstruction objective
-parser.add_argument('--use_chamfer_loss', action='store_true', default=False,
-    help='Use permutation-invariant Chamfer reconstruction loss (NN matching on '
-         'position) instead of element-wise L2. Order-free (no --morton_order '
-         'needed). Slower due to the NN search. Off by default (element-wise).')
-parser.add_argument('--chamfer_chunk', type=int, default=2048,
-    help='Chunk size for the Chamfer NN search (memory control). Lower if OOM. '
-         'Only used when --use_chamfer_loss.')
-parser.add_argument('--geom_loss', type=str, default='l2',
-    choices=['l2', 'quat_antipodal', 'bures', 'bures_codiag', 'logeuclid'],
-    help="Geometric reconstruction metric for the scale+rotation block. 'l2' "
-         "(default) keeps the current element-wise behaviour unchanged. The "
-         "others are GAUGE-INVARIANT: they compare the covariance "
-         "Sigma=R diag(s^2) R^T instead of raw (quat, scale), removing the "
-         "unlearnable quaternion double-cover / axis-permutation gauge that "
-         "stalls rotation. bures=exact 2-Wasserstein shape term; "
-         "bures_codiag=stable co-diagonalisation upper bound (recommended); "
-         "logeuclid=log-Euclidean; quat_antipodal=cheap double-cover-aware "
-         "rotation ablation. Composes orthogonally with --use_chamfer_loss "
-         "(assignment). Requires --scale_norm_mode linear.")
-parser.add_argument('--geom_eps', type=float, default=1e-6,
-    help='Isotropic regulariser added to each covariance (Sigma + eps*I) for '
-         'numerical stability of the matrix square root / log.')
-parser.add_argument('--geom_ns_iters', type=int, default=10,
-    help='Newton-Schulz iterations for the SPD matrix square root '
-         '(bures / bures_codiag). More = more accurate, slower.')
-parser.add_argument('--geom_shape_weight', type=float, default=1.0,
-    help='Multiplier on the covariance/rotation shape term relative to the '
-         'position/colour/opacity terms.')
-# ── Permutation-invariant per-block SET reconstruction loss (Sinkhorn EMD) ────
-# Replaces the slot-aligned recon loss with within-block optimal-transport
-# matching, so colour/orientation are graded as a SET (the gauge-correct target)
-# rather than per slot. Folds the gauge-invariant covariance sqrt into the OT
-# cost, so it subsumes the geom shape term (uses --color_loss_weight and
-# --geom_shape_weight as the colour/shape multipliers). Default OFF (baseline).
-parser.add_argument('--set_loss', action='store_true',
-    help='Use the permutation-invariant per-block set (Sinkhorn EMD) reconstruction '
-         'loss instead of the slot-aligned one. Targets the washed-colour / round-blob '
-         'failure, which is a within-block permutation gauge, not lost information.')
-parser.add_argument('--set_block_size', type=int, default=0,
-    help='Gaussians per token block for set matching. 0 = auto = ceil(num_gaussians/512), '
-         'i.e. the decoder fan-out g (where the gauge lives).')
-parser.add_argument('--set_pos_weight', type=float, default=1.0,
-    help='Position multiplier in the set-matching feature. Lower lets colour/shape '
-         'drive the within-block reassignment more freely.')
-parser.add_argument('--set_opa_weight', type=float, default=1.0,
-    help='Opacity multiplier in the set-matching feature.')
-parser.add_argument('--set_sinkhorn_eps', type=float, default=0.05,
-    help='Entropic regularisation for Sinkhorn (relative to per-block mean cost). '
-         'Lower = harder, more permutation-like matching (needs more iters).')
-parser.add_argument('--set_sinkhorn_iters', type=int, default=50,
-    help='Sinkhorn iterations per block.')
-parser.add_argument('--set_diag_every', type=int, default=10,
-    help='Compute the (expensive) set-matched per-component training readout every N steps '
-         'and carry it forward between (the loss still matches every step). Reduces the '
-         'redundant second Sinkhorn/step; the epoch-mean readout stays representative.')
-
-# ── Virtual-camera rendering loss (default OFF; complements the set loss) ──────
-parser.add_argument('--render_loss', action='store_true',
-    help='Add a virtual-camera rendering loss: render predicted vs GT Gaussians from the '
-         'same synthetic cameras and minimise image L1 + D-SSIM. Needs gsplat. Verify with '
-         'render_check.py first.')
-parser.add_argument('--render_loss_weight', type=float, default=0.5,
-    help='Weight of the render loss added to total_loss.')
-parser.add_argument('--render_warmup_epochs', type=int, default=0,
-    help='Only apply the render loss after this many epochs (fine-tune phase). 0 = from start.')
-parser.add_argument('--render_views', type=int, default=4,
-    help='Cameras per scene (azimuth ring).')
-parser.add_argument('--render_img', type=int, default=128,
-    help='Render resolution (square). Keep modest at 40k Gaussians.')
-parser.add_argument('--render_max_scenes', type=int, default=8,
-    help='Scenes per step to render (random subset each step; cost control). 0 = whole batch.')
-parser.add_argument('--render_ssim_weight', type=float, default=0.2,
-    help='Weight of (1 - SSIM); the L1 term has weight 1.0.')
-parser.add_argument('--render_lpips_weight', type=float, default=0.0,
-    help="Weight of the LPIPS perceptual term inside the render loss (L1 + ssim*D-SSIM "
-         "+ lpips*LPIPS). 0 = off. ~1.0 for a render-PRIMARY objective. Needs the `lpips` "
-         "package; degrades gracefully to L1+D-SSIM if its weights cannot be fetched.")
-parser.add_argument('--param_loss_weight', type=float, default=1.0,
-    help="Global multiplier on the PARAMETER-space reconstruction loss (the set/Chamfer/L2 "
-         "recon term). 1.0 = current behaviour (parameter-primary). For a render-PRIMARY "
-         "objective set this small (e.g. 0.1) and raise --render_loss_weight (e.g. 5-10) so "
-         "the gauge-invariant render signal drives the fit and parameters only regularize.")
-parser.add_argument('--render_fov', type=float, default=50.0)
-parser.add_argument('--render_dist_mult', type=float, default=2.6,
-    help='Camera distance = render_dist_mult * chunk radius.')
-parser.add_argument('--render_up_axis', type=int, default=2, choices=[0, 1, 2],
-    help='World up axis for camera elevation (match what looked correct in render_check).')
-parser.add_argument('--render_quat_order', default='wxyz', choices=['wxyz', 'xyzw'],
-    help="Quaternion order gsplat expects. Use xyzw ONLY if render_check showed scrambled "
-         "geometry with wxyz.")
-cov_grp = parser.add_mutually_exclusive_group()
-cov_grp.add_argument('--cov_metric', dest='cov_metric', action='store_true', default=True,
-    help='[DEFAULT ON] Report the gauge-invariant covariance error (mean per-Gaussian '
-         'Bures + log-Euclidean) and target anisotropy at each eval. Independent of '
-         '--geom_loss, so it enables L2-vs-Bures checkpoint comparison on one metric.')
-cov_grp.add_argument('--no_cov_metric', dest='cov_metric', action='store_false',
-    help='Disable the covariance eval metric (saves a little eval time).')
 parser.add_argument('--aug_yaw', action='store_true', default=False,
     help='Augment TRAINING scenes with a random yaw rotation about the gravity axis '
          '(positions rotate by R, each Gaussian orientation composes with R so the '
@@ -826,21 +252,6 @@ parser.add_argument('--anchor_teacher_force', action='store_true', default=False
 parser.add_argument('--offset_scale_init', type=float, default=2.0,
                     help="Initial value of the learnable global offset scale used by "
                          "--anchor_relative_decode (it adapts during training).")
-parser.add_argument('--micro_pattern',         action='store_true', default=False,
-                    help="GaussianCube-style framed canonical micro-pattern: decode "
-                         "pos = anchor + R_block.(s_block.c[slot]) + micro*tanh(resid), "
-                         "where c is a fixed unit-ball point set and (s_block,R_block) is "
-                         "a per-token frame. Requires --anchor_relative_decode and "
-                         "scaffold_mode='hilbert_block'. Retrain (not a fine-tune of the "
-                         "free-offset decoder).")
-parser.add_argument('--micro_pattern_no_rotation', action='store_true', default=False,
-                    help="Ablation: drop the per-token rotation (anisotropic scale only) "
-                         "from --micro_pattern. Default keeps rotation, needed to orient "
-                         "the flattened pattern to non-axis-aligned surfaces.")
-parser.add_argument('--micro_offset_scale',    type=float, default=0.3,
-                    help="Initial bound of the SMALL per-Gaussian residual on top of the "
-                         "framed canonical pattern (--micro_pattern). Learnable; if it "
-                         "grows large the pattern prior is not fitting the local surfaces.")
 parser.add_argument('--embed_dim',             type=int,   default=None,
                     help="Per-token latent width (capacity knob). None = use the YAML "
                          "value (32 -> latent 512*32 = 16384). The latent token count is "
@@ -848,13 +259,16 @@ parser.add_argument('--embed_dim',             type=int,   default=None,
                          "512 * embed_dim: set 64 to DOUBLE capacity to 32768 (the real "
                          "lever for the position floor). Needs a Stage-2 retrain at the new "
                          "latent size. KL scales ~linearly with this, so KL*weight grows.")
-parser.add_argument('--opacity_pos_weight',    type=float, default=0.0,
-                    help="Weight of an opacity-weighted position term added to the loss: "
-                         "sum_i o_i*|dp_i|^2 / sum_i o_i over Sinkhorn-matched pairs, "
-                         "weighted by GT opacity. Spends positional capacity on VISIBLE "
-                         "Gaussians (improves renders) rather than the aggregate Pos mean. "
-                         "Requires --set_loss. 0 = off; try ~0.05 to start.")
 parser.add_argument('--latent_disentangle',   action='store_true', default=False)
+parser.add_argument('--local_disentangle',    action='store_true', default=False,
+    help="Add a global z_s layout latent (16 tokens from the CLS) ON TOP of the local "
+         "per-token z_g, conditioning the decoder via cross-attention (the Strategy-B1 "
+         "path), with z_s KL-regularised and supervised by the scene_semantic / "
+         "scene_layout / colour heads + cross_recon + ortho. Requires --local_encoder. "
+         "Lets the local encoder/decoder run WITH latent disentanglement (previously "
+         "mutually exclusive: local_encoder forced structured_latent which forced "
+         "latent_disentangle off). z_g stays the structured per-token latent; "
+         "latent_disentangle stays off. Backward compatible: off by default.")
 parser.add_argument('--structured_latent',     action='store_true', default=False,
                     help="Per-token latent: token k of z == encoder token k == Hilbert "
                          "block k. Skips the dense kl_emb_proj_mean global remix. Overrides "
@@ -941,8 +355,7 @@ parser.add_argument('--pos_cond_heads', action='store_true',
 parser.add_argument('--pos_cond_color',     type=int,   default=1,
                     help="1=refine colour with the position head (default), 0=off.")
 parser.add_argument('--pos_cond_rotation',  type=int,   default=1,
-                    help="1=refine rotation with the position head (default), 0=off. "
-                         "Most useful with a gauge-invariant --geom_loss (bures*/logeuclid).")
+                    help="1=refine rotation with the position head (default), 0=off.")
 parser.add_argument('--pos_cond_n_freqs',   type=int,   default=32,
                     help="Number of Fourier frequency pairs for the position encoding.")
 parser.add_argument('--pos_cond_sigma',     type=float, default=6.0,
@@ -967,12 +380,6 @@ parser.add_argument('--extra_train_scenes',   type=str,   default='',
 args = parser.parse_args()
 
 # Validation of flags
-if args.geom_loss != 'l2' and args.scale_norm_mode != 'linear':
-    raise ValueError(
-        f"--geom_loss {args.geom_loss} assembles Sigma = R diag(scale^2) R^T and "
-        f"needs positive linear scale, but --scale_norm_mode is "
-        f"'{args.scale_norm_mode}'. Set --scale_norm_mode linear "
-        f"(SCALE_NORM_MODE=\"linear\" in the job).")
 if args.local_encoder:
     args.structured_latent = True
 if args.structured_latent and args.latent_disentangle:
@@ -980,11 +387,27 @@ if args.structured_latent and args.latent_disentangle:
           "cross_recon / ortho / z_s-InfoNCE auto-disable below.")
     args.latent_disentangle = False
 
+# ── LOCAL DISENTANGLEMENT (local encoder/decoder + a separate global z_s) ────
+# Adds a global layout latent z_s (16 tokens from the CLS) on top of the local
+# per-token z_g, conditioning the decoder via the B1 cross-attention path. z_s is
+# KL-regularised and supervised by the scene_semantic / scene_layout / colour heads
+# + cross_recon + ortho, so the local encoder/decoder can run WITH disentanglement
+# (previously mutually exclusive). latent_disentangle stays off (the structured
+# per-token z_g path is used); local_disentangle is the active mode and re-enables
+# cross_recon / ortho below.
+if args.local_disentangle:
+    if not args.local_encoder:
+        raise ValueError(
+            "--local_disentangle requires --local_encoder: z_s is a global layout code "
+            "added on top of the local per-token z_g produced by the local encoder. "
+            "Enable --local_encoder (LOCAL_ENCODER=\"true\" in the job).")
+    args.latent_disentangle = False   # local path: z_g is the structured per-token latent
+
 if args.decoder_zs_cross_attn and not args.latent_disentangle:
     raise ValueError("--decoder_zs_cross_attn requires --latent_disentangle")
-if args.cross_recon_weight > 0 and not args.latent_disentangle:
+if args.cross_recon_weight > 0 and not (args.latent_disentangle or args.local_disentangle):
     args.cross_recon_weight = 0.0
-if args.ortho_weight > 0 and not args.latent_disentangle:
+if args.ortho_weight > 0 and not (args.latent_disentangle or args.local_disentangle):
     args.ortho_weight = 0.0
 if args.z_s_infonce_weight > 0 and not args.latent_disentangle:
     args.z_s_infonce_weight = 0.0
@@ -995,6 +418,8 @@ _any_B = args.decoder_layout_cross_attn or args.decoder_layout_additive
 if args.zs_layout_infonce_weight > 0 and not _any_B:
     if args.latent_disentangle:
         print("[INFO] zs_layout_infonce_weight > 0 with Strategy A: routing z_s as layout tokens")
+    elif args.local_disentangle:
+        print("[INFO] zs_layout_infonce_weight > 0 with local_disentangle: z_s carries layout tokens")
     else:
         print("[WARNING] zs_layout_infonce_weight > 0 requires decoder_layout_* or latent_disentangle. Setting to 0.")
         args.zs_layout_infonce_weight = 0.0
@@ -1004,34 +429,10 @@ if args.semantic_dims % (args.embed_dim or 32) != 0:
     raise ValueError(f"--semantic_dims must be divisible by embed_dim ({args.embed_dim or 32})")
 if args.semantic_token_heads and not args.latent_disentangle:
     raise ValueError("--semantic_token_heads requires --latent_disentangle")
-if args.micro_pattern:
-    if not args.anchor_relative_decode:
-        print("[INFO] --micro_pattern requires --anchor_relative_decode. Enabling.")
-        args.anchor_relative_decode = True
-    if not args.position_scaffold:
-        print("[INFO] --micro_pattern requires --position_scaffold. Enabling.")
-        args.position_scaffold = True
-    if args.scaffold_mode != 'hilbert_block':
-        raise ValueError(
-            "--micro_pattern requires --scaffold_mode hilbert_block: the canonical "
-            "slot index (i % g) only aligns with the decoder layout and the per-token "
-            "anchor when token_ids = arange(N)//g, which is the hilbert_block scaffold. "
-            f"Got scaffold_mode='{args.scaffold_mode}'.")
-if args.opacity_pos_weight > 0 and not args.set_loss:
-    raise ValueError(
-        "--opacity_pos_weight needs --set_loss: the opacity-weighted position term "
-        "reuses the per-block Sinkhorn matching to pair predicted and target Gaussians. "
-        "Enable --set_loss, or set --opacity_pos_weight 0.")
 if args.position_layout_residual and not args.scene_layout_head:
     args.scene_layout_head = True
 if args.token_cond and 'B' in args.token_cond_approach.upper() and not args.scene_layout_head:
     args.scene_layout_head = True
-# Chamfer matches on the position columns as passed. In scaffold / layout-residual
-# modes those columns are residuals, so NN matching would be on residual coords.
-if args.use_chamfer_loss and (args.position_scaffold or args.position_layout_residual):
-    print("[WARNING] --use_chamfer_loss with position_scaffold/position_layout_residual: "
-          "Chamfer matches on residual position columns, which is likely not intended. "
-          "Use chamfer with absolute-position targets (no scaffold/residual).")
 
 if args.anchor_relative_decode and not args.position_scaffold:
     print("[INFO] --anchor_relative_decode requires --position_scaffold. Enabling.")
@@ -1062,6 +463,7 @@ if args.use_wandb and accelerator.is_main_process:
         flags = [
             (args.color_residual,             "_colorresidual"),
             (args.latent_disentangle,         f"_disent{args.semantic_dims}"),
+            (args.local_disentangle,          f"_localdisent{args.semantic_dims}"),
             (args.decoder_zs_cross_attn,      "_zsCA"),
             (args.decoder_fourier_pe,         "_fourierpe"),
             (args.scene_layout_head,          "_layout"),
@@ -1073,7 +475,6 @@ if args.use_wandb and accelerator.is_main_process:
             (args.zs_layout_infonce_weight > 0,   "_layNCE"),
             (args.zs_pool_infonce_weight > 0,      "_poolNCE"),
             (args.morton_order,               "_morton"),
-            (args.use_chamfer_loss,           "_chamfer"),
             (enable_semantic,                 f"_pgNCE{args.segment_loss_weight}"),
         ]
         for flag, label in flags:
@@ -1098,6 +499,7 @@ tag    = (f"RGB_job_{job_id}_{effective_semantic_mode}" if job_id
 flags = [
     (args.color_residual,             "_colorresidual"),
     (args.latent_disentangle,         f"_disent{args.semantic_dims}"),
+    (args.local_disentangle,          f"_localdisent{args.semantic_dims}"),
     (args.decoder_zs_cross_attn,      "_zsCA"),
     (args.decoder_fourier_pe,         "_fourierpe"),
     (args.scene_layout_head,          "_layout"),
@@ -1109,7 +511,6 @@ flags = [
     (args.zs_layout_infonce_weight > 0,   "_layNCE"),
     (args.zs_pool_infonce_weight > 0,      "_poolNCE"),
     (args.morton_order,               "_morton"),
-    (args.use_chamfer_loss,           "_chamfer"),
     (enable_semantic,                 f"_pgNCE"),
 ]
 for flag, label in flags:
@@ -1128,14 +529,14 @@ if accelerator.is_main_process:
     print(f"  decoder_zs_cross_attn={args.decoder_zs_cross_attn}")
     print(f"  color_residual={args.color_residual}")
     print(f"  latent_disentangle={args.latent_disentangle} semantic_dims={args.semantic_dims}")
+    print(f"  local_disentangle={args.local_disentangle}")
     print(f"  scene_layout_head={args.scene_layout_head}")
     print(f"  decoder_fourier_pe={args.decoder_fourier_pe}")
     print(f"  token_local_decoder={args.token_local_decoder}")
     print(f"  crop_percentile={args.crop_percentile}")
     print(f"  morton_order={args.morton_order}"
           f"{' curve='+args.order_curve.upper()+(' frame=[-%g,%g]'%(args.order_frame_radius,args.order_frame_radius) if args.order_frame_radius>0 else ' frame=per-scene') if args.morton_order else ''}")
-    print(f"  RECON OBJECTIVE = {'CHAMFER (permutation-invariant)' if args.use_chamfer_loss else 'element-wise L2'}"
-          f"{' chunk='+str(args.chamfer_chunk) if args.use_chamfer_loss else ''}")
+    print(f"  RECON OBJECTIVE = element-wise L2")
     print(f"  cross_recon={args.cross_recon_weight} ortho={args.ortho_weight}")
     print(f"  Save: {save_path}")
     print(f"{'='*70}\n")
@@ -1174,12 +575,10 @@ p.token_local_decoder     = args.token_local_decoder
 p.anchor_relative_decode  = args.anchor_relative_decode
 p.anchor_teacher_force    = args.anchor_teacher_force
 p.offset_scale_init       = args.offset_scale_init
-p.micro_pattern           = args.micro_pattern
-p.micro_pattern_rotation  = not args.micro_pattern_no_rotation
-p.micro_offset_scale      = args.micro_offset_scale
 p.structured_latent       = args.structured_latent
 p.local_encoder           = args.local_encoder
 p.local_window            = args.local_window
+p.local_disentangle       = args.local_disentangle
 p.decoder_zs_cross_attn       = args.decoder_zs_cross_attn
 p.decoder_layout_cross_attn   = args.decoder_layout_cross_attn
 p.decoder_layout_additive     = args.decoder_layout_additive
@@ -1234,7 +633,7 @@ if args.resume_checkpoint:
         ckpt.get('semantic_token_heads',  False) == args.semantic_token_heads,
         ckpt.get('token_local_decoder',  False) == args.token_local_decoder,
         ckpt.get('decoder_zs_cross_attn', False) == args.decoder_zs_cross_attn,
-        ckpt.get('micro_pattern',         False) == args.micro_pattern,
+        ckpt.get('local_disentangle',     False) == args.local_disentangle,
     ])
     if not strict:
         print(f"  Architecture changed — loading strict=False")
@@ -1312,9 +711,6 @@ _ds_kwargs = dict(
     morton_order=args.morton_order,         # Z-order reorder of selected Gaussians
     order_curve=args.order_curve,           # which space-filling curve (hilbert default)
     order_frame_radius=args.order_frame_radius,  # fixed canonical frame for the sort
-    canonical_voxel=args.canonical_voxel,   # density-adaptive voxel canonicalization
-    voxel_res=args.voxel_res,
-    voxel_snap=args.voxel_snap,
     sample_voxel_res=args.sample_voxel_res,
 )
 # NOTE: preload is intentionally NOT in _ds_kwargs. It lives in _train_only_kwargs
@@ -1588,13 +984,7 @@ if accelerator.is_main_process:
     else:
         print(f"  Val held-out chunks: N/A")
     print(f"  Gaussian order     : {(args.order_curve.upper()+' curve') if args.morton_order else 'opacity rank'}")
-    print(f"  Recon assignment   : {'CHAMFER (order-free)' if args.use_chamfer_loss else 'element-wise (slot)'}")
-    print(f"  Recon geom metric  : {args.geom_loss}"
-          + ("" if args.geom_loss == 'l2'
-             else f"  (gauge-invariant covariance; eps={args.geom_eps}, "
-                  f"ns_iters={args.geom_ns_iters}, shape_w={args.geom_shape_weight})"))
     print(f"  Yaw augmentation   : {('ON (axis=%s, +/-%.0f deg)' % (args.aug_yaw_axis, args.aug_yaw_max_deg)) if args.aug_yaw else 'off'}")
-    print(f"  Covariance metric  : {'on (Bures + log-Euclidean + anisotropy each eval)' if args.cov_metric else 'off'}")
     print(f"  Spatial crop       : {('inner %.0f%%' % args.crop_percentile) if args.crop_percentile < 100 else 'disabled'}")
     print(f"  Batches/epoch      : {_bpe}  "
           f"(batch={args.batch_size} x {accelerator.num_processes} GPUs)")
@@ -1666,12 +1056,10 @@ _ckpt_meta = {
     'anchor_relative_decode':     args.anchor_relative_decode,
     'anchor_teacher_force':       args.anchor_teacher_force,
     'offset_scale_init':          args.offset_scale_init,
-    'micro_pattern':              args.micro_pattern,
-    'micro_pattern_rotation':     (not args.micro_pattern_no_rotation),
-    'micro_offset_scale':         args.micro_offset_scale,
     'structured_latent':          args.structured_latent,
     'local_encoder':              args.local_encoder,
     'local_window':               args.local_window,
+    'local_disentangle':          args.local_disentangle,
     'num_gaussians':              args.num_gaussians,
     'pos_cond_heads':             args.pos_cond_heads,
     'pos_cond_color':             bool(args.pos_cond_color),
@@ -1703,11 +1091,6 @@ _ckpt_meta = {
     'use_canonical_norm':         args.use_canonical_norm,
     'chunk_norm_factor':          args.chunk_norm_factor,
     'scale_norm_mode':            args.scale_norm_mode,
-    'geom_loss':                  args.geom_loss,
-    'geom_eps':                   args.geom_eps,
-    'geom_ns_iters':              args.geom_ns_iters,
-    'geom_shape_weight':          args.geom_shape_weight,
-    'cov_metric':                 args.cov_metric,
     'aug_yaw':                    args.aug_yaw,
     'aug_yaw_axis':               args.aug_yaw_axis,
     'aug_yaw_max_deg':            args.aug_yaw_max_deg,
@@ -1719,8 +1102,6 @@ _ckpt_meta = {
     'morton_order':               args.morton_order,
     'order_curve':                args.order_curve,
     'order_frame_radius':         args.order_frame_radius,
-    'use_chamfer_loss':           args.use_chamfer_loss,
-    'chamfer_chunk':              args.chamfer_chunk,
 }
 
 # ============================================================================
@@ -1747,7 +1128,6 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
     _eval_autocast = _use_autocast
 
     total_l2 = total_kl = total_color = total_scene_sem = 0.0
-    total_cov_bures = total_cov_le = total_aniso = 0.0   # gauge-invariant covariance metric
     total_anchor = total_layout = total_seg = total_z_s_nce = total_zs_tok_nce = total_zs_lay_nce = 0.0
     per_param    = {k: 0.0 for k in PARAM_SLICES}
     n_scenes     = 0
@@ -1775,7 +1155,9 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
     do_z_s_vis     = (do_pca and raw_model.shape_model.z_s_infonce_head is not None)
     do_zs_tok_vis  = (do_pca and args.zs_token_infonce_weight > 0 and args.latent_disentangle)
     _any_B_eval    = args.decoder_layout_cross_attn or args.decoder_layout_additive
-    do_zs_lay_vis  = (do_pca and _any_B_eval)
+    # local_disentangle exposes z_s as last_z_layout too, so save the z_s PCA PLYs
+    # (useful thesis figures of the geometry/layout-disentangled global code).
+    do_zs_lay_vis  = (do_pca and (_any_B_eval or args.local_disentangle))
     do_zs_pool_vis = (do_pca and args.zs_pool_infonce_weight > 0)
 
     _pos_abs_min = _pos_abs_max = _pos_gt_range = 0.0
@@ -1828,27 +1210,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
                 pred_3d = UV_gs_recover.reshape(B,-1,14)
 
             pred_abs   = UV_gs_recover.reshape(B,-1,14)
-            if args.set_loss:
-                _set_g = args.set_block_size if args.set_block_size > 0 else -(-args.num_gaussians // 512)
-                recon_loss = compute_reconstruction_loss_set(
-                    pred_3d, target, B, args.color_loss_weight, args.geom_shape_weight, _set_g,
-                    args.set_pos_weight, args.set_opa_weight,
-                    args.set_sinkhorn_eps, args.set_sinkhorn_iters)
-            elif args.geom_loss == 'l2':
-                if args.use_chamfer_loss:
-                    recon_loss = chamfer_reconstruction_loss(
-                        pred_3d, target, B, args.color_loss_weight, args.chamfer_chunk)
-                else:
-                    recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
-            else:
-                if args.use_chamfer_loss:
-                    recon_loss = chamfer_reconstruction_loss_geom(
-                        pred_3d, target, B, args.color_loss_weight, args.geom_loss,
-                        args.chamfer_chunk, args.geom_eps, args.geom_ns_iters, args.geom_shape_weight)
-                else:
-                    recon_loss = compute_reconstruction_loss_geom(
-                        pred_3d, target, B, args.color_loss_weight, args.geom_loss,
-                        args.geom_eps, args.geom_ns_iters, args.geom_shape_weight)
+            recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
             kl_loss    = -0.5*torch.sum(1+log_var - mu.pow(2) - log_var.exp(), dim=1)
 
             if mcp is not None and args.color_residual:
@@ -1898,29 +1260,8 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
                 _pos_abs_max  = pred_abs[:,:,0:3].cpu().float().max().item()
                 _pos_gt_range = (UV_gs_batch[:,:,4:7].cpu().max()-UV_gs_batch[:,:,4:7].cpu().min()).item()/2
 
-            # Under Chamfer the set is permutation-free, so index-matched per-component
-            # error is meaningless; match by position first. Element-wise keeps slot order.
-            if args.set_loss:
-                _set_g = args.set_block_size if args.set_block_size > 0 else -(-args.num_gaussians // 512)
-                ind = set_matched_individual_losses(
-                    pred_3d, target, _set_g, args.color_loss_weight, args.geom_shape_weight,
-                    args.set_pos_weight, args.set_opa_weight, args.set_sinkhorn_eps, args.set_sinkhorn_iters)
-            elif args.use_chamfer_loss:
-                ind = compute_individual_losses_matched(pred_3d, target, args.chamfer_chunk)
-            else:
-                ind = compute_individual_losses(pred_3d, target)
+            ind = compute_individual_losses(pred_3d, target)
             for k in per_param: per_param[k] += ind[k]
-
-            if args.cov_metric:
-                try:
-                    _cov = compute_covariance_diagnostics(
-                        pred_3d, target, args.use_chamfer_loss, args.chamfer_chunk,
-                        args.geom_eps, args.geom_ns_iters)
-                    total_cov_bures += _cov['cov_bures']
-                    total_cov_le    += _cov['cov_logeuclid']
-                    total_aniso     += _cov['aniso']
-                except Exception as _cov_err:
-                    print(f"  [cov_metric skipped this eval: {type(_cov_err).__name__}: {_cov_err}]")
 
             if do_recon and len(recon_preds) < args.recon_ply_num_scenes:
                 pnp = pred_abs.cpu().float().numpy(); mnp = mean_color_gt.cpu().numpy()
@@ -2064,9 +1405,6 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
         # avg_l2_error and per-attribute losses: RAW norm per batch, averaged over
         # batches (NOT per scene) — same convention as the training-side printout.
         'avg_l2_error':       total_l2 / _nb,
-        'cov_bures':          total_cov_bures / _nb,
-        'cov_logeuclid':      total_cov_le / _nb,
-        'aniso':              total_aniso / _nb,
         'avg_kl':             total_kl / n,
         'color_pred_loss':    total_color / n,
         'scene_semantic_kl':  total_scene_sem / n,
@@ -2153,8 +1491,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         'zs_tok_nce','zs_tok_ncats',
         'zs_lay_nce','zs_lay_ncats',
         'zs_pool_nce','zs_pool_ncats',
-        'pos','col','opa','scl','rot','shape','render','opos']}
-    _ind_cache = {k: 0.0 for k in ('position','color','opacity','scale','rotation','shape')}
+        'pos','col','opa','scl','rot']}
 
     for i_batch, batch_data in enumerate(trainDataLoader):
         UV_gs_batch   = batch_data['features'].float().to(device)
@@ -2216,54 +1553,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             target  = target_abs
             pred_3d = UV_gs_recover.reshape(B,-1,14)
 
-        opacity_pos_loss = torch.tensor(0., device=device)
-        if args.set_loss:
-            _set_g = args.set_block_size if args.set_block_size > 0 else -(-args.num_gaussians // 512)
-            if args.opacity_pos_weight > 0:
-                recon_loss, opacity_pos_loss = compute_reconstruction_loss_set(
-                    pred_3d, target, B, args.color_loss_weight, args.geom_shape_weight, _set_g,
-                    args.set_pos_weight, args.set_opa_weight,
-                    args.set_sinkhorn_eps, args.set_sinkhorn_iters, return_opos=True)
-            else:
-                recon_loss = compute_reconstruction_loss_set(
-                    pred_3d, target, B, args.color_loss_weight, args.geom_shape_weight, _set_g,
-                    args.set_pos_weight, args.set_opa_weight,
-                    args.set_sinkhorn_eps, args.set_sinkhorn_iters)
-        elif args.geom_loss == 'l2':
-            if args.use_chamfer_loss:
-                recon_loss = chamfer_reconstruction_loss(
-                    pred_3d, target, B, args.color_loss_weight, args.chamfer_chunk)
-            else:
-                recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
-        else:
-            if args.use_chamfer_loss:
-                recon_loss = chamfer_reconstruction_loss_geom(
-                    pred_3d, target, B, args.color_loss_weight, args.geom_loss,
-                    args.chamfer_chunk, args.geom_eps, args.geom_ns_iters, args.geom_shape_weight)
-            else:
-                recon_loss = compute_reconstruction_loss_geom(
-                    pred_3d, target, B, args.color_loss_weight, args.geom_loss,
-                    args.geom_eps, args.geom_ns_iters, args.geom_shape_weight)
-
-        # Virtual-camera rendering loss (image-space crispness signal). Rendered in
-        # fp32 outside autocast; the gradient flows back through the cast into the
-        # (possibly bf16) model. Off unless --render_loss; gated by a warmup so it
-        # can be switched on as a fine-tune phase after the set loss has converged.
-        render_loss = torch.tensor(0., device=device)
-        if args.render_loss and epoch >= args.render_warmup_epochs:
-            if compute_render_loss is None:
-                raise RuntimeError(
-                    f"--render_loss set but render_loss could not be imported: "
-                    f"{_RENDER_LOSS_IMPORT_ERROR}. Ensure render_loss.py is on the path "
-                    f"and gsplat is installed.")
-            with torch.amp.autocast('cuda', enabled=False):
-                render_loss = compute_render_loss(
-                    pred_3d.float(), target.float(), mean_color_gt.float(),
-                    num_ring=args.render_views, img_size=args.render_img,
-                    fov_deg=args.render_fov, ssim_weight=args.render_ssim_weight,
-                    lpips_weight=args.render_lpips_weight,
-                    max_scenes=args.render_max_scenes, up_axis=args.render_up_axis,
-                    dist_mult=args.render_dist_mult, quat_order=args.render_quat_order)
+        recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
 
         log_var_clamped = log_var.clamp(-10.0, 10.0)
         KL_loss     = -0.5*torch.sum(1+log_var_clamped-mu.pow(2)-log_var_clamped.exp(), dim=1).mean()
@@ -2357,7 +1647,32 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                     'zs_pool_num_cats':     _pool_metrics.get('num_categories_in_batch', 0)}
 
         cross_recon_loss = torch.tensor(0., device=device)
-        if (args.latent_disentangle and args.cross_recon_weight > 0
+        if (args.local_disentangle and args.cross_recon_weight > 0
+                and _mu_s is not None and _mu_g is not None and B > 1):
+            # Local-disentangle cross-recon: keep z_g (geometry, the 512 local tokens)
+            # = the CURRENT scene, swap z_s (the global layout latent) across the batch,
+            # decode, and grade GEOMETRY against the current scene. Geometry should be
+            # invariant under a z_s swap -> forces z_s to carry layout/semantics only,
+            # not geometry. Positions are ABSOLUTE (anchor_relative_decode), so the
+            # target is the absolute geometry and NO scaffold subtraction is needed.
+            D_s        = args.semantic_dims
+            z_g_cur    = _mu_g + torch.exp(0.5 * log_var[:, D_s:]) * torch.randn_like(_mu_g)
+            mu_s_shift = torch.roll(_mu_s, shifts=1, dims=0)
+            lv_s_shift = torch.roll(log_var[:, :D_s], shifts=1, dims=0)
+            z_s_swap   = mu_s_shift + torch.exp(0.5 * lv_s_shift) * torch.randn_like(mu_s_shift)
+            _ed_ld     = raw_model.shape_model.embed_dim
+            _nzs_ld    = raw_model.shape_model._n_zs_tokens
+            lat_seq    = z_g_cur.reshape(B, 512, _ed_ld)            # decoder sequence = z_g (current)
+            z_s_swap_t = z_s_swap.reshape(B, _nzs_ld, _ed_ld)       # swapped z_s as cross-attn K/V
+            se_cur     = raw_model.shape_model._shape_embed_cache
+            with torch.autocast('cuda', dtype=_autocast_dtype, enabled=_use_autocast):
+                UV_cross, _ = raw_model.shape_model.decode(
+                    lat_seq, volume_queries=None, return_semantic_features=False,
+                    shape_embed=se_cur, scaffold_anchors=sa_gpu, scaffold_token_ids=sti_gpu,
+                    z_layout=z_s_swap_t)
+            pred_cross_3d    = UV_cross.reshape(B, -1, 14)
+            cross_recon_loss = compute_cross_recon_loss(pred_cross_3d, target, B)
+        elif (args.latent_disentangle and args.cross_recon_weight > 0
                 and _mu_s is not None and _mu_g is not None and B > 1):
             D_s = args.semantic_dims
             mu_s_shifted = torch.roll(_mu_s, shifts=1, dims=0)
@@ -2426,7 +1741,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                 raw_model.shape_model.last_scene_layout_pred = slp
 
         ortho_loss = torch.tensor(0., device=device)
-        if (args.latent_disentangle and args.ortho_weight > 0
+        if ((args.latent_disentangle or args.local_disentangle) and args.ortho_weight > 0
                 and _mu_s is not None and _mu_g is not None and B > 1):
             ortho_loss = compute_orthogonality_loss(_mu_s, _mu_g)
 
@@ -2435,9 +1750,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             scale_pen = compute_scale_penalty(UV_gs_recover.reshape(B,-1,14),
                                               threshold=args.scale_penalty_threshold)
 
-        total_loss = (args.param_loss_weight  * recon_loss
-                      + args.render_loss_weight    * render_loss
-                      + args.opacity_pos_weight    * opacity_pos_loss
+        total_loss = (recon_loss
                       + _kl_current                * KL_loss
                       + args.mean_color_weight       * color_pred_loss
                       + args.scene_semantic_weight   * scene_sem_loss
@@ -2458,25 +1771,9 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         optimizer.step()
         scheduler.step()
 
-        # Per-component readout: matched-by-position under Chamfer (the set is
-        # permutation-free), index-matched for element-wise (slot order is enforced).
-        if args.set_loss:
-            # Set matching needs a Sinkhorn; compute the readout on a stride and carry it
-            # forward (the loss still matches every step). Removes a redundant 2nd match/step.
-            if i_batch == 0 or (global_step % max(args.set_diag_every, 1) == 0):
-                _set_g = args.set_block_size if args.set_block_size > 0 else -(-args.num_gaussians // 512)
-                _ind_cache = set_matched_individual_losses(
-                    pred_3d, target, _set_g, args.color_loss_weight, args.geom_shape_weight,
-                    args.set_pos_weight, args.set_opa_weight, args.set_sinkhorn_eps, args.set_sinkhorn_iters)
-            ind = _ind_cache
-        elif args.use_chamfer_loss:
-            ind = compute_individual_losses_matched(pred_3d, target, args.chamfer_chunk)
-        else:
-            ind = compute_individual_losses(pred_3d, target)
+        ind = compute_individual_losses(pred_3d, target)
         e['loss']       += total_loss.item()
         e['recon']      += recon_loss.item()
-        e['render']     += float(render_loss)
-        e['opos']       += float(opacity_pos_loss)
         e['kl']         += KL_loss.item()
         e['sem']        += semantic_loss.item()
         e['color_pred'] += color_pred_loss.item()
@@ -2498,24 +1795,13 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         e['pos'] += ind['position']; e['col'] += ind['color']
         e['opa'] += ind['opacity'];  e['scl'] += ind['scale']
         e['rot'] += ind['rotation']
-        # Covariance shape term backed out of Recon so it is visible in the log.
-        # Recon*B = pos + color_weight*col + opa + shape, and Pos/Col/Opa here are the
-        # same norms the loss used (exact for element-wise; approximate under Chamfer,
-        # whose matched pairs differ from the index-matched diagnostics).
-        if args.set_loss:
-            e['shape'] += ind['shape']          # set-matched covariance (meaningful)
-        elif args.geom_loss != 'l2':
-            e['shape'] += (recon_loss.item() * B
-                           - ind['position'] - args.color_loss_weight * ind['color']
-                           - ind['opacity'])
 
         if epoch == start_epoch and i_batch == 0 and accelerator.is_main_process:
             print(f"\nEPOCH {epoch} BATCH 0 DIAGNOSTIC:")
             print(f"  recon={recon_loss.item():.4f} | KL={KL_loss.item():.4f} | "
                   f"kl_weight={_kl_current:.2e} | KL_contrib={_kl_current*KL_loss.item():.4f} | "
                   f"mu=[{mu.min().item():.3f},{mu.max().item():.3f}]")
-            print(f"  recon objective: {'CHAMFER' if args.use_chamfer_loss else 'element-wise'} | "
-                  f"morton_order={args.morton_order}")
+            print(f"  recon objective: element-wise L2 | morton_order={args.morton_order}")
             if _kl_anneal_active:
                 _pct = min(100.0, 100.0 * global_step / args.kl_anneal_steps)
                 print(f"  KL annealing: step {global_step}/{args.kl_anneal_steps} "
@@ -2554,10 +1840,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
               f"PgNCE={e['sem']/nb:.4f} | "
               f"LR={lr_now:.2e}")
         print(f"  Pos={e['pos']/nb:.3f} | Col={e['col']/nb:.3f} | "
-              f"Opa={e['opa']/nb:.3f} | Scl={e['scl']/nb:.3f} | Rot={e['rot']/nb:.3f}"
-              + (f" | Shape={e['shape']/nb:.3f}" if args.geom_loss != 'l2' else "")
-              + (f" | Render={e['render']/nb:.4f}" if args.render_loss else "")
-              + (f" | OPos={e['opos']/nb:.2f}" if args.opacity_pos_weight > 0 else ""))
+              f"Opa={e['opa']/nb:.3f} | Scl={e['scl']/nb:.3f} | Rot={e['rot']/nb:.3f}")
 
     # EVALUATION
     if epoch % args.eval_every == 0 or epoch == args.num_epochs - 1:
@@ -2573,10 +1856,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                   f"Opa={val_metrics['opacity_loss']:.4f}  "
                   f"Scl={val_metrics['scale_loss']:.4f}  "
                   f"Rot={val_metrics['rotation_loss']:.4f}")
-            if args.cov_metric:
-                print(f"  CovBures={val_metrics['cov_bures']:.5f}  "
-                      f"CovLogE={val_metrics['cov_logeuclid']:.5f}  "
-                      f"Aniso={val_metrics['aniso']:.2f}  (gauge-invariant; raw Rot is gauge-blind)")
             if args.color_residual:
                 print(f"  ColorPredMSE={val_metrics['color_pred_loss']:.6f}")
             if args.scene_semantic_head:
@@ -2606,10 +1885,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                       f"Opa={chunk_metrics['opacity_loss']:.4f}  "
                       f"Scl={chunk_metrics['scale_loss']:.4f}  "
                       f"Rot={chunk_metrics['rotation_loss']:.4f}")
-                if args.cov_metric:
-                    print(f"  CovBures={chunk_metrics['cov_bures']:.5f}  "
-                          f"CovLogE={chunk_metrics['cov_logeuclid']:.5f}  "
-                          f"Aniso={chunk_metrics['aniso']:.2f}  (gauge-invariant)")
                 if chunk_metrics['avg_l2_error'] > 1e-6:
                     _gap = val_metrics['avg_l2_error'] / chunk_metrics['avg_l2_error']
                     print(f"  DISTRIBUTION GAP  full_L2 / chunk_L2 = {_gap:.2f}x  "
@@ -2637,16 +1912,9 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                 'val_full_pos': val_metrics['position_loss'],
                 'val_full_col': val_metrics['color_loss'],
             }
-            if args.cov_metric:
-                log_dict['val_full_cov_bures']     = val_metrics['cov_bures']
-                log_dict['val_full_cov_logeuclid'] = val_metrics['cov_logeuclid']
-                log_dict['val_full_aniso']         = val_metrics['aniso']
             if chunk_metrics is not None:
                 log_dict['val_chunk_l2']  = chunk_metrics['avg_l2_error']
                 log_dict['val_chunk_pos'] = chunk_metrics['position_loss']
-                if args.cov_metric:
-                    log_dict['val_chunk_cov_bures']     = chunk_metrics['cov_bures']
-                    log_dict['val_chunk_cov_logeuclid'] = chunk_metrics['cov_logeuclid']
                 if chunk_metrics['avg_l2_error'] > 1e-6:
                     log_dict['val_dist_gap'] = (val_metrics['avg_l2_error']
                                                 / chunk_metrics['avg_l2_error'])

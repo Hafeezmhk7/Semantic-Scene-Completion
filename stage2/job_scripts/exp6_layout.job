@@ -1,0 +1,29 @@
+#!/bin/bash
+#SBATCH --job-name=exp6_layout
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=2
+#SBATCH --time=13:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=120G
+#SBATCH --output=log_ss2/exp6_layout_%j.out
+#SBATCH --error=log_ss2/exp6_layout_%j.err
+
+# exp6 full local-disentangle (split) | generation stage 2a: z_s
+echo "Job $SLURM_JOB_ID | $(date)"
+# Find stage2_env.sh whether you sbatch from job_scripts OR from the repo root.
+for _c in "./stage2_env.sh" "${SLURM_SUBMIT_DIR}/stage2_env.sh" \
+          "${SLURM_SUBMIT_DIR}/stage2/job_scripts/stage2_env.sh" \
+          "${SLURM_SUBMIT_DIR}/job_scripts/stage2_env.sh"; do
+    if [ -f "$_c" ]; then source "$_c"; _ENV_OK=1; break; fi
+done
+[ -n "${_ENV_OK:-}" ] || { echo "ERROR: stage2_env.sh not found. cd to stage2/job_scripts and resubmit."; exit 1; }
+
+RUN_TAG="exp6"          # e.g. exp1
+STAGE="layout"
+STAGE1_CKPT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage1/RGB_job_23978168_hidden_colorresidual_localdisent512_fourierpe_layout_morton_pgNCE_chunks_inferencefixed/best_model.pth"
+NUM_EPOCHS=500
+MODEL_SIZE="B"
+ROPE_TYPE="learned_ape"
+BATCH_SIZE=90
+run_stage2_train

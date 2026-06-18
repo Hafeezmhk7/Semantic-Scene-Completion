@@ -11,6 +11,13 @@ DECODER STRATEGIES (controlled by flags, all backward-compatible):
   C  baseline (no flags)
   D  decoder_zs_cross_attn=True [FAILED — kept for reference]
 
+  LD local_disentangle=True (NEW) — local encoder/decoder (structured per-token
+     z_g, 512 tokens) PLUS a separate global layout latent z_s (16 tokens from the
+     CLS), KL-regularised and conditioning the decoder through the B1 cross-attention
+     path. z_s is supervised by the scene_semantic / scene_layout / colour heads +
+     cross_recon + ortho. Requires local_encoder; lets the local encoder run WITH
+     latent disentanglement (previously mutually exclusive). Backward compatible.
+
 CHANGE vs original: get_decoder_transformer_features() added between encode() and decode()
 for use by Stage 2 Latent Perceptual Loss (LPL).
 See train_stage2.py --lpl_weight flag.
@@ -290,97 +297,6 @@ class AnchorPredFromTokens(nn.Module):
 
 
 # ============================================================================
-# GAUSSIANCUBE-STYLE FRAMED MICRO-PATTERN  (scene-level structured residual)
-# ============================================================================
-# GaussianCube (Zhang et al., NeurIPS 2024) gets crisp geometry by snapping
-# Gaussians onto a DENSE regular voxel grid via optimal transport, so position is
-# essentially a grid index (structurally free) plus a small offset. A dense grid
-# is the wrong primitive for SCENES (surfaces are ~2D in a 3D volume, so a dense
-# grid is mostly empty and the bijection drags Gaussians far off-surface). The
-# portable part of the idea is narrow and real: position = structural reference +
-# SMALL residual, so the latent never spends bits on coarse placement.
-#
-# Here the structural reference is, per latent token, a FIXED canonical point set
-# (a low-discrepancy ball, free / shared / no bits) carried by a learned per-token
-# FRAME — an anisotropic scale + rotation predicted from the latent — so the
-# canonical ball can be flattened and oriented to the local surface patch. The
-# decoder then only has to predict a small per-Gaussian residual. This is the
-# sparse, scene-adaptive analogue of GaussianCube's grid, and it sits on top of
-# the existing anchor-relative decode (anchor = block centre, already ~free).
-#
-# Alignment (the reason this is exact, not approximate): in scaffold_mode=
-# 'hilbert_block' the dataset sets token_ids = arange(N) // g (a FIXED array), which
-# is precisely the TokenLocalDecoder's own layout (Gaussian i -> token i//g, slot
-# i%g). So the anchor a Gaussian receives, the decoder slot that produced it, and
-# the canonical-pattern slot c[i%g] all index the same token consistently. The
-# micro-pattern therefore REQUIRES hilbert_block (guarded in the training script).
-
-def _fibonacci_ball(n):
-    """`n` deterministic low-discrepancy points in the unit ball — the canonical
-    per-token micro-pattern (the scene-level stand-in for GaussianCube's voxel
-    grid). Fibonacci-sphere directions on radius cbrt(i/n) shells fill the ball
-    ~uniformly. Returned as float32 [n, 3]."""
-    i = torch.arange(n, dtype=torch.float64) + 0.5
-    golden = math.pi * (3.0 - math.sqrt(5.0))           # golden angle
-    z = 1.0 - 2.0 * i / n                               # in (-1, 1)
-    r = torch.sqrt(torch.clamp(1.0 - z * z, min=0.0))
-    theta = golden * i
-    dirs = torch.stack([r * torch.cos(theta), r * torch.sin(theta), z], dim=-1)
-    radii = (i / n) ** (1.0 / 3.0)                      # ~uniform ball density
-    return (dirs * radii.unsqueeze(-1)).to(torch.float32)   # [n, 3]
-
-
-def _rot6d_to_matrix(r6):
-    """Zhou et al. (CVPR 2019) continuous 6D rotation rep -> [..., 3, 3] rotation
-    matrix via Gram-Schmidt. r6[..., 0:3] and r6[..., 3:6] are the first two
-    (un-orthonormalised) columns; identity rep is [1,0,0, 0,1,0]."""
-    a1 = r6[..., 0:3]
-    a2 = r6[..., 3:6]
-    b1 = F.normalize(a1, dim=-1, eps=1e-8)
-    a2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
-    b2 = F.normalize(a2, dim=-1, eps=1e-8)
-    b3 = torch.cross(b1, b2, dim=-1)
-    return torch.stack([b1, b2, b3], dim=-1)            # columns (b1,b2,b3)
-
-
-class BlockFramePredFromTokens(nn.Module):
-    """Per-token local FRAME for the canonical micro-pattern: an anisotropic scale
-    (3) and, optionally, a 6D rotation (6) per latent token, predicted from the
-    transformer tokens. Lets each token's fixed canonical ball be flattened (one
-    small scale) and oriented to the local surface, so the decoder predicts only a
-    small residual. Deterministic function of the latent (Stage-2 compatible),
-    exactly like AnchorPredFromTokens. Inits to scale=scale_init, rotation=identity
-    so the first forward is a benign ~isotropic ball of the right size."""
-    def __init__(self, width=384, num_tokens=512, use_rotation=True, scale_init=0.5):
-        super().__init__()
-        self.num_tokens   = num_tokens
-        self.use_rotation = use_rotation
-        self.trunk = nn.Sequential(
-            nn.Linear(width, 128), nn.LayerNorm(128), nn.ReLU(),
-            nn.Linear(128, 64),   nn.LayerNorm(64),  nn.ReLU())
-        self.log_scale_head = nn.Linear(64, 3)
-        nn.init.zeros_(self.log_scale_head.weight)
-        nn.init.constant_(self.log_scale_head.bias, float(math.log(scale_init)))
-        if use_rotation:
-            self.rot6_head = nn.Linear(64, 6)
-            nn.init.zeros_(self.rot6_head.weight)
-            with torch.no_grad():
-                self.rot6_head.bias.copy_(torch.tensor([1., 0., 0., 0., 1., 0.]))
-        else:
-            self.rot6_head = None
-        print(f"[BlockFramePredFromTokens] [B,{num_tokens},{width}] -> scale[B,{num_tokens},3]"
-              f"{' + rot6' if use_rotation else ''} | scale_init={scale_init} | "
-              f"{sum(p.numel() for p in self.parameters()):,} params")
-
-    def forward(self, transformer_tokens):
-        B, T, W = transformer_tokens.shape
-        h = self.trunk(transformer_tokens.reshape(B * T, W))
-        s = self.log_scale_head(h).exp().reshape(B, T, 3)          # [B,T,3] > 0
-        R = (_rot6d_to_matrix(self.rot6_head(h)).reshape(B, T, 3, 3)
-             if self.rot6_head is not None else None)
-        return s, R
-
-
 _N_GAUSSIANS  = 10_000
 FIXED_TOKEN_IDS_512 = torch.arange(_N_GAUSSIANS) * 512 // _N_GAUSSIANS
 FIXED_TOKEN_IDS_496 = torch.arange(_N_GAUSSIANS) * 496 // _N_GAUSSIANS
@@ -874,9 +790,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  structured_latent=False,
                  local_encoder=False,
                  local_window=1,
-                 micro_pattern=False,
-                 micro_pattern_rotation=True,
-                 micro_offset_scale=0.3):
+                 local_disentangle=False):
 
         super().__init__(
             device=device, dtype=dtype, num_latents=1 + num_latents,
@@ -919,6 +833,13 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.structured_latent = structured_latent
         self.local_encoder     = local_encoder
         self.local_window      = int(local_window)
+        # ── LOCAL DISENTANGLE (structured local z_g + separate global z_s) ──────
+        # local_disentangle adds a SEPARATE global layout latent z_s (from the CLS)
+        # on top of the structured local per-token z_g, conditioning the decoder via
+        # the B1 cross-attention path. It is independent of latent_disentangle (which
+        # stays off on the structured path); z_g remains the 512 local tokens.
+        self.local_disentangle = local_disentangle
+        self._z_s_latent       = None
         if structured_latent and latent_disentangle:
             print("  [INFO] structured_latent/local_encoder: forcing latent_disentangle=False")
             latent_disentangle      = False
@@ -952,11 +873,13 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         print(f"  decoder_zs_cross_attn    = {decoder_zs_cross_attn}  (Strategy D)")
         print(f"  decoder_layout_cross_attn= {decoder_layout_cross_attn}  (Strategy B1)")
         print(f"  decoder_layout_additive  = {decoder_layout_additive}  (Strategy B2)")
-        _strat = ("A" if latent_disentangle and not decoder_zs_cross_attn
+        print(f"  local_disentangle        = {local_disentangle}  (Strategy LD)")
+        _strat = ("LD (local z_g 512 + global z_s, cross-attn)" if local_disentangle
+                  else ("A" if latent_disentangle and not decoder_zs_cross_attn
                   else ("B1+B2" if decoder_layout_cross_attn and decoder_layout_additive
                   else ("B1" if decoder_layout_cross_attn
                   else ("B2" if decoder_layout_additive
-                  else ("D" if decoder_zs_cross_attn else "C (baseline)")))))
+                  else ("D" if decoder_zs_cross_attn else "C (baseline)"))))))
         print(f"  Active strategy: {_strat}")
         print(f"  semantic_mode={semantic_mode} | color_residual={color_residual}")
         print(f"  latent_disentangle={latent_disentangle}  semantic_dims={semantic_dims}")
@@ -1028,8 +951,11 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.lay_semantic_head = None
         self.lay_layout_head   = None
 
+        # Layout-token heads read z_s. Built for Strategy B (decoder_layout_*) AND for
+        # local_disentangle (where z_s comes from mu_s_proj, see below). For
+        # local_disentangle the routing in forward() reads self.last_z_layout (= z_s).
         _any_B_flag = decoder_layout_cross_attn or decoder_layout_additive
-        if _any_B_flag:
+        if _any_B_flag or local_disentangle:
             if color_residual:
                 self.lay_color_head = MeanColorHead(in_dim=_lay_color_in)
             if scene_semantic_head:
@@ -1039,16 +965,26 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
 
         self._mu_s_cache = None
         self._mu_g_cache = None
-        if latent_disentangle:
+        # mu_s_proj produces the global z_s for BOTH latent_disentangle (Strategy A,
+        # z_s carved from the dense remix) and local_disentangle (z_s a separate
+        # KL-regularised latent from the CLS, on top of the local per-token z_g). The
+        # global geometry remix (kl_emb_proj_*_g) is built for latent_disentangle ONLY:
+        # local_disentangle keeps the structured per-token z_g and does not remix it.
+        if latent_disentangle or local_disentangle:
             assert embed_dim > 0 and semantic_dims % embed_dim == 0
-            geom_dims = 64 * 64 * 4 - semantic_dims
-            assert geom_dims > 0
             self.mu_s_proj_mean     = nn.Linear(width, semantic_dims)
             self.mu_s_proj_var      = nn.Linear(width, semantic_dims)
+        if latent_disentangle:
+            geom_dims = 64 * 64 * 4 - semantic_dims
+            assert geom_dims > 0
             kl_in = (1 + num_latents - 1) * embed_dim
             self.kl_emb_proj_mean_g = nn.Linear(kl_in, geom_dims)
             self.kl_emb_proj_var_g  = nn.Linear(kl_in, geom_dims)
             print(f"  DISENTANGLE: mu_s[{semantic_dims}] | mu_g[{geom_dims}]")
+        if local_disentangle:
+            print(f"  LOCAL-DISENTANGLE: z_g = {_Z_TOKENS} local tokens (decoder sequence) | "
+                  f"z_s = {self._n_zs_tokens} global tokens from CLS (cross-attn K/V), "
+                  f"KL-regularised")
 
         self.z_s_infonce_head      = None
         self.last_z_s_infonce_proj = None
@@ -1096,39 +1032,6 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                   f"{offset_scale_init:.2f}*tanh(offset) | "
                   f"teacher_force={anchor_teacher_force} | learnable offset_scale")
 
-        # ── GAUSSIANCUBE-STYLE FRAMED MICRO-PATTERN ─────────────────────────────
-        # On top of the anchor-relative decode, replace the free within-block
-        # offset with: framed canonical point set + SMALL residual, i.e.
-        #     pos = anchor + R_block · (s_block · c[slot]) + micro_scale·tanh(resid)
-        # c is a fixed unit-ball point set (no bits); (s_block, R_block) is the
-        # per-token frame from BlockFramePredFromTokens; resid reuses the decoder's
-        # position output, now bounded SMALL. Requires anchor_relative_decode (for
-        # the per-token anchor + the raw-offset slot) and hilbert_block ids.
-        self.micro_pattern          = micro_pattern
-        self.micro_pattern_rotation = micro_pattern_rotation
-        self.block_frame_pred       = None
-        self.log_micro_offset_scale = None
-        if micro_pattern:
-            if not anchor_relative_decode:
-                raise ValueError(
-                    "micro_pattern=True requires anchor_relative_decode=True (it "
-                    "provides the per-token anchor and the raw-offset slot).")
-            _mp_ntok = self._n_zg_tokens if decoder_zs_cross_attn else _Z_TOKENS
-            _mp_g    = -(-_N_GAUSSIANS // _mp_ntok)      # ceil(N / n_tokens) = g/token
-            # register_buffer must NOT be preceded by a plain `self.canonical_pattern`
-            # attribute (PyTorch raises "attribute already exists"), so it is only set
-            # here (buffer) or in the else branch (None).
-            self.register_buffer("canonical_pattern",
-                                 _fibonacci_ball(_mp_g), persistent=False)   # [g,3]
-            self.block_frame_pred = BlockFramePredFromTokens(
-                width=width, num_tokens=_mp_ntok, use_rotation=micro_pattern_rotation)
-            self.log_micro_offset_scale = nn.Parameter(
-                torch.tensor(float(math.log(micro_offset_scale))))
-            print(f"  [MICRO-PATTERN] pos = anchor + "
-                  f"R_block·(s_block·c[{_mp_g}]) + {micro_offset_scale:.2f}*tanh(resid)"
-                  f" | rotation={micro_pattern_rotation} | learnable residual scale")
-        else:
-            self.canonical_pattern = None
 
         self.zs_cond_decoder = None
         self.post_kl_g       = None
@@ -1157,18 +1060,29 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.last_z_layout_pool_proj   = None
         self.last_z_layout_pool_hidden = None
 
+        # z_s InfoNCE / pool heads: Strategy B (z_s from layout_projector) OR
+        # local_disentangle (z_s from mu_s_proj). The deterministic layout_projector
+        # is built for Strategy B ONLY; under local_disentangle z_s is the KL-regularised
+        # latent produced in encode(), not a deterministic projection of shape_embed.
         _any_B = decoder_layout_cross_attn or decoder_layout_additive
-        if _any_B:
-            self.layout_projector = Layout16Projector(
-                in_dim=width, n_tokens=self._n_zs_tokens, token_dim=embed_dim)
+        if _any_B or local_disentangle:
             _lay_flat = self._n_zs_tokens * embed_dim
             self.z_layout_infonce_head = SemanticTokenInfoNCEHead(
                 in_dim=_lay_flat, proj_dim=128)
             self.z_layout_pool_head = ZSTokenPoolProjectHead(
                 n_tokens=self._n_zs_tokens, token_dim=embed_dim)
+        if _any_B:
+            self.layout_projector = Layout16Projector(
+                in_dim=width, n_tokens=self._n_zs_tokens, token_dim=embed_dim)
             print(f"  [Strategy B] Layout16Projector + InfoNCE heads active")
+        if local_disentangle:
+            print(f"  [Local-Disentangle] z_s InfoNCE/pool heads active (z_s from mu_s_proj)")
 
-        if decoder_layout_cross_attn:
+        # B1 cross-attention decoder: Strategy B1 OR local_disentangle. Both route the
+        # 512-token geometry sequence through zs_cond_decoder_B with z_s (16 tokens) as
+        # cross-attention K/V, keeping the 512-token anchor head / FIXED_TOKEN_IDS_512 /
+        # scaffold all consistent (unlike Strategy D's 496-token path).
+        if decoder_layout_cross_attn or local_disentangle:
             self.post_kl_layout = nn.Linear(embed_dim, width)
             nn.init.trunc_normal_(self.post_kl_layout.weight, std=0.02)
             self.zs_cond_decoder_B = ZSCondTransformerDecoder(
@@ -1176,7 +1090,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             self.GS_decoder_B = GS_decoder(
                 3, 1024, num_tokens=_Z_TOKENS, width=width,
                 color_residual=color_residual)
-            print(f"  [Strategy B1] cross-attn: 512 geom + z_layout K/V per layer")
+            print(f"  [{'Strategy B1' if decoder_layout_cross_attn else 'Local-Disentangle'}]"
+                  f" cross-attn decoder: {_Z_TOKENS} geom + z_layout K/V per layer")
 
         if decoder_layout_additive:
             self.layout_additive_cond = LayoutAdditiveConditioner(
@@ -1248,8 +1163,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         # semantic-feature pipeline both work unchanged.
         #
         # GS_decoder instances that may exist at this point:
-        #   - self.GS_decoder       (512 tokens) → Strategy A / B / C paths
-        #   - self.GS_decoder_B     (512 tokens) → Strategy B1 path
+        #   - self.GS_decoder       (512 tokens) → Strategy A / B / C / LD paths
+        #   - self.GS_decoder_B     (512 tokens) → Strategy B1 / LD path
         #   - self.GS_decoder_new   (_n_zg_tokens) → Strategy D path
         # Only the relevant decoder is actually used per forward, but consistent
         # replacement keeps checkpoint compatibility simple.
@@ -1304,12 +1219,29 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             posterior = DiagonalGaussianDistribution(moments, feat_dim=-1)
             z_tok     = posterior.sample() if sample_posterior else posterior.mode()  # [B,K,embed_dim]
             mean, logvar = moments.chunk(2, dim=-1)              # each [B, K, embed_dim]
-            self._mu_s_cache = None
-            self._mu_g_cache = None
-            Bsz     = z_tok.shape[0]
-            mu      = mean.reshape(Bsz, -1)                      # [B, K*embed_dim]
-            log_var = logvar.reshape(Bsz, -1)
-            z       = z_tok.reshape(Bsz, -1)
+            Bsz       = z_tok.shape[0]
+            mu_g      = mean.reshape(Bsz, -1)                    # [B, K*embed_dim]  (z_g mean)
+            log_var_g = logvar.reshape(Bsz, -1)
+            z         = z_tok.reshape(Bsz, -1)                   # decoder sequence = local z_g (512 tokens)
+            if self.local_disentangle:
+                # Add a SEPARATE global layout latent z_s from the CLS/shape embedding,
+                # KL-regularised alongside z_g. z_g (the 512 local tokens) stays the
+                # decoder sequence unchanged; z_s is carried via self._z_s_latent and
+                # conditions the decoder through cross-attention (Strategy B1 path).
+                mu_s      = self.mu_s_proj_mean(shape_embed)     # [B, semantic_dims]
+                log_var_s = self.mu_s_proj_var(shape_embed)
+                z_s       = mu_s + torch.exp(0.5 * log_var_s) * torch.randn_like(mu_s)
+                self._z_s_latent = z_s.reshape(Bsz, self._n_zs_tokens, self.embed_dim)  # [B,16,32]
+                self._mu_s_cache = mu_s
+                self._mu_g_cache = mu_g
+                mu      = torch.cat([mu_s, mu_g],           dim=-1)   # KL spans z_s + z_g
+                log_var = torch.cat([log_var_s, log_var_g], dim=-1)
+            else:
+                self._z_s_latent = None
+                self._mu_s_cache = None
+                self._mu_g_cache = None
+                mu      = mu_g
+                log_var = log_var_g
             return shape_embed, mu, log_var, z, posterior
 
         kl_embed, posterior     = self.encode_kl_embed(latents, sample_posterior)
@@ -1336,75 +1268,24 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
     # =========================================================================
     # LATENT PERCEPTUAL LOSS — DECODER TRANSFORMER FEATURE EXTRACTOR
     # =========================================================================
-    #
     # Reference: Berrada et al., NeurIPS 2024 — arXiv:2411.04873
     #   "Boosting Latent Diffusion with Perceptual Objectives"
-    #
-    # Problem (Autoencoder-Diffusion Disconnect):
-    #   Stage 2 flow matching generates z_g tokens whose DISTRIBUTION matches
-    #   the encoder aggregate posterior (KL converges ~epoch 1400). However each
-    #   generated z_g_gen is ~211 units from the nearest encoder z_g_clean in
-    #   R^{15872}. The 777M GS_decoder was trained exclusively on encoder outputs
-    #   and extrapolates poorly for off-manifold Stage 2 inputs → blurry Gaussians.
-    #
-    # Solution (LPL):
-    #   Include the frozen decoder transformer in Stage 2 training objective.
-    #   Each geometry DiT step, after predicting v_pred:
-    #
-    #     z_g_est   = x_t + (1-t) * v_pred                   [B, 496, 32]
-    #     Z_est     = cat([z_s_clean, z_g_est],   dim=1)      [B, 512, 32]
-    #     Z_clean   = cat([z_s_clean, z_g_clean], dim=1)      [B, 512, 32]
-    #     feat_gen  = get_decoder_transformer_features(Z_est)   [B, 512, 384]
-    #     feat_clean= get_decoder_transformer_features(Z_clean) [B, 512, 384]  # no_grad
-    #     L_LPL     = MSE(feat_gen, feat_clean)
-    #     L_total   = L_flow + lpl_weight * L_LPL
-    #
-    # Feature level: transformer output H_out [B, 512, 384]
-    #   — BEFORE the 777M GS_decoder MLP
-    #   — only 21M transformer in backward path (~3.3GB extra activation memory)
-    #   — captures decoder's spatial per-token understanding of the scene
-    #
-    # Gradient: L_LPL → H_out_gen → Z_est → z_g_est → v_pred → DiT parameters
-    #   Stage 1 decoder weights: requires_grad=False → NEVER updated.
-    #
-    # Enable in Stage 2: --lpl_weight 0.01  (default 0.0 = disabled)
+    # Returns the decoder transformer output H_out (before the GS_decoder MLP) so
+    # Stage 2 can match generated vs clean latents in decoder feature space. Mirrors
+    # the decode() branch selection for every strategy (incl. local_disentangle).
 
     def get_decoder_transformer_features(self, latents, z_layout=None):
         """
         Return decoder transformer output H_out for Latent Perceptual Loss.
-
-        Runs the Stage 1 decoder forward pass up to and including the 12-layer
-        self-attention transformer, stopping BEFORE the 777M GS_decoder MLP.
-
-        Exactly mirrors the corresponding branch of decode() for all strategies.
-        Verified line-by-line against the actual decode() source code.
-
-        Parameters
-        ----------
-        latents  : Z [B, 512, 32]  full latent (z_s and z_g concatenated)
-        z_layout : [B, 16, 32]     Strategy B1/B2/B3 only; pass None for A and D
-
-        Returns
-        -------
-        H_out : [B, 512, 384]  (Strategy A / B)   decoder transformer output
-                [B, 496, 384]  (Strategy D)        cross-attn decoder output
-
-        Gradient flow
-        -------------
-        Do NOT use torch.no_grad() for the generated latent Z_est — gradients
-        must flow: L_LPL → feat_gen → Z_est → z_g_est → v_pred → DiT params.
-
-        DO use torch.no_grad() for the clean reference:
-            with torch.no_grad():
-                feat_clean = shape_model.get_decoder_transformer_features(Z_clean)
-
-        Stage 1 decoder parameters (requires_grad=False) are NEVER updated.
+        latents  : Z [B, 512, 32]  full latent sequence (z_g for the structured path)
+        z_layout : [B, 16, 32]     Strategy B1/B2/B3 or local_disentangle; None for A/D
         """
         B = latents.shape[0]
-        _any_B = (self.decoder_layout_cross_attn or self.decoder_layout_additive)
+        _any_B = (self.decoder_layout_cross_attn or self.decoder_layout_additive
+                  or self.local_disentangle)
 
         if _any_B and z_layout is not None:
-            # ── Strategy B1 / B2 / B3 ────────────────────────────────────────
+            # ── Strategy B1 / B2 / B3 / local_disentangle ────────────────────
             # Exact mirror of decode() _any_B branch:
             H = self.post_kl(latents)                               # [B, 512, 384]
             if self.decoder_layout_additive and self.layout_additive_cond is not None:
@@ -1414,7 +1295,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 H = H + self.decoder_fourier_pe_module(B, H.device)
             elif self.decoder_pos_emb is not None:
                 H = H + self.decoder_pos_emb.unsqueeze(0)
-            if self.decoder_layout_cross_attn and self.zs_cond_decoder_B is not None:
+            if (self.decoder_layout_cross_attn or self.local_disentangle) and self.zs_cond_decoder_B is not None:
                 H_lay = self.post_kl_layout(z_layout)               # [B, 16, 384]
                 return self.zs_cond_decoder_B(H, H_lay)             # [B, 512, 384]
             else:
@@ -1422,7 +1303,6 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
 
         elif self.decoder_zs_cross_attn:
             # ── Strategy D ───────────────────────────────────────────────────
-            # Exact mirror of decode() decoder_zs_cross_attn branch:
             n_s = self._n_zs_tokens                                 # 16
             H_g = self.post_kl_g(latents[:, n_s:, :])              # [B, 496, 384]
             H_s = self.post_kl_s(latents[:, :n_s, :])              # [B,  16, 384]
@@ -1432,10 +1312,6 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
 
         else:
             # ── Strategy A  (primary LPL use case) ───────────────────────────
-            # Exact mirror of decode() legacy/else branch.
-            # token_cond_adaln is always False for Stage 2 because load_stage1()
-            # sets p.token_cond=False → self.token_cond_adaln_flag=False,
-            # so the branch always falls through to self.transformer(H).
             H = self.post_kl(latents)                               # [B, 512, 384]
             if self.decoder_fourier_pe_flag and self.decoder_fourier_pe_module is not None:
                 H = H + self.decoder_fourier_pe_module(B, H.device)
@@ -1450,7 +1326,10 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                z_layout=None):
         B = latents.shape[0]
 
-        _any_B = (self.decoder_layout_cross_attn or self.decoder_layout_additive)
+        # _any_B includes local_disentangle: its decoder sequence is the 512 local
+        # z_g tokens and z_s is passed on z_layout (cross-attn K/V), exactly like B1.
+        _any_B = (self.decoder_layout_cross_attn or self.decoder_layout_additive
+                  or self.local_disentangle)
         if _any_B and z_layout is not None:
             H = self.post_kl(latents)
             if self.decoder_layout_additive and self.layout_additive_cond is not None:
@@ -1460,7 +1339,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 H = H + self.decoder_fourier_pe_module(B, H.device)
             elif self.decoder_pos_emb is not None:
                 H = H + self.decoder_pos_emb.unsqueeze(0)
-            if self.decoder_layout_cross_attn and self.zs_cond_decoder_B is not None:
+            if (self.decoder_layout_cross_attn or self.local_disentangle) and self.zs_cond_decoder_B is not None:
                 H_lay = self.post_kl_layout(z_layout)
                 H     = self.zs_cond_decoder_B(H, H_lay)
             else:
@@ -1478,7 +1357,10 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                                self.semantic_distribution_head])
             need_hidden = return_semantic_features and has_sem
             latents_flat = H_out.reshape(B, -1)
-            gs_dec = self.GS_decoder_B if (self.decoder_layout_cross_attn and self.GS_decoder_B is not None) else self.GS_decoder
+            gs_dec = (self.GS_decoder_B
+                      if ((self.decoder_layout_cross_attn or self.local_disentangle)
+                          and self.GS_decoder_B is not None)
+                      else self.GS_decoder)
             if need_hidden:
                 reconstruction, hidden = gs_dec(latents_flat, return_hidden=True)
             else:
@@ -1560,17 +1442,6 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         if self.anchor_relative_decode and pred_anchors is not None:
             # ── Anchor-relative LOCAL decoding (Scaffold-GS style) ──────────────
             #     pos = anchor[token] + offset_scale * tanh(raw_offset)
-            # raw_offset is the decoder's raw position output (pred_3d[...,0:3]).
-            # The offset is BOUNDED, so the anchor carries the coarse position.
-            # Anchor source:
-            #   - teacher-forced GT block centroids (diagnostic upper bound) when
-            #     anchor_teacher_force and scaffold_anchors is provided; isolates
-            #     the decoder from the encoder's ability to predict anchors.
-            #   - else the per-token PREDICTED anchors (Stage-2-compatible: they are
-            #     a deterministic function of the latent, so the Stage-2 DiT that
-            #     generates the latent also controls them).
-            # The OUTPUT is absolute positions, so the training recon loss uses the
-            # absolute target (see --anchor_relative_decode branch in gs_can3tok_2).
             pred_3d = reconstruction.reshape(B, _N_GAUSSIANS, 14)
             raw_off = pred_3d[:, :, 0:3]
             if self.anchor_teacher_force:
@@ -1587,34 +1458,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             else:
                 anchor_pg = anchor_src[:, _fixed_ids.to(anchor_src.device), :]
             pred_3d = pred_3d.clone()
-            if self.micro_pattern and self.block_frame_pred is not None:
-                # ── Framed canonical micro-pattern + small residual ─────────────
-                #     pos = anchor + R_block·(s_block·c[slot]) + micro·tanh(resid)
-                # Frame is per latent token; gather it by the SAME token map as the
-                # anchor. Canonical slot = i % g aligns with the decoder's layout
-                # (hilbert_block: token = i // g). raw_off is the decoder's position
-                # output, here used as the SMALL residual.
-                s_tok, R_tok = self.block_frame_pred(H_out)         # [B,T,3], [B,T,3,3]|None
-                if scaffold_token_ids is not None:
-                    sid = scaffold_token_ids.long()                 # [B,N]
-                else:
-                    sid = _fixed_ids.to(raw_off.device).unsqueeze(0).expand(B, -1)
-                s_pg = torch.gather(s_tok, 1, sid.unsqueeze(-1).expand(-1, -1, 3))
-                g_pt = self.canonical_pattern.shape[0]
-                slot = torch.arange(_N_GAUSSIANS, device=raw_off.device) % g_pt
-                c_pg = self.canonical_pattern.to(raw_off.dtype)[slot].unsqueeze(0).expand(B, -1, -1)
-                framed = s_pg * c_pg                                # anisotropic scale
-                if R_tok is not None:
-                    R_pg = torch.gather(
-                        R_tok.reshape(B, R_tok.shape[1], 9), 1,
-                        sid.unsqueeze(-1).expand(-1, -1, 9)
-                    ).reshape(B, _N_GAUSSIANS, 3, 3)
-                    framed = torch.einsum('bnij,bnj->bni', R_pg, framed)   # orient to surface
-                micro = self.log_micro_offset_scale.exp()
-                pred_3d[:, :, 0:3] = anchor_pg + framed + micro * torch.tanh(raw_off)
-            else:
-                scale = self.log_offset_scale.exp()
-                pred_3d[:, :, 0:3] = anchor_pg + scale * torch.tanh(raw_off)
+            scale = self.log_offset_scale.exp()
+            pred_3d[:, :, 0:3] = anchor_pg + scale * torch.tanh(raw_off)
             reconstruction = pred_3d.reshape(B, -1)
 
         elif pred_anchors is not None:
@@ -1676,27 +1521,53 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             self.last_zs_pool_proj, self.last_zs_pool_hidden = \
                 self.zs_pool_proj_head(_z_s_toks)
 
-        self.last_z_layout      = None
-        self.last_z_layout_proj = None
+        self.last_z_layout             = None
+        self.last_z_layout_proj        = None
+        self.last_z_layout_pool_proj   = None
+        self.last_z_layout_pool_hidden = None
         _any_B = self.decoder_layout_cross_attn or self.decoder_layout_additive
         if _any_B and self.layout_projector is not None:
+            # Strategy B: z_s is a deterministic projection of the shape embedding.
             self.last_z_layout = self.layout_projector(_se)
+        elif self.local_disentangle:
+            # local_disentangle: z_s is the KL-regularised global latent from encode().
+            self.last_z_layout = self._z_s_latent
+        if self.last_z_layout is not None:
             if self.z_layout_infonce_head is not None:
                 z_lay_flat = self.last_z_layout.reshape(z.shape[0], -1)
                 self.last_z_layout_proj = self.z_layout_infonce_head(z_lay_flat)
-            self.last_z_layout_pool_proj   = None
-            self.last_z_layout_pool_hidden = None
             if self.z_layout_pool_head is not None:
                 self.last_z_layout_pool_proj, self.last_z_layout_pool_hidden = \
                     self.z_layout_pool_head(self.last_z_layout)
 
-        if (not _any_B and self.latent_disentangle
+        if (not _any_B and not self.local_disentangle and self.latent_disentangle
                 and self.z_s_infonce_head is not None):
             self.last_z_layout_proj = self.last_z_s_infonce_proj
 
         _lay_src = self.last_z_layout
 
-        if self.semantic_token_heads_flag or self.structured_layout_tokens_flag:
+        if self.local_disentangle and _lay_src is not None:
+            # Heads read z_s (= last_z_layout), NOT z (which is the geometry z_g).
+            # With structured_layout_tokens: token0=colour, 1..8=semantic, 9..15=layout
+            # (mirrors the Strategy-B head wiring); else a flat block over tokens 1..15.
+            B_cur = z.shape[0]
+            self.last_mean_color_pred = (
+                self.lay_color_head(_lay_src[:, 0, :]) if self.lay_color_head else None)
+            if self.structured_layout_tokens_flag:
+                _n_s  = self._n_sem_tokens
+                z_sem = _lay_src[:, 1 : 1+_n_s, :].reshape(B_cur, -1)
+                z_lay = _lay_src[:, 1+_n_s : , :].reshape(B_cur, -1)
+                self.last_scene_semantic_pred = (
+                    self.lay_semantic_head(z_sem) if self.lay_semantic_head else None)
+                self.last_scene_layout_pred = (
+                    self.lay_layout_head(z_lay) if self.lay_layout_head else None)
+            else:
+                _lay_all = _lay_src[:, 1:, :].reshape(B_cur, -1)
+                self.last_scene_semantic_pred = (
+                    self.lay_semantic_head(_lay_all) if self.lay_semantic_head else None)
+                self.last_scene_layout_pred = (
+                    self.lay_layout_head(_lay_all) if self.lay_layout_head else None)
+        elif self.semantic_token_heads_flag or self.structured_layout_tokens_flag:
             _ed = self.embed_dim
             _sd = self.semantic_dims
             self.last_mean_color_pred = (
@@ -1748,7 +1619,7 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
             scaffold_token_ids=scaffold_token_ids,
             z_layout=self.last_z_layout)
 
-        if not self.semantic_token_heads_flag and not _any_B:
+        if not self.semantic_token_heads_flag and not _any_B and not self.local_disentangle:
             self.last_mean_color_pred = (
                 self.mean_color_head(_se) if self.mean_color_head else None)
             self.last_scene_semantic_pred = (
