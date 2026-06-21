@@ -1,0 +1,28 @@
+#!/bin/bash
+#SBATCH --job-name=exp6_sample_gen
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=02:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=60G
+#SBATCH --output=log_ss2/exp6_sample_gen_%j.out
+#SBATCH --error=log_ss2/exp6_sample_gen_%j.err
+
+# exp6 split generation (set LAYOUT_CKPT, GEOMETRY_CKPT)
+echo "Job $SLURM_JOB_ID | $(date)"
+# Find stage2_env.sh whether you sbatch from job_scripts OR from the repo root.
+for _c in "./stage2_env.sh" "${SLURM_SUBMIT_DIR}/stage2_env.sh" \
+          "${SLURM_SUBMIT_DIR}/stage2/job_scripts/stage2_env.sh" \
+          "${SLURM_SUBMIT_DIR}/job_scripts/stage2_env.sh"; do
+    if [ -f "$_c" ]; then source "$_c"; _ENV_OK=1; break; fi
+done
+[ -n "${_ENV_OK:-}" ] || { echo "ERROR: stage2_env.sh not found. cd to stage2/job_scripts and resubmit."; exit 1; }
+
+OBJECTIVE="generation"
+STAGE1_CKPT="/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage1/RGB_job_23978168_hidden_colorresidual_localdisent512_fourierpe_layout_morton_pgNCE_chunks_inferencefixed/best_model.pth"
+LAYOUT_CKPT="/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion]/checkpoints_stage2/stage2_exp6_layout_B_learned_ape_23999059/best_model.pth"
+GEOMETRY_CKPT="/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion]/checkpoints_stage2/stage2_exp6_geometry_B_learned_ape_24004893/best_model.pth"
+NUM_SAMPLES=8
+OUTPUT_DIR="./gen_exp6"
+run_stage2_sample

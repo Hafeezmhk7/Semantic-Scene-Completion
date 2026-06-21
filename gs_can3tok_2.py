@@ -1,12 +1,12 @@
 """
-Can3Tok Training — MAIN NEW IDEA: decoder_zs_cross_attn
+Can3Tok Training -- MAIN NEW IDEA: decoder_zs_cross_attn
 =========================================================
 DATASET MODES (--train_data):
-  "chunks"   — train_grid1.0cm_chunk8x8_stride6x6/ (default, 3888 chunks)
+  "chunks"   -- train_grid1.0cm_chunk8x8_stride6x6/ (default, 3888 chunks)
                Requires norm_factor.npy (run precompute_norm_from_chunks.py)
                Normalization: GLOBAL scene frame via norm_factor.npy
-  "full"     — train/ (800 full scenes, per-scene normalization)
-  "combined" — both sources concatenated (4688 total)
+  "full"     -- train/ (800 full scenes, per-scene normalization)
+  "combined" -- both sources concatenated (4688 total)
   Validation always uses val/ (held-out full scenes).
 
 RECONSTRUCTION OBJECTIVE:
@@ -50,7 +50,7 @@ from pca_feature_visualization import visualize_semantic_features, visualize_z_s
 try:
     from pca_feature_visualization import visualize_zs_tokens
 except ImportError:
-    print("[WARNING] visualize_zs_tokens not found — z_s token PCA disabled.")
+    print("[WARNING] visualize_zs_tokens not found -- z_s token PCA disabled.")
     def visualize_zs_tokens(*args, **kwargs):
         return None
 from gs_ply_reconstructor import save_reconstructed_gaussians
@@ -78,12 +78,30 @@ GEO_ONLY_SLICES = {
 # ============================================================================
 # LOSS HELPERS
 # ============================================================================
-def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0):
+def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0, valid_mask=None):
+    """Element-wise L2 recon loss. valid_mask: optional [B,N] tensor; when given
+    (canonical_voxel padding case), padding slots (mask==0) are zeroed in BOTH
+    prediction and target before the norm so only real Gaussians are graded. None =
+    original behaviour (every slot counted)."""
+    if valid_mask is not None:
+        m = valid_mask.unsqueeze(-1).to(prediction.dtype)   # [B,N,1] broadcast over 14 attrs
+        prediction = prediction * m
+        target     = target * m
     if color_weight == 1.0:
         return torch.norm(prediction - target, p=2) / batch_size
     return (torch.norm(prediction[:,:,0:3] - target[:,:,0:3], p=2)
           + torch.norm(prediction[:,:,3:6] - target[:,:,3:6], p=2) * color_weight
           + torch.norm(prediction[:,:,6:]  - target[:,:,6:],  p=2)) / batch_size
+
+
+def _masked_individual_losses(prediction, target, valid_mask=None):
+    """Per-attribute raw norms, optionally masking padding slots (canonical_voxel)."""
+    if valid_mask is not None:
+        m = valid_mask.unsqueeze(-1).to(prediction.dtype)
+        prediction = prediction * m
+        target     = target * m
+    return {k: torch.norm(prediction[:,:,sl] - target[:,:,sl], p=2).item()
+            for k, sl in PARAM_SLICES.items()}
 
 
 def compute_individual_losses(prediction, target):
@@ -347,6 +365,23 @@ parser.add_argument('--num_gaussians',        type=int,   default=10000,
                          "decoder/encoder Gaussian count together (kept consistent). The "
                          "latent stays 512 tokens; only g=ceil(num_gaussians/512) per token "
                          "scales. Default 10000 reproduces prior runs.")
+# ── CANONICAL VOXEL RE-EXPRESSION (gauge-removal experiment) ──────────────────
+parser.add_argument('--canonical_voxel', action='store_true', default=False,
+    help="Re-express each scene as one representative Gaussian per occupied voxel on "
+         "a fixed canonical grid (canonical_voxel_merge), Hilbert-ordered, padded to "
+         "num_gaussians with zero-opacity dummies. Position becomes (occupied cell -> "
+         "centre)+bounded residual, an IDENTIFIABLE target, removing the per-Gaussian "
+         "placement gauge that collapses scale/rotation to isotropic blobs under raw "
+         "regression. Replaces opacity sampling + reorder. The recon loss masks the "
+         "padding slots via valid_mask so only real Gaussians are graded.")
+parser.add_argument('--voxel_res', type=int, default=64,
+    help="Grid resolution R for canonical_voxel_merge (R^3 cells over [-frame,frame]). "
+         "Higher R = finer canonicalization, more occupied voxels (less padding), but "
+         "smaller per-cell residual. 64 is a sane start for ~40k targets.")
+parser.add_argument('--voxel_snap', action='store_true', default=False,
+    help="Snap canonical positions fully to voxel centres (position becomes purely "
+         "which-cell-is-occupied, zero residual). Off = keep the representative "
+         "Gaussian's real position (cell + small residual). Off is the gentler test.")
 # Position-conditioned per-Gaussian colour/rotation refinement heads (off by default).
 parser.add_argument('--pos_cond_heads', action='store_true',
                     help="Enable Fourier position-conditioned refinement of per-Gaussian "
@@ -387,7 +422,7 @@ if args.structured_latent and args.latent_disentangle:
           "cross_recon / ortho / z_s-InfoNCE auto-disable below.")
     args.latent_disentangle = False
 
-# ── LOCAL DISENTANGLEMENT (local encoder/decoder + a separate global z_s) ────
+# -- LOCAL DISENTANGLEMENT (local encoder/decoder + a separate global z_s) ----
 # Adds a global layout latent z_s (16 tokens from the CLS) on top of the local
 # per-token z_g, conditioning the decoder via the B1 cross-attention path. z_s is
 # KL-regularised and supervised by the scene_semantic / scene_layout / colour heads
@@ -517,7 +552,7 @@ for flag, label in flags:
     if flag: tag += label
 tag += f"_{args.train_data}_inferencefixed"
 
-save_path = f"/home/yli11/scratch-project/Hafeez_thesis/Can3Tok/checkpoints_stage1/{tag}/"
+save_path = f"/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/checkpoints_stage1/{tag}/"
 os.makedirs(save_path, exist_ok=True)
 
 # ============================================================================
@@ -525,7 +560,7 @@ os.makedirs(save_path, exist_ok=True)
 # ============================================================================
 if accelerator.is_main_process:
     print(f"\n{'='*70}")
-    print(f"CAN3TOK — train_data='{args.train_data}'")
+    print(f"CAN3TOK -- train_data='{args.train_data}'")
     print(f"  decoder_zs_cross_attn={args.decoder_zs_cross_attn}")
     print(f"  color_residual={args.color_residual}")
     print(f"  latent_disentangle={args.latent_disentangle} semantic_dims={args.semantic_dims}")
@@ -537,6 +572,9 @@ if accelerator.is_main_process:
     print(f"  morton_order={args.morton_order}"
           f"{' curve='+args.order_curve.upper()+(' frame=[-%g,%g]'%(args.order_frame_radius,args.order_frame_radius) if args.order_frame_radius>0 else ' frame=per-scene') if args.morton_order else ''}")
     print(f"  RECON OBJECTIVE = element-wise L2")
+    if args.canonical_voxel:
+        print(f"  CANONICAL VOXEL : ON  R={args.voxel_res}  snap={args.voxel_snap}  "
+              f"(gauge-removal: one rep Gaussian/occupied voxel, padding masked in loss)")
     print(f"  cross_recon={args.cross_recon_weight} ortho={args.ortho_weight}")
     print(f"  Save: {save_path}")
     print(f"{'='*70}\n")
@@ -636,14 +674,14 @@ if args.resume_checkpoint:
         ckpt.get('local_disentangle',     False) == args.local_disentangle,
     ])
     if not strict:
-        print(f"  Architecture changed — loading strict=False")
+        print(f"  Architecture changed -- loading strict=False")
     gs_autoencoder.load_state_dict(ckpt['model_state_dict'], strict=strict)
     if 'optimizer_state_dict' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         print("  Loaded optimizer state from checkpoint.")
     else:
         print("  [WARN] checkpoint has no 'optimizer_state_dict' (this is a best/model-only "
-              "checkpoint, e.g. best_model.pth) — starting with a FRESH optimizer. This is "
+              "checkpoint, e.g. best_model.pth) -- starting with a FRESH optimizer. This is "
               "expected and fine for fine-tuning (e.g. switching on the render loss); the "
               "Adam moments will rebuild within a few steps.")
     start_epoch   = ckpt.get('epoch', 0) + 1
@@ -712,6 +750,9 @@ _ds_kwargs = dict(
     order_curve=args.order_curve,           # which space-filling curve (hilbert default)
     order_frame_radius=args.order_frame_radius,  # fixed canonical frame for the sort
     sample_voxel_res=args.sample_voxel_res,
+    canonical_voxel=args.canonical_voxel,   # gauge-removal: one rep Gaussian per occupied voxel
+    voxel_res=args.voxel_res,               # canonical grid resolution R
+    voxel_snap=args.voxel_snap,             # snap to cell centres vs keep rep position
 )
 # NOTE: preload is intentionally NOT in _ds_kwargs. It lives in _train_only_kwargs
 # (so the big train/extra sets honor --no_preload for memory), while the val and
@@ -755,7 +796,7 @@ else:  # combined
     gs_dataset_train = Data.ConcatDataset([_ds_full, _ds_chunk])
     _n_train_chunks  = len(_ds_chunk)
 
-# Val full scenes (PRIMARY — thesis target)
+# Val full scenes (PRIMARY -- thesis target)
 if accelerator.is_main_process:
     print(f"\n--- Validation Dataset: val/ (held-out full scenes) ---")
 gs_dataset_val = gs_dataset(
@@ -790,11 +831,11 @@ if args.train_data in ('chunks', 'combined') and _n_train_chunks > 0:
             **_ds_kwargs)
         if len(gs_dataset_val_chunk) > 0:
             _has_chunk_val = True
-            # ── HARD DISJOINTNESS GUARANTEE ──────────────────────────────────────
+            # -- HARD DISJOINTNESS GUARANTEE ---------------------------------------
             # Training chunks and held-out val chunks must never overlap. Overlap
             # occurs when --random_subset_seed is set: training then samples a RANDOM
             # train_scenes out of all chunks, while val skips the first train_scenes
-            # SORTED — so the skipped range is mostly inside the random training set.
+            # SORTED -- so the skipped range is mostly inside the random training set.
             # Reject it loudly rather than report a contaminated chunk metric.
             _train_chunk_dirs = set(
                 gs_dataset_train.scene_dirs if args.train_data == 'chunks'
@@ -810,17 +851,17 @@ if args.train_data in ('chunks', 'combined') and _n_train_chunks > 0:
                     f"the first {args.train_scenes} SORTED chunks, so they overlap.\n"
                     f"Fix:   unset --random_subset_seed (set RANDOM_SUBSET_SEED=\"\" in the "
                     f"job). Training then takes the first {args.train_scenes} sorted chunks "
-                    f"and val takes the remaining {len(gs_dataset_val_chunk)} — disjoint by "
+                    f"and val takes the remaining {len(gs_dataset_val_chunk)} -- disjoint by "
                     f"construction.\n{'!'*70}")
             if accelerator.is_main_process:
                 print(f"  Clean chunk split verified: {len(_train_chunk_dirs)} train / "
-                      f"{len(gs_dataset_val_chunk)} val chunks, 0 overlap ✓")
+                      f"{len(gs_dataset_val_chunk)} val chunks, 0 overlap [OK]")
         else:
             if accelerator.is_main_process:
                 print(f"  [INFO] No held-out chunks available. Chunk val disabled.")
             gs_dataset_val_chunk = None
     except _ChunkSplitError:
-        raise  # contamination is fatal — never disable-and-continue on a dirty split
+        raise  # contamination is fatal -- never disable-and-continue on a dirty split
     except Exception as e:
         if accelerator.is_main_process:
             print(f"  [WARNING] Could not create held-out chunk val dataset: {e}")
@@ -928,10 +969,10 @@ if accelerator.is_main_process:
         nf_ok  = sum(1 for d in dirs[:sample]
                      if os.path.exists(os.path.join(d, 'norm_factor.npy')))
         if expected_present:
-            status = ('ALL PRESENT — global frame' if nf_ok == sample
-                      else f'MISSING in {sample-nf_ok}/{sample} — position WILL NOT converge!')
+            status = ('ALL PRESENT -- global frame' if nf_ok == sample
+                      else f'MISSING in {sample-nf_ok}/{sample} -- position WILL NOT converge!')
         else:
-            status = ('ABSENT — per-scene fallback (correct for full scenes)'
+            status = ('ABSENT -- per-scene fallback (correct for full scenes)'
                       if nf_ok == 0 else f'present in {nf_ok}/{sample} (unusual but OK)')
         print(f"  {label:<30s}: {nf_ok}/{sample}  {status}")
         if expected_present and nf_ok >= 2:
@@ -976,7 +1017,7 @@ if accelerator.is_main_process:
                   f"(semantics disabled)")
     else:
         print(f"  Training scenes    : {_n_train_main}")
-    print(f"  Val full scenes    : {n_val}  (PRIMARY — thesis target)")
+    print(f"  Val full scenes    : {n_val}  (PRIMARY -- thesis target)")
     if _has_chunk_val:
         print(f"  Val held-out chunks: {len(gs_dataset_val_chunk)}  "
               f"(CLEAN split: first {_n_train_chunks} sorted = train, "
@@ -1027,7 +1068,7 @@ if accelerator.is_main_process:
                   f"|  SM {props.major}.{props.minor}  "
                   f"|  {props.multi_processor_count} SMs")
     else:
-        print(f"  CUDA not available — running on CPU")
+        print(f"  CUDA not available -- running on CPU")
     print(f"  Mixed precision : {_mp}")
     print(f"  Autocast dtype  : {_autocast_dtype}")
     print(f"  Autocast enabled: {_use_autocast}")
@@ -1102,6 +1143,9 @@ _ckpt_meta = {
     'morton_order':               args.morton_order,
     'order_curve':                args.order_curve,
     'order_frame_radius':         args.order_frame_radius,
+    'canonical_voxel':            args.canonical_voxel,
+    'voxel_res':                  args.voxel_res,
+    'voxel_snap':                 args.voxel_snap,
 }
 
 # ============================================================================
@@ -1173,6 +1217,8 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
                        if need_scaffold_data else None)
             sti_gpu = (batch_data['scaffold_token_ids'].long().to(device)
                        if args.position_scaffold else None)
+            vmask_gpu = (batch_data['valid_mask'].float().to(device)
+                         if args.canonical_voxel else None)
 
             _rsf = True if do_sem_pca else None
 
@@ -1210,7 +1256,8 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
                 pred_3d = UV_gs_recover.reshape(B,-1,14)
 
             pred_abs   = UV_gs_recover.reshape(B,-1,14)
-            recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
+            recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight,
+                                                     valid_mask=vmask_gpu)
             kl_loss    = -0.5*torch.sum(1+log_var - mu.pow(2) - log_var.exp(), dim=1)
 
             if mcp is not None and args.color_residual:
@@ -1260,7 +1307,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
                 _pos_abs_max  = pred_abs[:,:,0:3].cpu().float().max().item()
                 _pos_gt_range = (UV_gs_batch[:,:,4:7].cpu().max()-UV_gs_batch[:,:,4:7].cpu().min()).item()/2
 
-            ind = compute_individual_losses(pred_3d, target)
+            ind = _masked_individual_losses(pred_3d, target, valid_mask=vmask_gpu)
             for k in per_param: per_param[k] += ind[k]
 
             if do_recon and len(recon_preds) < args.recon_ply_num_scenes:
@@ -1403,7 +1450,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
     _nb = max(n_batches, 1)     # for raw recon / per-attribute norms (matches training)
     return {
         # avg_l2_error and per-attribute losses: RAW norm per batch, averaged over
-        # batches (NOT per scene) — same convention as the training-side printout.
+        # batches (NOT per scene) -- same convention as the training-side printout.
         'avg_l2_error':       total_l2 / _nb,
         'avg_kl':             total_kl / n,
         'color_pred_loss':    total_color / n,
@@ -1510,6 +1557,11 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         sa_gpu  = (batch_data['scaffold_anchors'].float().to(device) if need_scaffold_data else None)
         sti_gpu = (batch_data['scaffold_token_ids'].long().to(device) if args.position_scaffold else None)
 
+        # canonical_voxel pads to num_gaussians with zero-opacity dummies; mask them
+        # out of the recon/per-attribute losses so only real Gaussians are graded.
+        vmask_gpu = (batch_data['valid_mask'].float().to(device)
+                     if args.canonical_voxel else None)
+
         optimizer.zero_grad()
 
         if _kl_anneal_active and global_step < args.kl_anneal_steps:
@@ -1553,7 +1605,8 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             target  = target_abs
             pred_3d = UV_gs_recover.reshape(B,-1,14)
 
-        recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight)
+        recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight,
+                                                 valid_mask=vmask_gpu)
 
         log_var_clamped = log_var.clamp(-10.0, 10.0)
         KL_loss     = -0.5*torch.sum(1+log_var_clamped-mu.pow(2)-log_var_clamped.exp(), dim=1).mean()
@@ -1771,7 +1824,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         optimizer.step()
         scheduler.step()
 
-        ind = compute_individual_losses(pred_3d, target)
+        ind = _masked_individual_losses(pred_3d, target, valid_mask=vmask_gpu)
         e['loss']       += total_loss.item()
         e['recon']      += recon_loss.item()
         e['kl']         += KL_loss.item()
@@ -1888,7 +1941,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                 if chunk_metrics['avg_l2_error'] > 1e-6:
                     _gap = val_metrics['avg_l2_error'] / chunk_metrics['avg_l2_error']
                     print(f"  DISTRIBUTION GAP  full_L2 / chunk_L2 = {_gap:.2f}x  "
-                          f"({'negligible' if _gap < 1.3 else 'moderate' if _gap < 2.0 else 'large — chunks much easier'})")
+                          f"({'negligible' if _gap < 1.3 else 'moderate' if _gap < 2.0 else 'large -- chunks much easier'})")
 
         if val_metrics['avg_l2_error'] < best_val_loss:
             best_val_loss = val_metrics['avg_l2_error']

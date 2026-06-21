@@ -1,0 +1,592 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_canvox64
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=4
+#SBATCH --time=25:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=90G
+#SBATCH --output=logs_ss1/can3tok_canvox64_%j.out
+#SBATCH --error=logs_ss1/can3tok_canvox64_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# DATASET SELECTION
+# ============================================================================
+TRAIN_DATA="chunks"
+
+# ============================================================================
+# FLAGS
+# ============================================================================
+
+# ── CANONICAL VOXEL GAUGE TEST ────────────────────────────────────────────────
+# Re‑express each scene as one representative Gaussian per occupied voxel on a
+# fixed canonical grid (canonical_voxel_merge), padded to num_gaussians with
+# zero‑opacity dummies. Losses mask the padding via valid_mask.
+CANONICAL_VOXEL=True
+VOXEL_RES=64
+VOXEL_SNAP=False   # set to True for fully snap to voxel centres (stronger gauge removal)
+
+# To resume Step 2's best checkpoint into a Step 3 (cross-stitch) run, point
+# this at Step 2's best_model.pth and flip TOKEN_LOCAL_HEAD_CROSS_STITCH=True
+# below. The shared trunk + 5 existing per-attribute heads load fine (strict=False
+# fallback, since the architecture changed by adding the cross-stitch module);
+# only the new cross-stitch matrix starts fresh at its identity init.
+RESUME_CHECKPOINT=""
+RESUME_EPOCH=""
+
+DECODER_LAYOUT_CROSS_ATTN=False
+DECODER_LAYOUT_ADDITIVE=False
+
+# Token-local decoder: REQUIRED here. It replaces the 775M-param flat GS_decoder
+# (impractical at 40000 gaussians) with a 1.6M shared per-token MLP, and it is the
+# memory headroom that lets the local encoder run at batch 64. Each of the 512
+# decoder tokens reconstructs its own Hilbert block of g=ceil(40000/512)=79 Gaussians.
+TOKEN_LOCAL_DECODER=True
+
+# ── GRADIENT-STARVATION FIX (scale/rotation collapse to uniform spheres) ────
+# DIAGNOSIS: TokenLocalDecoder's single shared out_linear (hidden_dim -> g*14)
+# produces ALL 14 output channels (pos/color/opacity/scale/quat) from ONE weight
+# matrix. Position's raw L2 magnitude dominates scale's by 2-3 orders of
+# magnitude (observed: Pos ~500-7000 vs Scl ~74), so the rows of out_linear
+# feeding scale/rotation get almost no gradient -> scale/rotation get stuck near
+# their init (exp(0)=1, i.e. uniform spheres) for hundreds of epochs, which is
+# exactly the rendered-as-spheres failure mode seen in the R1-R7 reconstructions.
+#
+# STEP 2 FIX (try this first): TOKEN_LOCAL_SEPARATE_HEADS=True replaces the one
+# shared out_linear with 5 INDEPENDENT per-attribute heads (position/color/
+# opacity/scale/quat), each its own small Linear->GELU->Linear off the shared
+# trunk h2. Position's loss can no longer write gradient into the weights that
+# produce scale/rotation (or vice versa) -- the starvation mechanism is removed
+# by construction, not just reweighted around. The shared trunk (in_linear/
+# mid_linear -> h2) is UNCHANGED, so the per-Gaussian InfoNCE pipeline (which
+# only ever reads h2) is completely unaffected.
+#
+# STEP 3 FIX (only if Step 2 shows the heads visibly DRIFTING APART -- e.g.
+# scale/rotation locally inconsistent with predicted position/geometry in the
+# rendered reconstructions): TOKEN_LOCAL_HEAD_CROSS_STITCH=True adds a learned
+# Cross-Stitch unit (Misra et al., CVPR 2016) mixing the 5 heads' pre-projection
+# hidden states via a learned 5x5 matrix, initialised to the IDENTITY (zero
+# extra coupling at the start of training -- mathematically a no-op vs Step 2
+# until the optimiser learns otherwise). Requires TOKEN_LOCAL_SEPARATE_HEADS=True.
+#
+# WORKFLOW: start this job with SEPARATE_HEADS=True, CROSS_STITCH=False. If the
+# rendered scale/rotation look decoupled from position after a few hundred
+# epochs, set RESUME_CHECKPOINT to this run's best_model.pth, flip
+# CROSS_STITCH=True, and relaunch (same job script, new RESUME_CHECKPOINT).
+TOKEN_LOCAL_SEPARATE_HEADS=False
+TOKEN_LOCAL_HEAD_CROSS_STITCH=False
+
+# ── POSITION SCAFFOLD / ANCHORS ──────────────────────────────────────────────
+# This run does NOT use the anchor scaffold: positions decode directly from the
+# 512 local z_g tokens. local_disentangle does not need the scaffold (it adds the
+# global z_s by cross-attention, independent of anchors). POSITION_SCAFFOLD=False
+# is Stage-2 feasible (no per-Gaussian anchor assignment to reproduce); there are
+# simply no anchors to predict. SCAFFOLD_MODE is therefore inert here, kept only so
+# the value is documented. To bring anchors back later, set POSITION_SCAFFOLD=True
+# with SCAFFOLD_MODE=hilbert_block (NOT voxel, which is not Stage-2 feasible).
+POSITION_SCAFFOLD=True
+SCAFFOLD_MODE="hilbert_block"  # inert while POSITION_SCAFFOLD=False
+ANCHOR_RELATIVE_DECODE=False
+ANCHOR_TEACHER_FORCE=False     # diagnostic only (feeds GT anchors); must stay False for Stage 2
+OFFSET_SCALE_INIT=2.0          # only used when ANCHOR_RELATIVE_DECODE=True
+ANCHOR_LOSS_WEIGHT=1.0
+
+# ── LOCAL ENCODER + LOCAL DISENTANGLEMENT ────────────────────────────────────
+# LOCAL_ENCODER: windowed spatially-local encoder. Geometry query k attends to a
+# window of Hilbert blocks around block k. REQUIRES Hilbert-ordered input, i.e.
+# MORTON_ORDER=True below (otherwise the blocks are opacity-rank groups, not spatial,
+# and the local premise is broken). Implies STRUCTURED_LATENT internally.
+LOCAL_ENCODER=True
+LOCAL_WINDOW=1
+STRUCTURED_LATENT=False         # auto-forced True by LOCAL_ENCODER; left as-is
+
+# LOCAL_DISENTANGLE: adds a separate global layout latent z_s (16 tokens from the
+# CLS) on top of the local per-token z_g, conditioning the decoder via cross-attention,
+# KL-regularised, supervised by the scene-semantic / scene-layout / colour heads plus
+# cross_recon + ortho. This is the flag that gives disentanglement WITH the local
+# encoder (--latent_disentangle is incompatible here and is auto-forced off). The
+# disentanglement is actually enforced by CROSS_RECON_WEIGHT (swap z_s across the
+# batch, geometry must not change) and ORTHO_WEIGHT (decorrelate z_s from z_g) below.
+LOCAL_DISENTANGLE=True
+
+# Per-Gaussian InfoNCE (--semantic_mode + --segment_loss_weight). Operates on the
+# per-Gaussian encoder/decoder features and pulls same-ScanNet72-label Gaussians
+# together. ONLY the 3800 chunks contribute (the 3 full-scene sources load with
+# semantics disabled -> segment=-1 -> filtered out), so there is no cross-dataset
+# label-taxonomy collision. Requires SEGMENT_WEIGHT>0 (0 silently disables the head).
+SEMANTIC_MODE_OVERRIDE="hidden"  # "hidden" = per-Gaussian hidden features, "decoder" = per-Gaussian decoder features
+
+LATENT_DISENTANGLE=True        # incompatible with the local encoder; auto-forced off
+SEMANTIC_DIMS=512               # z_s = 16 tokens x 32
+CROSS_RECON_WEIGHT=0.3          # disentanglement loss (active now that LOCAL_DISENTANGLE=True)
+ORTHO_WEIGHT=0.1                # disentanglement loss (active now that LOCAL_DISENTANGLE=True)
+
+COLOR_RESIDUAL=True
+MEAN_COLOR_WEIGHT=0.5
+COLOR_LOSS_WEIGHT=2.0
+
+# STRUCTURED_LAYOUT_TOKENS: carve z_s into dedicated token groups -- token 0 = colour,
+# tokens 1-8 = semantic, tokens 9-15 = layout -- so each head reads its own slice of
+# z_s instead of a shared pool. Pairs with the two heads below.
+STRUCTURED_LAYOUT_TOKENS=True
+
+# Scene heads that supervise z_s (give it semantic + layout meaning). Under
+# LOCAL_DISENTANGLE these build the z_s-reading variants, so their gradients land on z_s.
+SCENE_SEMANTIC_HEAD=True
+SCENE_SEMANTIC_WEIGHT=0.3
+SCENE_LAYOUT_HEAD=True
+LAYOUT_LOSS_WEIGHT=0.3
+SEMANTIC_TOKEN_HEADS=False      # requires latent_disentangle; must stay False on the local path
+
+ZS_POOL_INFONCE_WEIGHT=0.0
+ZS_POOL_INFONCE_TEMPERATURE=0.10
+
+ZS_LAYOUT_INFONCE_WEIGHT=0.0    # this is the one contrastive z_s term that works with local_disentangle
+ZS_LAYOUT_INFONCE_TEMPERATURE=0.07
+ZS_TOKEN_INFONCE_WEIGHT=0.0     # requires latent_disentangle; auto-disabled here
+ZS_TOKEN_INFONCE_TEMPERATURE=0.07
+Z_S_INFONCE_WEIGHT=0.0          # requires latent_disentangle; auto-disabled here
+Z_S_INFONCE_TEMPERATURE=0.07
+Z_S_INFONCE_DELTA=0.4
+
+SEMANTIC_MODE="$SEMANTIC_MODE_OVERRIDE"
+SEGMENT_WEIGHT=0.4     # weight on the per-Gaussian InfoNCE (0 = disabled). Raise for a stronger semantic pull (watch Recon).
+INSTANCE_WEIGHT=0.0
+SEMANTIC_TEMP=0.10
+SEMANTIC_SUBSAMPLE=10000
+SAMPLING_STRATEGY="balanced"
+
+DECODER_FOURIER_PE=True
+DECODER_POS_ENC=False
+
+TOKEN_COND=False
+TOKEN_COND_APPROACH="B"
+TOKEN_COND_ADALN=False
+
+SCALE_PENALTY_WEIGHT=0.0
+SCALE_PENALTY_THRESHOLD=0.5
+
+CROP_PERCENTILE=100.0
+
+# ── GAUSSIAN REORDERING (space-filling curve) ────────────────────────────────
+# MORTON_ORDER is the master switch for REORDERING the selected Gaussians along a
+# space-filling curve, so slot i maps to a spatially-stable location. ORDER_CURVE
+# picks WHICH curve: "hilbert" (recommended, best locality) or "morton" (Z-order).
+# NOTE on the naming: the flag is MORTON_ORDER for historical reasons but it only
+# ENABLES reordering; the curve itself is chosen by ORDER_CURVE. So
+# MORTON_ORDER=True + ORDER_CURVE="hilbert" means "reorder using the Hilbert curve"
+# (NOT Morton). ORDER_FRAME_RADIUS>0 uses a FIXED canonical frame [-R,R] so the
+# slot->position target is consistent across scenes.
+# REQUIRED here: (a) the LOCAL_ENCODER and the TOKEN_LOCAL_DECODER both assume the
+# points are Hilbert-ordered (block k = a local spatial cluster), and (b) the
+# element-wise L2 recon is only learnable when slot i is spatially stable across
+# scenes. With MORTON_ORDER=False the local blocks are opacity-rank groups and the
+# whole structured/local design is undermined.
+MORTON_ORDER=True
+ORDER_CURVE="hilbert"
+ORDER_FRAME_RADIUS=10.0
+
+AUG_YAW=False
+AUG_YAW_AXIS="z"
+AUG_YAW_MAX_DEG=180.0
+
+BATCH_SIZE=64
+NUM_EPOCHS=2000
+NUM_GAUSSIANS=40000
+POS_COND_HEADS=0
+POS_COND_COLOR=0
+POS_COND_ROTATION=0
+POS_COND_SIGMA=6.0
+POS_COND_POS_SCALE=10.0
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-5
+# ── LATENT CAPACITY ──────────────────────────────────────────────────────────
+# Per-token latent width. Token count is pinned to the 512-block count, so the
+# structured-latent total = 512 * EMBED_DIM. 32 = baseline (16384). 64 = DOUBLE
+# (32768) and the real lever for the position floor. Changing this is a Stage-1
+# RETRAIN and needs a matching Stage-2 latent size; KL grows ~linearly so watch
+# KL_WEIGHT*KL. Blank/32 reproduces the previous runs exactly.
+EMBED_DIM=32
+KL_ANNEAL_STEPS=0
+LR_RESTART_T0=800
+EVAL_EVERY=10
+WEIGHT_DECAY=1e-2
+WARMUP_STEPS=300
+LR_MIN_RATIO=0.1
+FAILURE_THRESHOLD=100
+
+TRAIN_SCENES=300
+RANDOM_SUBSET_SEED=""
+VAL_SCENES=100        # full-scene val from interior_gs/val (takes min(100, available))
+CHUNK_VAL_SCENES=88
+# Gaussian SELECTION (which num_gaussians to keep per scene). This is the lever for
+# the "model can't fully learn / fewer Gaussians helps" symptom: opacity ranking
+# scatters with non-uniform density (hard to compress); uniform/FPS equalizes it.
+#   opacity          = top-K by opacity (legacy; deterministic; visually cleanest here)
+#   uniform | fps    = density-uniform FPS-style grid sampling (now seeded -> deterministic)
+#   uniform_instance = the above, stratified by instance label (object-coherent)
+# NOTE: val + chunk-val are always preloaded (sampled ONCE, frozen for the run), so the
+# val metric is a fixed measure regardless of method or --no_preload on the train sets.
+SAMPLING_METHOD="opacity"
+SAMPLE_VOXEL_RES=96    # grid resolution for uniform/fps sampling (needs occupied voxels >= NUM_GAUSSIANS)
+
+# ── FULL-SCENE DATA MIX (added on top of the 3800 chunks) ─────────────────────
+# Main set = 3800 interior_gs chunks (TRAIN_DATA=chunks, global frame via
+# norm_factor.npy). The three extra roots below are FULL scenes, each PER-SCENE
+# normalised (no norm_factor.npy -> centred + scaled to radius 10, the SAME frame
+# the full-scene val uses). Semantics are auto-disabled for extra paths, so the
+# scene-semantic / scene-layout / per-Gaussian heads are driven ONLY by the 3800
+# chunks; the full scenes contribute 0 to those losses (valid masks are empty).
+# Counts: 800 + 1290 + 906(->856 available) ~= 2946 full scenes; total train ~= 6746.
+# EXTRA_TRAIN_PATHS="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train:/home/yli7/scratch/datasets/gaussian_world/preprocessed/arkitscenes_mcmc_3dgs/train:/home/yli7/scratch/datasets/gaussian_world/preprocessed/scannetpp_v2_mcmc_3dgs_lang_large_new/train"
+# EXTRA_TRAIN_SCENES="800:1290:906"
+EXTRA_TRAIN_PATHS=""
+EXTRA_TRAIN_SCENES=""
+
+# Load scenes on-the-fly instead of caching all of them in RAM. Each DDP rank holds
+# its OWN preload copy, so the ~6746-scene chunks+full mix (~34 GB/rank) plus the
+# epoch-0 eval spike blew past --mem=90G and got SIGKILL-ed (exit -9). False here =
+# no preload -> low host RAM, epochs a bit slower (disk + per-access sampling/sort,
+# overlapped by the dataloader workers). Set True only if you also raise --mem.
+PRELOAD=False
+
+USE_CANONICAL_NORM=True
+CHUNK_NORM_FACTOR=True
+SCALE_NORM_MODE="linear"
+
+PCA_VIS_FREQ=100
+PCA_NUM_SCENES=3
+PCA_BRIGHTNESS=1.25
+RECON_PLY_FREQ=100
+RECON_PLY_NUM_SCENES=3
+RECON_PLY_MAX_SH=3
+
+export WANDB_API_KEY="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"
+USE_WANDB=True
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+_any_B=false
+[ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && _any_B=true
+[ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && _any_B=true
+
+if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; then
+    echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True"; exit 1
+fi
+
+if [ "$LOCAL_DISENTANGLE" = "True" ] && [ "$LOCAL_ENCODER" != "True" ]; then
+    echo "ERROR: LOCAL_DISENTANGLE=True requires LOCAL_ENCODER=True"; exit 1
+fi
+
+# Gradient-starvation fix dependency checks (mirror the argparse-side checks in
+# gs_can3tok_2.py; checked here too so a bad config fails fast before the Python
+# process even launches).
+if [ "$TOKEN_LOCAL_SEPARATE_HEADS" = "True" ] && [ "$TOKEN_LOCAL_DECODER" != "True" ]; then
+    echo "ERROR: TOKEN_LOCAL_SEPARATE_HEADS=True requires TOKEN_LOCAL_DECODER=True"; exit 1
+fi
+if [ "$TOKEN_LOCAL_HEAD_CROSS_STITCH" = "True" ] && [ "$TOKEN_LOCAL_SEPARATE_HEADS" != "True" ]; then
+    echo "ERROR: TOKEN_LOCAL_HEAD_CROSS_STITCH=True requires TOKEN_LOCAL_SEPARATE_HEADS=True"
+    echo "       (Step 3 is layered on top of Step 2 -- enable separate heads first.)"
+    exit 1
+fi
+
+# hilbert_block scaffold groups the Hilbert-ordered points into blocks, so it is only
+# meaningful when the points are actually reordered. Warn (do not hard-fail) so that
+# scaffold-without-reordering ablations are still possible.
+if [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCAFFOLD_MODE" = "hilbert_block" ] && [ "$MORTON_ORDER" != "True" ]; then
+    echo "══════════════════════════════════════════════════════════════════════"
+    echo "  WARNING: SCAFFOLD_MODE=hilbert_block WITHOUT MORTON_ORDER=True"
+    echo "  The per-block centroids will be computed on OPACITY-RANKED groups."
+    echo "  This is NOT spatially coherent and NOT suitable for Stage-2."
+    echo "  (Allowed for ablation/debugging. To silence this, set MORTON_ORDER=True)."
+    echo "══════════════════════════════════════════════════════════════════════"
+fi
+
+# The local encoder/decoder assume Hilbert-ordered input. Warn if reordering is off.
+if [ "$LOCAL_ENCODER" = "True" ] && [ "$MORTON_ORDER" != "True" ]; then
+    echo "══════════════════════════════════════════════════════════════════════"
+    echo "  WARNING: LOCAL_ENCODER=True WITHOUT MORTON_ORDER=True"
+    echo "  The encoder's 512 blocks will be opacity-rank groups, not spatial"
+    echo "  clusters, so the local/compositional premise is broken. Set"
+    echo "  MORTON_ORDER=True with ORDER_CURVE=hilbert."
+    echo "══════════════════════════════════════════════════════════════════════"
+fi
+
+_CP_CHECK=$(python3 -c "
+v = float('$CROP_PERCENTILE')
+if v <= 0 or v > 100:
+    raise ValueError(f'CROP_PERCENTILE must be in (0, 100], got {v}')
+print('ok')
+" 2>&1)
+if [ "$_CP_CHECK" != "ok" ]; then
+    echo "ERROR: CROP_PERCENTILE=$CROP_PERCENTILE is invalid: $_CP_CHECK"
+    exit 1
+fi
+
+ACTIVE_STRATEGY="C (baseline)"
+if [ "$LATENT_DISENTANGLE" = "True" ] && [ "$_any_B" = "false" ]; then
+    ACTIVE_STRATEGY="A — 16+496 in sequence (BEST)"
+elif [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && [ "$DECODER_LAYOUT_ADDITIVE" = "True" ]; then
+    ACTIVE_STRATEGY="B3 — 512 geom + additive + cross-attn"
+elif [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ]; then
+    ACTIVE_STRATEGY="B1 — 512 geom + cross-attn per layer"
+elif [ "$DECODER_LAYOUT_ADDITIVE" = "True" ]; then
+    ACTIVE_STRATEGY="B2 — 512 geom + additive bias"
+fi
+# local_disentangle is its own strategy (local z_g + global z_s); report it accurately.
+if [ "$LOCAL_DISENTANGLE" = "True" ]; then
+    ACTIVE_STRATEGY="LD — local z_g (512) + global z_s (16, cross-attn)"
+fi
+
+TOKEN_LOCAL_MODE_DESC="SHARED (legacy)"
+if [ "$TOKEN_LOCAL_SEPARATE_HEADS" = "True" ]; then
+    TOKEN_LOCAL_MODE_DESC="SEPARATE-HEADS"
+    [ "$TOKEN_LOCAL_HEAD_CROSS_STITCH" = "True" ] && TOKEN_LOCAL_MODE_DESC="SEPARATE-HEADS + CROSS-STITCH"
+fi
+
+echo "========================================================================"
+echo "  CAN3TOK — Strategy: $ACTIVE_STRATEGY"
+if [ "$TOKEN_LOCAL_DECODER" = "True" ]; then
+    echo "  TOKEN-LOCAL DECODER ENABLED  |  mode=$TOKEN_LOCAL_MODE_DESC"
+fi
+if [ "$LOCAL_DISENTANGLE" = "True" ]; then
+    echo "  LOCAL DISENTANGLE: z_s(16) cross-attn | cross_recon=$CROSS_RECON_WEIGHT ortho=$ORTHO_WEIGHT"
+    echo "  z_s supervision  : scene_semantic=$SCENE_SEMANTIC_HEAD scene_layout=$SCENE_LAYOUT_HEAD structured_tokens=$STRUCTURED_LAYOUT_TOKENS"
+fi
+_CP_INT=$(python3 -c "print(int(float('$CROP_PERCENTILE')))")
+if [ "$_CP_INT" -lt 100 ]; then
+    echo "  SPATIAL CROP: keeping inner ${CROP_PERCENTILE}% of each scene by"
+    echo "     distance from centroid before opacity sampling."
+else
+    echo "  Spatial crop    : disabled (CROP_PERCENTILE=100)"
+fi
+if [ "$MORTON_ORDER" = "True" ]; then
+    _FRAME_DESC=$(python3 -c "r=float('$ORDER_FRAME_RADIUS'); print(f'canonical frame [-{r:g},{r:g}]' if r>0 else 'per-scene min-max (legacy)')")
+    echo "  GAUSSIAN ORDER  : ${ORDER_CURVE^^} space-filling curve, ${_FRAME_DESC}"
+else
+    echo "  Gaussian order  : opacity rank (default)"
+fi
+echo "  Recon objective : element-wise L2 (slot-aligned; needs MORTON_ORDER=True)"
+if [ "$POSITION_SCAFFOLD" = "True" ]; then
+    echo "  Position scaffold: ON  mode=$SCAFFOLD_MODE  anchor_relative=$ANCHOR_RELATIVE_DECODE  teacher_force=$ANCHOR_TEACHER_FORCE"
+else
+    echo "  Position scaffold: OFF (positions decode directly from z_g; no anchors)"
+fi
+echo "  TRAIN_DATA=$TRAIN_DATA  TRAIN_SCENES=$TRAIN_SCENES  VAL_SCENES=$VAL_SCENES"
+if [ "$CANONICAL_VOXEL" = "True" ]; then
+    echo "  CANONICAL VOXEL : ON  R=$VOXEL_RES  snap=$VOXEL_SNAP  (gauge-removal: padding masked in loss)"
+else
+    echo "  CANONICAL VOXEL : OFF"
+fi
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+# export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+# Force UTF-8 for file I/O regardless of the node's locale. Snellius compute nodes
+# default to an ASCII (C/POSIX) locale, under which Python reads source/text files
+# with the ASCII codec and a stray UTF-8 byte raises UnicodeDecodeError. PYTHONUTF8=1
+# forces UTF-8 regardless of whether a UTF-8 locale is installed. (Harmless otherwise.)
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
+mkdir -p logs_ss1 checkpoints_stage1
+
+[ "$USE_WANDB" = "True" ] && wandb login $WANDB_API_KEY --relogin 2>/dev/null
+
+YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+if [ -f "$YAML_PATH" ]; then
+    POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
+    [ "$POINT_FEATS" != "11" ] && echo "ERROR: point_feats=$POINT_FEATS, expected 11" && exit 1
+    echo "  point_feats=11 confirmed"
+fi
+
+if [ "$TRAIN_DATA" = "chunks" ] || [ "$TRAIN_DATA" = "combined" ]; then
+    CHUNKS_DIR="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
+    echo ""
+    echo "  Pre-flight: checking norm_factor.npy in chunk dirs..."
+
+    _NF_COUNT=$(ls "$CHUNKS_DIR" | sort | head -50 | while read d; do
+        [ -f "$CHUNKS_DIR/$d/norm_factor.npy" ] && echo "ok"
+    done | wc -l)
+
+    if [ "$_NF_COUNT" -eq 50 ]; then
+        echo "  norm_factor.npy: 50/50 sampled chunks OK — global frame confirmed"
+        _EX_DIR=$(ls "$CHUNKS_DIR" | sort | head -1)
+        echo "  Example: $_EX_DIR"
+        python3 -c "
+import numpy as np, sys
+nf = np.load('$CHUNKS_DIR/$_EX_DIR/norm_factor.npy')
+print(f'    center=({nf[0]:.3f}, {nf[1]:.3f}, {nf[2]:.3f})  scale={nf[3]:.4f}')
+if nf[3] <= 0:
+    print('ERROR: scale_factor <= 0 — corrupt norm_factor.npy!')
+    sys.exit(1)
+"
+    elif [ "$_NF_COUNT" -gt 0 ]; then
+        echo "  WARNING: norm_factor.npy found in only $_NF_COUNT/50 sampled chunks."
+    else
+        echo "  ERROR: norm_factor.npy missing from all 50 sampled chunks!"
+        exit 1
+    fi
+    echo ""
+fi
+
+echo ""
+
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+
+ACCELERATE_CONFIG="/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml"
+TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
+
+TRAIN_CMD="$TRAIN_CMD --train_data $TRAIN_DATA"
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --num_gaussians $NUM_GAUSSIANS"
+if [ "$POS_COND_HEADS" = "1" ]; then
+    TRAIN_CMD="$TRAIN_CMD --pos_cond_heads --pos_cond_color $POS_COND_COLOR --pos_cond_rotation $POS_COND_ROTATION"
+    TRAIN_CMD="$TRAIN_CMD --pos_cond_sigma $POS_COND_SIGMA --pos_cond_pos_scale $POS_COND_POS_SCALE"
+fi
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE --kl_weight $KL_WEIGHT --kl_anneal_steps $KL_ANNEAL_STEPS"
+TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY --warmup_steps $WARMUP_STEPS"
+TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO --lr_restart_T0 $LR_RESTART_T0 --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
+[ -n "$CHUNK_VAL_SCENES" ] && TRAIN_CMD="$TRAIN_CMD --chunk_val_scenes $CHUNK_VAL_SCENES"
+TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+TRAIN_CMD="$TRAIN_CMD --sample_voxel_res $SAMPLE_VOXEL_RES"
+
+[ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_cross_attn"
+[ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_additive"
+
+[ "$LATENT_DISENTANGLE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
+[ "$LOCAL_DISENTANGLE"  = "True" ] && TRAIN_CMD="$TRAIN_CMD --local_disentangle"
+TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
+TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT --ortho_weight $ORTHO_WEIGHT"
+
+[ "$COLOR_RESIDUAL" = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
+TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT --color_loss_weight $COLOR_LOSS_WEIGHT"
+
+[ "$SCENE_SEMANTIC_HEAD"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
+TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
+[ "$SCENE_LAYOUT_HEAD"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
+[ "$STRUCTURED_LAYOUT_TOKENS" = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_layout_tokens"
+TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
+[ "$SEMANTIC_TOKEN_HEADS"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --semantic_token_heads"
+
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_weight $ZS_POOL_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_temperature $ZS_POOL_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_weight $ZS_LAYOUT_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_temperature $ZS_LAYOUT_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --zs_token_infonce_weight $ZS_TOKEN_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_token_infonce_temperature $ZS_TOKEN_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_weight $Z_S_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_temperature $Z_S_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_delta $Z_S_INFONCE_DELTA"
+
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
+TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
+TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
+
+[ "$DECODER_POS_ENC"    = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_pos_enc"
+[ "$DECODER_FOURIER_PE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
+[ "$TOKEN_LOCAL_DECODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_local_decoder"
+[ "$TOKEN_LOCAL_SEPARATE_HEADS"    = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_local_separate_heads"
+[ "$TOKEN_LOCAL_HEAD_CROSS_STITCH" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_local_head_cross_stitch"
+
+[ "$POSITION_SCAFFOLD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scaffold_mode $SCAFFOLD_MODE"
+[ "$ANCHOR_RELATIVE_DECODE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_relative_decode --offset_scale_init $OFFSET_SCALE_INIT"
+[ "$ANCHOR_TEACHER_FORCE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_teacher_force"
+[ "$STRUCTURED_LATENT" = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_latent"
+[ "$LOCAL_ENCODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --local_encoder --local_window $LOCAL_WINDOW"
+
+[ "$TOKEN_COND"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond --token_cond_approach $TOKEN_COND_APPROACH"
+[ "$TOKEN_COND_ADALN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_adaln"
+
+TRAIN_CMD="$TRAIN_CMD --scale_penalty_weight $SCALE_PENALTY_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scale_penalty_threshold $SCALE_PENALTY_THRESHOLD"
+
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+[ "$USE_CANONICAL_NORM"  = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+[ "$CHUNK_NORM_FACTOR"   = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_chunk_norm_factor"
+
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ --pca_num_scenes $PCA_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+
+[ "$USE_WANDB" = "True" ] && TRAIN_CMD="$TRAIN_CMD --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC"
+
+[ -n "$RANDOM_SUBSET_SEED" ] && TRAIN_CMD="$TRAIN_CMD --random_subset_seed $RANDOM_SUBSET_SEED"
+
+TRAIN_CMD="$TRAIN_CMD --crop_percentile $CROP_PERCENTILE"
+
+[ "$MORTON_ORDER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --morton_order"
+TRAIN_CMD="$TRAIN_CMD --order_curve $ORDER_CURVE"
+TRAIN_CMD="$TRAIN_CMD --order_frame_radius $ORDER_FRAME_RADIUS"
+
+# ── CANONICAL VOXEL FLAGS ────────────────────────────────────────────────────
+[ "$CANONICAL_VOXEL" = "True" ] && TRAIN_CMD="$TRAIN_CMD --canonical_voxel --voxel_res $VOXEL_RES"
+[ "$VOXEL_SNAP" = "True" ] && TRAIN_CMD="$TRAIN_CMD --voxel_snap"
+
+[ -n "$EMBED_DIM" ] && TRAIN_CMD="$TRAIN_CMD --embed_dim $EMBED_DIM"
+
+[ "$AUG_YAW" = "True" ] && TRAIN_CMD="$TRAIN_CMD --aug_yaw --aug_yaw_axis $AUG_YAW_AXIS --aug_yaw_max_deg $AUG_YAW_MAX_DEG"
+
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
+    [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
+fi
+
+[ -n "$EXTRA_TRAIN_PATHS"  ] && TRAIN_CMD="$TRAIN_CMD --extra_train_paths $EXTRA_TRAIN_PATHS"
+[ -n "$EXTRA_TRAIN_SCENES" ] && TRAIN_CMD="$TRAIN_CMD --extra_train_scenes $EXTRA_TRAIN_SCENES"
+[ "$PRELOAD" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_preload"
+
+echo "Command: $TRAIN_CMD"
+echo ""
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $TRAIN_CMD
+TRAIN_EXIT=$?
+echo ""
+echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+if [ $TRAIN_EXIT -eq 0 ]; then
+    echo ""
+    echo "COMPLETED. Strategy: $ACTIVE_STRATEGY | TokenLocal: $TOKEN_LOCAL_MODE_DESC | Data: $TRAIN_DATA | Crop: ${CROP_PERCENTILE}% | Order: ${MORTON_ORDER}/${ORDER_CURVE} | Scaffold: $SCAFFOLD_MODE | CanonicalVoxel: R=${VOXEL_RES}, snap=${VOXEL_SNAP}"
+    echo ""
+    echo "  Useful log greps:"
+    echo "  Best full-scene model  : grep 'NEW BEST' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out | tail -5"
+    echo "  Val full scenes (L2)   : grep 'Val FULL SCENES' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out"
+    echo "  Position convergence   : grep 'Pos=' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out | head -20"
+    echo "  Scale/Rotation conv.   : grep 'Scl=' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out | head -20"
+    echo "  CrossRecon / Ortho     : grep 'CrossRecon' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out | head -20"
+    echo "  Local disentangle      : grep 'local_disentangle' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out"
+    echo "  Gaussian order         : grep 'GAUSSIAN ORDER' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out"
+    echo "  TokenLocalDecoder mode : grep 'TokenLocalDecoder' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out"
+    echo "  Canonical voxel        : grep 'CANONICAL VOXEL' logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.out"
+else
+    echo "FAILED (exit $TRAIN_EXIT)"
+    echo "  Error log: cat logs_ss1/can3tok_canvox64_${SLURM_JOB_ID}.err"
+fi

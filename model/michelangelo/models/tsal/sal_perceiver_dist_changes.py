@@ -784,6 +784,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  jepa_idea1=False,
                  query_decoder=False,
                  token_local_decoder=False,
+                 token_local_separate_heads=False,
+                 token_local_head_cross_stitch=False,
                  anchor_relative_decode=False,
                  anchor_teacher_force=False,
                  offset_scale_init=2.0,
@@ -819,6 +821,8 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         self.decoder_layout_additive       = decoder_layout_additive
         self.structured_layout_tokens_flag = structured_layout_tokens
         self.token_local_decoder_flag      = token_local_decoder
+        self.token_local_separate_heads    = token_local_separate_heads
+        self.token_local_head_cross_stitch = token_local_head_cross_stitch
 
         # ── STRUCTURED PER-TOKEN LATENT / LOCAL ENCODER ─────────────────────────
         # local_encoder implies structured_latent (a local encoder is pointless if the
@@ -1178,15 +1182,21 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                   f"shared per-token MLPs:")
             self.GS_decoder = TokenLocalDecoder(
                 width=width, hidden_dim=512, num_tokens=512,
-                num_gaussians=_N_GAUSSIANS, color_residual=color_residual)
+                num_gaussians=_N_GAUSSIANS, color_residual=color_residual,
+                separate_heads=token_local_separate_heads,
+                head_cross_stitch=token_local_head_cross_stitch)
             if self.GS_decoder_B is not None:
                 self.GS_decoder_B = TokenLocalDecoder(
                     width=width, hidden_dim=512, num_tokens=_Z_TOKENS,
-                    num_gaussians=_N_GAUSSIANS, color_residual=color_residual)
+                    num_gaussians=_N_GAUSSIANS, color_residual=color_residual,
+                    separate_heads=token_local_separate_heads,
+                    head_cross_stitch=token_local_head_cross_stitch)
             if self.GS_decoder_new is not None:
                 self.GS_decoder_new = TokenLocalDecoder(
                     width=width, hidden_dim=512, num_tokens=self._n_zg_tokens,
-                    num_gaussians=_N_GAUSSIANS, color_residual=color_residual)
+                    num_gaussians=_N_GAUSSIANS, color_residual=color_residual,
+                    separate_heads=token_local_separate_heads,
+                    head_cross_stitch=token_local_head_cross_stitch)
 
         print(f"{'='*70}\n")
 

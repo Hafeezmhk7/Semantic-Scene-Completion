@@ -1,0 +1,99 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_overfit
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=08:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=60G
+#SBATCH --output=logs_ss1/can3tok_overfit_%j.out
+#SBATCH --error=logs_ss1/can3tok_overfit_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# OVERFIT DIAGNOSTIC  (capability test, NOT a learning test)
+# ----------------------------------------------------------------------------
+# QUESTION: Can this architecture + element-wise-L2 objective produce a SHARP
+# reconstruction AT ALL, when every excuse (compression / generalization / KL /
+# competing losses) is removed?
+#
+# SETUP (every advantage given to the model):
+#   * train on a TINY set (4 chunks) -> near-memorization, no generalization demand
+#   * KL OFF (--kl_weight 0) -> no bottleneck squeezing the latent toward a blurry mean
+#   * NO side losses (semantic / layout / cross-recon / ortho / infoNCE all 0/off)
+#     -> the optimizer spends 100% of capacity on raw reconstruction
+#   * single GPU, batch=4 -> the whole set is one batch, cleanest possible signal
+#   * many epochs -> let it fully converge / memorize
+#   * canonical_voxel ON (the gauge fix we confirmed) so scale/rotation are identifiable
+#   * NO snap -> keep real within-cell positions (avoid grid quantization blur)
+#
+# READING THE RESULT (look at the held-out-chunk recon PLY, and the train Recon):
+#   * Train Recon drives toward ~0 AND the chunk render is SHARP / oriented
+#       -> the objective CAN represent a sharp chunk. The blur in real runs is
+#          capacity / compression / generalization -> fix ARCHITECTURE, keep L2.
+#   * Train Recon plateaus high, OR it memorizes (train Recon low) but the render
+#     is STILL a blurry blob
+#       -> the element-wise-L2-on-parameters objective itself cannot express
+#          sharpness -> the FORMULATION is wrong -> move to a RENDER loss.
+#
+# NOTE (config-only, no code edit): the script's chunk-val is held-out by
+# construction (skip_scenes), so we render the held-out chunk, not the literal
+# trained chunk. With only 4 chunks + KL off + long training the model is pushed
+# hard toward the memorization regime, so the held-out-chunk render is a strong
+# proxy. If it blobs here, the objective is the ceiling.
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
+mkdir -p logs_ss1 checkpoints_stage1
+
+export WANDB_API_KEY="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"
+wandb login $WANDB_API_KEY --relogin 2>/dev/null
+
+ACCEL=/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml
+
+# ── single-process launch (1 GPU): avoids DDP entirely for the diagnostic ──
+accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
+  --train_data chunks \
+  --train_scenes 4 \
+  --chunk_val_scenes 4 \
+  --val_scenes 4 \
+  --batch_size 4 \
+  --num_epochs 4000 \
+  --eval_every 200 \
+  --num_gaussians 40000 \
+  --lr 2e-4 \
+  --kl_weight 0.0 \
+  --kl_anneal_steps 0 \
+  --weight_decay 0.0 \
+  --warmup_steps 50 \
+  --lr_min_ratio 1.0 \
+  --lr_restart_T0 0 \
+  --color_residual --mean_color_weight 0.5 --color_loss_weight 2.0 \
+  --scale_norm_mode linear \
+  --canonical_voxel --voxel_res 64 \
+  --morton_order --order_curve hilbert --order_frame_radius 10.0 \
+  --token_local_decoder \
+  --local_encoder --local_window 1 \
+  --position_scaffold --anchor_loss_weight 1.0 --scaffold_mode hilbert_block \
+  --decoder_fourier_pe \
+  --recon_ply_freq 200 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
+  --pca_vis_freq 100000 \
+  --embed_dim 32 \
+  --no_preload \
+  --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC
+
+echo "Exit: $?  |  End: $(date)"
+echo ""
+echo "WHAT TO LOOK AT:"
+echo "  1) Train 'Recon=' over epochs -- does it drive toward ~0 (memorizing) or plateau?"
+echo "  2) reconstructed_gaussians_chunk/epoch_XXXX/ PLY -- SHARP/oriented or blurry blob?"
+echo "  3) Compare to ground_truth_gaussians_chunk/ (saved at epoch 0, same chunk)."
