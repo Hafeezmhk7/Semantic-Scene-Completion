@@ -59,7 +59,10 @@ export WANDB_API_KEY="wandb_v1_D9IJNMrJPieCvMbrazxUsefC4bi_d2yePUnKgyoY3qwn5IPhE
 wandb login $WANDB_API_KEY --relogin 2>/dev/null
 
 ACCEL=/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml
-
+# --morton_order --order_curve hilbert --order_frame_radius 10.0 \
+# --position_scaffold --anchor_loss_weight 1.0 --scaffold_mode hilbert_block \
+#  --token_local_decoder \
+# --local_encoder --local_window 1 \
 # ── single-process launch (1 GPU): avoids DDP entirely for the diagnostic ──
 accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
   --train_data chunks \
@@ -79,13 +82,8 @@ accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
   --lr_restart_T0 0 \
   --color_residual --mean_color_weight 0.5 --color_loss_weight 2.0 \
   --scale_norm_mode linear \
-  --canonical_voxel --voxel_res 64 \
-  --morton_order --order_curve hilbert --order_frame_radius 10.0 \
-  --token_local_decoder \
-  --local_encoder --local_window 1 \
-  --position_scaffold --anchor_loss_weight 1.0 --scaffold_mode hilbert_block \
   --decoder_fourier_pe \
-  --recon_ply_freq 200 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
+  --recon_ply_freq 500 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
   --pca_vis_freq 100000 \
   --embed_dim 32 \
   --no_preload \
