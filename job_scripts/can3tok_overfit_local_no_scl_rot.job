@@ -1,0 +1,140 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_overfit_local_no_scl_rot
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=08:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=60G
+#SBATCH --output=logs_ss1/can3tok_overfit_local_no_scl_rot_%j.out
+#SBATCH --error=logs_ss1/can3tok_overfit_local_no_scl_rot_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# OVERFIT DIAGNOSTIC: LOCAL ARCH WITHOUT SCALE/ROTATION IN THE LOSS
+# ----------------------------------------------------------------------------
+# QUESTION: Can the LOCAL encoder + TOKEN-LOCAL decoder fit POSITION and COLOR
+# on 4 chunks when scale and rotation are removed from the loss entirely?
+#
+# WHY THIS RUN EXISTS:
+#   Three prior overfit runs (4 chunks, KL=0, 4000 epochs) gave:
+#
+#     Flat decoder + reordering          Pos= 7.2  Col= 2.8  Opa=0.07  Scl=0.28  Rot= 1.2
+#     Local encoder/decoder + reorder    Pos=29    Col=15    Opa=1.4   Scl=16    Rot=57
+#     Local encoder/decoder NO reorder   Pos=104   Col=18    Opa=1.2   Scl=17    Rot=86
+#
+#   Reordering helped Pos a lot (104 -> 29), Rot moderately (86 -> 57), Scl
+#   barely (17 -> 16). The smoothness gradient is consistent with a story
+#   where the SHARED MLP in the token-local decoder can produce
+#   smooth-across-slots patterns (Pos, Col) from a 32-dim per-token latent,
+#   but cannot produce slot-arbitrary patterns (Scl, Rot) from any 32-dim
+#   code, because 78 unrelated values per token have no smooth representation
+#   in a small shared MLP.
+#
+#   The flat decoder hits Pos=7.2 / Col=2.8 because it has effectively
+#   per-slot weights, so the latent only needs to identify the scene and the
+#   per-slot weights carry the rest -- Scl/Rot included.
+#
+#   This run isolates the hypothesis: KEEP the local pair, REMOVE Scl/Rot
+#   from the loss. If the local arch is only failing on the non-smooth
+#   attributes, Pos and Col should now fall to roughly the flat-decoder
+#   floor (Pos~7, Col~3). If they stay well above that, the local arch has
+#   an independent capacity issue on the smooth attributes too.
+#
+# SETUP DIFFERENCES FROM can3tok_overfit_flat_reordering.job:
+#   * --local_encoder --local_window 1       (windowed spatially-local encoder)
+#   * --token_local_decoder                  (shared per-token MLP decoder)
+#   * --no_scale_rotation_loss               (THE diagnostic flag, NEW)
+#   Everything else (4 chunks, KL=0, 4000 epochs, batch=4, lr=2e-4, morton
+#   ordering with hilbert curve, decoder_fourier_pe, etc.) identical to the
+#   flat reordering reference run for a clean A/B comparison.
+#
+# READING THE RESULT (last training epoch line):
+#   * Pos near 7 and Col near 3
+#       -> local architecture is fine for the smooth subset. The floor in the
+#          prior runs was specifically the non-smooth attributes (Scl, Rot)
+#          meeting a shared, smoothness-biased decoder. Headline claim:
+#          architecture-loss mismatch on the non-smooth attributes only,
+#          gauge identifiability is not the primary cause.
+#
+#   * Pos still well above 7 (e.g. >15)
+#       -> capacity ceiling on the smooth attributes too. Smoothness mismatch
+#          is part of the story, not the whole story. Next probe would be
+#          a capacity widening test (embed_dim=64) to separate the two.
+#
+#   IGNORE the Scl=... Rot=... numbers in this run. Under --no_scale_rotation_loss
+#   they receive no gradient from the recon term, so the heads drift and the
+#   numbers are uninformative. Pos / Col / Opa are the data points.
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
+mkdir -p logs_ss1 checkpoints_stage1
+
+export WANDB_API_KEY="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"
+wandb login $WANDB_API_KEY --relogin 2>/dev/null
+
+ACCEL=/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml
+
+# ── single-process launch (1 GPU): avoids DDP entirely for the diagnostic ──
+accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
+  --train_data chunks \
+  --train_scenes 4 \
+  --chunk_val_scenes 4 \
+  --val_scenes 4 \
+  --batch_size 4 \
+  --num_epochs 4000 \
+  --eval_every 200 \
+  --num_gaussians 40000 \
+  --lr 2e-4 \
+  --kl_weight 0.0 \
+  --kl_anneal_steps 0 \
+  --weight_decay 0.0 \
+  --warmup_steps 50 \
+  --lr_min_ratio 1.0 \
+  --morton_order --order_curve hilbert --order_frame_radius 10.0 \
+  --local_encoder --local_window 1 \
+  --token_local_decoder \
+  --no_scale_rotation_loss \
+  --lr_restart_T0 0 \
+  --color_residual --mean_color_weight 0.5 --color_loss_weight 2.0 \
+  --scale_norm_mode linear \
+  --decoder_fourier_pe \
+  --recon_ply_freq 500 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
+  --pca_vis_freq 100000 \
+  --embed_dim 128 \
+  --no_preload \
+  --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC
+
+echo "Exit: $?  |  End: $(date)"
+echo ""
+echo "WHAT TO LOOK AT (last training epoch line in the .out file):"
+echo "  * Pos and Col only (Opa is informative too)."
+echo "  * Reference (flat decoder + reordering, same data): Pos=7.2  Col=2.8  Opa=0.07"
+echo "  * If Pos~7 and Col~3 here, the local architecture is fine on the smooth subset"
+echo "    and the prior floor was driven by the non-smooth Scl/Rot meeting the shared"
+echo "    token-local MLP."
+echo "  * If Pos stays well above 7, there is a capacity ceiling on the smooth attributes"
+echo "    too, and smoothness mismatch is only part of the story."
+echo "  * IGNORE Scl and Rot in this run -- under --no_scale_rotation_loss those heads"
+echo "    receive no gradient and the numbers are meaningless. The training log still"
+echo "    prints them (from _masked_individual_losses) but only for monitoring."
+echo ""
+echo "  Quick greps:"
+echo "    Last train line     : tail -20 logs_ss1/can3tok_overfit_local_no_scl_rot_${SLURM_JOB_ID}.out | grep -A1 'Epoch 3999'"
+echo "    Val full scenes     : grep 'Val FULL SCENES' logs_ss1/can3tok_overfit_local_no_scl_rot_${SLURM_JOB_ID}.out"
+echo "    Val held-out chunks : grep 'Val HELD-OUT CHUNKS' logs_ss1/can3tok_overfit_local_no_scl_rot_${SLURM_JOB_ID}.out"
+echo ""
+echo "  Reconstructed PLYs (visual comparison to flat reordering run):"
+echo "    reconstructed_gaussians_chunk/epoch_3500/scene*.ply"
+echo "    Pos and Col should look much closer to GT now than in the prior local runs."
+echo "    Splat ORIENTATIONS and SIZES will be wrong (no Scl/Rot gradient), but the"
+echo "    point cloud and colors should match the structure of ground_truth_gaussians_chunk/."

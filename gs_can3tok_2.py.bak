@@ -56,16 +56,6 @@ except ImportError:
 from gs_ply_reconstructor import save_reconstructed_gaussians
 from accelerate import Accelerator, DistributedDataParallelKwargs
 
-# Render-loss companion (written next to this file by apply_render_loss_patch.py).
-# Imported defensively so the script still runs when --render_loss is OFF and
-# render_loss_helpers.py is absent.
-try:
-    from render_loss_helpers import get_render_module as _get_render_module
-    _RENDER_HELPERS_AVAILABLE = True
-except Exception as _e:
-    _RENDER_HELPERS_AVAILABLE = False
-    _RENDER_IMPORT_ERROR = _e
-
 import sys
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
@@ -88,101 +78,15 @@ GEO_ONLY_SLICES = {
 # ============================================================================
 # LOSS HELPERS
 # ============================================================================
-def _build_sigma_from_sq(s, q, eps=1e-8):
-    """Build the 3D Gaussian covariance Σ = R(q)·diag(s²)·R(q)ᵀ from (scale, quat).
-
-    The 3DGS factorisation (s, q) -> Σ is many-to-one (gauge-redundant): axis
-    permutations (σ·s, q·r_σ), ±q sign flips, and S¹/S³ fibres for degenerate
-    scales all give the same Σ. Element-wise L2 on (s, q) averages over that
-    orbit and converges to its centroid -- which for typical anisotropic Σ is
-    isotropic in scale and degenerate in rotation, producing the small-circular-
-    Gaussian artefact. A loss in Σ-space sees only the gauge-INVARIANT quantity,
-    so any orbit representative is admissible and the artefact goes away.
-
-    s : [..., 3]  scale (positive; raw decoder output, assumed softplus'd)
-    q : [..., 4]  quaternion in 3DGS (w, x, y, z) convention, L2-normalised here
-    eps : numerical floor for the quaternion norm
-
-    Returns : [..., 3, 3]  symmetric positive-(semi)definite covariance, fp32.
-    """
-    # fp32 inside even under bf16 autocast: the per-Gaussian matmul is small but
-    # the L2 distance accumulates over B*N matrices, so stability matters.
-    s32 = s.float()
-    q32 = q.float()
-    q32 = q32 / q32.norm(dim=-1, keepdim=True).clamp_min(eps)
-    w, x, y, z = q32.unbind(-1)
-    R = torch.stack([
-        torch.stack([1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],     dim=-1),
-        torch.stack([2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],     dim=-1),
-        torch.stack([2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)], dim=-1),
-    ], dim=-2)                                                # [..., 3, 3]
-    # Σ = R · diag(s²) · Rᵀ computed as (R * s²[None, :]) @ Rᵀ
-    s2  = s32 * s32                                           # [..., 3]
-    Rs2 = R * s2.unsqueeze(-2)                                # R[..., :, j] *= s²[..., j]
-    return Rs2 @ R.transpose(-1, -2)                          # [..., 3, 3]
-
-
-def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0,
-                                valid_mask=None, exclude_scale_rotation=False,
-                                use_sigma_loss=False, sigma_weight=1.0,
-                                use_render_loss=False):
+def compute_reconstruction_loss(prediction, target, batch_size, color_weight=1.0, valid_mask=None):
     """Element-wise L2 recon loss. valid_mask: optional [B,N] tensor; when given
     (canonical_voxel padding case), padding slots (mask==0) are zeroed in BOTH
     prediction and target before the norm so only real Gaussians are graded. None =
-    original behaviour (every slot counted).
-
-    exclude_scale_rotation : DIAGNOSTIC flag. When True, the scale (7:10) and
-    rotation (10:14) attributes are dropped from the loss entirely, so their
-    decoder heads receive ZERO gradient from this term. The loss becomes
-    Pos + color_weight * Col + Opa only. Used to test whether the local
-    encoder / token-local decoder can fit the smooth-across-slots attributes
-    when the slot-arbitrary ones (Scl, Rot) are removed. The Scl=... Rot=...
-    numbers in the training log are still computed via _masked_individual_losses
-    but are LOGGING only -- they do not drive training. Pair with --kl_weight 0
-    and a small --train_scenes to run a clean overfit diagnostic.
-
-    use_sigma_loss : DIAGNOSTIC flag (gauge-removal test). When True, the
-    element-wise L2 terms on scale (7:10) and rotation (10:14) are REPLACED with
-    a single Frobenius norm on the covariance Σ = R(q)·diag(s²)·R(q)ᵀ, which is
-    GAUGE-INVARIANT in (s, q): any orbit representative produces the same Σ, so
-    the L2-on-orbit averaging that drives predictions to isotropic blobs no
-    longer applies. Position (0:3), color (3:6), opacity (6:7) stay as element-
-    wise L2 since they carry no gauge group. The Scl=... Rot=... numbers in the
-    log are still computed on raw (s, q) but become uninformative -- the model
-    is free to pick any orbit representative, so those per-attribute L2
-    magnitudes can grow or oscillate even as the rendered Gaussians become
-    correctly anisotropic. THE PLY RENDER IS THE REAL SIGNAL. Takes precedence
-    over exclude_scale_rotation if both are set.
-    sigma_weight scales the Σ Frobenius term; default 1.0 is the raw Frobenius
-    distance summed over all (B*N) Gaussians.
-    """
+    original behaviour (every slot counted)."""
     if valid_mask is not None:
         m = valid_mask.unsqueeze(-1).to(prediction.dtype)   # [B,N,1] broadcast over 14 attrs
         prediction = prediction * m
         target     = target * m
-    if use_sigma_loss:
-        # Gauge-invariant path: replace L2 on (s, q) with Frobenius on Σ.
-        # Position, color, opacity carry no gauge -> element-wise L2 unchanged.
-        pos_loss   = torch.norm(prediction[:,:,0:3] - target[:,:,0:3], p=2)
-        col_loss   = torch.norm(prediction[:,:,3:6] - target[:,:,3:6], p=2) * color_weight
-        opa_loss   = torch.norm(prediction[:,:,6:7] - target[:,:,6:7], p=2)
-        sigma_pred = _build_sigma_from_sq(prediction[:,:,7:10], prediction[:,:,10:14])
-        sigma_targ = _build_sigma_from_sq(target[:,:,7:10],     target[:,:,10:14])
-        diff       = sigma_pred - sigma_targ                                # [B, N, 3, 3]
-        if valid_mask is not None:
-            diff = diff * valid_mask.unsqueeze(-1).unsqueeze(-1).to(diff.dtype)
-        sigma_loss = torch.norm(diff, p=2) * float(sigma_weight)
-        return (pos_loss + col_loss + opa_loss + sigma_loss) / batch_size
-    if exclude_scale_rotation or use_render_loss:
-        # Diagnostic path: third term covers ONLY opacity (6:7). Scale (7:10) and
-        # rotation (10:14) get no gradient from THIS loss term. Under
-        # --render_loss the shape gradient is supplied by the rendered-image
-        # comparison computed externally in the training loop; here we simply
-        # remove the element-wise (s, q) term that was driving collapse.
-        return (torch.norm(prediction[:,:,0:3] - target[:,:,0:3], p=2)
-              + torch.norm(prediction[:,:,3:6] - target[:,:,3:6], p=2) * color_weight
-              + torch.norm(prediction[:,:,6:7] - target[:,:,6:7], p=2)
-              ) / batch_size
     if color_weight == 1.0:
         return torch.norm(prediction - target, p=2) / batch_size
     return (torch.norm(prediction[:,:,0:3] - target[:,:,0:3], p=2)
@@ -411,19 +315,6 @@ parser.add_argument('--token_cond_approach',  type=str,   default='B',
 parser.add_argument('--decoder_fourier_pe',   action='store_true', default=False)
 parser.add_argument('--token_local_decoder', action='store_true', default=False,
     help='Replace flat GS_decoder with shared per-token MLP. See token_local_decoder.py.')
-parser.add_argument('--token_local_separate_heads', action='store_true', default=False,
-# parser.add_argument('--token_local_separate_heads', action='store_true', default=False)
-# parser.add_argument('--token_local_separate_heads', action='store_true', default=False)
-# parser.add_argument('--token_local_separate_heads', action='store_true', default=False,
-    help="""In the TokenLocalDecoder, use 5 independent per-attribute heads (pos / col / opa / scl / rot).
-         off a shared trunk h2 instead of one shared out_linear. Fixes the gradient-starvation
-         failure where position's gradient drowns out color and rotation in the shared head
-         (Col / Rot stuck near random init while Pos and Scl converge). Requires --token_local_decoder.""")
-
-parser.add_argument('--token_local_head_cross_stitch', action='store_true', default=False,
-    help="""Cross-stitch the 5 per-attribute heads (only meaningful with --token_local_separate_heads).
-         Lets each attribute head see a small learned combination of the others' trunks. Defer to
-         an ablation once --token_local_separate_heads is validated alone.""")
 parser.add_argument('--token_cond_adaln',     action='store_true', default=False)
 parser.add_argument('--semantic_token_heads', action='store_true', default=False)
 # Legacy
@@ -435,63 +326,6 @@ parser.add_argument('--no_label_input',       dest='label_input', action='store_
 parser.add_argument('--scale_norm_mode',      type=str,   default='linear',
                     choices=['log','linear'])
 parser.add_argument('--color_loss_weight',    type=float, default=1.0)
-parser.add_argument('--no_scale_rotation_loss', action='store_true', default=False,
-    help='DIAGNOSTIC: drop scale (7:10) and rotation (10:14) from the reconstruction '
-         'loss so their decoder heads receive ZERO gradient from this term. The model '
-         'still PRODUCES scale/rotation outputs (the Scl=... Rot=... numbers in the log '
-         'are still computed for monitoring) but they do not drive training. The Scl/Rot '
-         'numbers will be uninformative under this flag and should be ignored when '
-         'reading the run. Pairs with --kl_weight 0 and a small --train_scenes to test '
-         'whether the local encoder / token-local decoder can fit the smooth-across-slots '
-         'attributes (Pos, Col) when the slot-arbitrary ones (Scl, Rot) are removed. '
-         'Reference target on 4 chunks with the flat decoder + reordering, KL=0: '
-         'Pos~7, Col~3, Opa~0.07.')
-parser.add_argument('--sigma_loss', action='store_true', default=False,
-    help='DIAGNOSTIC (gauge-removal): replace element-wise L2 on scale (7:10) and '
-         'rotation (10:14) with a gauge-invariant Frobenius norm on the covariance '
-         'Sigma = R(q)*diag(s^2)*R(q)^T. Tests whether the small-isotropic-Gaussian '
-         'failure mode is caused by gauge ambiguity in the (s, q) parameterisation. '
-         'Position (0:3), color (3:6), opacity (6:7) stay as element-wise L2 since '
-         'they carry no gauge group. Pair with the same setup as a no_scale_rotation '
-         'overfit baseline so the runs are directly comparable. The Scl=.../Rot=... '
-         'numbers in the log become uninformative under this flag -- inspect the '
-         'reconstructed PLYs to confirm Gaussians become anisotropic. Takes precedence '
-         'over --no_scale_rotation_loss if both are set.')
-parser.add_argument('--sigma_weight', type=float, default=1.0,
-    help='Multiplier on the Sigma Frobenius term when --sigma_loss is on. 1.0 = raw '
-         'Frobenius distance summed over all (B*N) Gaussians. Increase if the early '
-         'Pos/Col loss dominates and Sigma stays unfit; decrease if Sigma explodes and '
-         'Pos/Col stop converging. Default 1.0 matches the magnitude of the prior L2 '
-         'scale+rotation term roughly for typical normalised splat sizes.')
-parser.add_argument('--render_loss', action='store_true', default=False,
-    help='DIAGNOSTIC (image-supervised shape): replace element-wise L2 on (s, q) '
-         'with a differentiable-render comparison. Predicted and ground-truth '
-         'Gaussians are rasterised through synthesised cameras and the resulting '
-         'images are compared with L1 + ssim_weight*(1-SSIM). Position (0:3), '
-         'color (3:6), opacity (6:7) still use element-wise L2; scale (7:10) and '
-         'rotation (10:14) get gradient only through the rendered image. Tests '
-         'whether per-pixel pooling at the renderer escapes the conditional-mean '
-         'isotropic minimum that both L2-on-(s,q) and L2-on-Sigma converged to. '
-         'Requires gsplat or diff-gaussian-rasterization installed.')
-parser.add_argument('--render_loss_weight', type=float, default=1.0,
-    help='Multiplier on the render-loss term in the total loss. 1.0 is a sensible '
-         'default for an L1+SSIM image loss in [0,1] alongside the element-wise '
-         'L2 terms in their current scale. Increase if Pos/Col/Opa dominate and '
-         'shapes never converge; decrease if the renders dominate and Pos/Col '
-         'stop improving.')
-parser.add_argument('--render_num_cameras', type=int, default=2,
-    help='Number of synthesised cameras rendered per scene per training step. '
-         'More cameras = more informative shape gradient but linearly more '
-         'rasteriser cost. 2-4 is the published sweet spot.')
-parser.add_argument('--render_image_size', type=int, default=128,
-    help='Square image side length for render-loss rasterisation. 128 keeps '
-         'training-step cost reasonable; 256+ may help shape detail but slows '
-         'training meaningfully.')
-parser.add_argument('--render_fov_deg', type=float, default=60.0,
-    help='Vertical field of view (degrees) for synthesised cameras.')
-parser.add_argument('--render_ssim_weight', type=float, default=0.2,
-    help='Weight on the (1-SSIM) term inside the render loss. Standard 3DGS '
-         'recipe uses 0.2 (so the loss is 0.8 * L1 + 0.2 * (1-SSIM)).')
 parser.add_argument('--scale_penalty_weight', type=float, default=0.0)
 parser.add_argument('--scale_penalty_threshold', type=float, default=0.5)
 preload_grp = parser.add_mutually_exclusive_group()
@@ -741,15 +575,6 @@ if accelerator.is_main_process:
     if args.canonical_voxel:
         print(f"  CANONICAL VOXEL : ON  R={args.voxel_res}  snap={args.voxel_snap}  "
               f"(gauge-removal: one rep Gaussian/occupied voxel, padding masked in loss)")
-    if args.sigma_loss:
-        print(f"  SIGMA LOSS      : ON  weight={args.sigma_weight}  "
-              f"(gauge-INVARIANT Frobenius on Sigma=R(q)*diag(s^2)*R(q)^T; "
-              f"replaces element-wise L2 on (s, q))")
-    if args.render_loss:
-        print(f"  RENDER LOSS     : ON  weight={args.render_loss_weight}  "
-              f"({args.render_num_cameras}cam@{args.render_image_size}px, "
-              f"fov={args.render_fov_deg:.0f}deg, ssim_w={args.render_ssim_weight}; "
-              f"replaces element-wise L2 on (s, q))")
     print(f"  cross_recon={args.cross_recon_weight} ortho={args.ortho_weight}")
     print(f"  Save: {save_path}")
     print(f"{'='*70}\n")
@@ -785,8 +610,6 @@ p.decoder_fourier_pe      = args.decoder_fourier_pe
 p.token_cond_adaln        = args.token_cond_adaln
 p.semantic_token_heads    = args.semantic_token_heads
 p.token_local_decoder     = args.token_local_decoder
-p.token_local_separate_heads    = args.token_local_separate_heads
-p.token_local_head_cross_stitch = args.token_local_head_cross_stitch
 p.anchor_relative_decode  = args.anchor_relative_decode
 p.anchor_teacher_force    = args.anchor_teacher_force
 p.offset_scale_init       = args.offset_scale_init
@@ -1270,8 +1093,6 @@ _ckpt_meta = {
     'token_cond_adaln':           args.token_cond_adaln,
     'semantic_token_heads':       args.semantic_token_heads,
     'token_local_decoder':        args.token_local_decoder,
-    'token_local_separate_heads':    args.token_local_separate_heads,
-    'token_local_head_cross_stitch': args.token_local_head_cross_stitch,
     'scaffold_mode':              args.scaffold_mode,
     'anchor_relative_decode':     args.anchor_relative_decode,
     'anchor_teacher_force':       args.anchor_teacher_force,
@@ -1325,14 +1146,6 @@ _ckpt_meta = {
     'canonical_voxel':            args.canonical_voxel,
     'voxel_res':                  args.voxel_res,
     'voxel_snap':                 args.voxel_snap,
-    'sigma_loss':                 args.sigma_loss,
-    'sigma_weight':               args.sigma_weight,
-    'render_loss':                args.render_loss,
-    'render_loss_weight':         args.render_loss_weight,
-    'render_num_cameras':         args.render_num_cameras,
-    'render_image_size':          args.render_image_size,
-    'render_fov_deg':             args.render_fov_deg,
-    'render_ssim_weight':         args.render_ssim_weight,
 }
 
 # ============================================================================
@@ -1444,11 +1257,7 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
 
             pred_abs   = UV_gs_recover.reshape(B,-1,14)
             recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight,
-                                                     valid_mask=vmask_gpu,
-                                                     exclude_scale_rotation=args.no_scale_rotation_loss,
-                                                     use_sigma_loss=args.sigma_loss,
-                                                     sigma_weight=args.sigma_weight,
-                                                     use_render_loss=args.render_loss)
+                                                     valid_mask=vmask_gpu)
             kl_loss    = -0.5*torch.sum(1+log_var - mu.pow(2) - log_var.exp(), dim=1)
 
             if mcp is not None and args.color_residual:
@@ -1665,28 +1474,6 @@ def evaluate_model(model, raw_model, dataloader, device, accelerator,
 # ============================================================================
 print(f"\n{'='*70}\nSTARTING TRAINING  (epoch {start_epoch} -> {args.num_epochs-1})\n{'='*70}\n")
 
-# Render-loss module: built once, reused every train/eval step. Built lazily
-# (only when --render_loss is on) so a default run never imports gsplat.
-_render_module = None
-if args.render_loss:
-    if not _RENDER_HELPERS_AVAILABLE:
-        raise RuntimeError(
-            "--render_loss requires render_loss_helpers.py next to this script. "
-            "Run apply_render_loss_patch.py to install it. "
-            f"Import error was: {_RENDER_IMPORT_ERROR}")
-    _render_module = _get_render_module(
-        num_cameras=args.render_num_cameras,
-        image_size=args.render_image_size,
-        fov_deg=args.render_fov_deg,
-        ssim_weight=args.render_ssim_weight,
-        color_residual=args.color_residual,
-        frame_radius=10.0,
-        verbose=accelerator.is_main_process,
-    )
-    if accelerator.is_main_process:
-        print(f"  [render_loss] module ready (backend={_render_module.backend}, "
-              f"weight={args.render_loss_weight}, sanity renders at epoch 0 batch 0)")
-
 _kl_anneal_active = (args.kl_anneal_steps > 0)
 _kl_step_offset   = _bpe * start_epoch
 
@@ -1751,7 +1538,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         'zs_tok_nce','zs_tok_ncats',
         'zs_lay_nce','zs_lay_ncats',
         'zs_pool_nce','zs_pool_ncats',
-        'render',
         'pos','col','opa','scl','rot']}
 
     for i_batch, batch_data in enumerate(trainDataLoader):
@@ -1820,36 +1606,7 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
             pred_3d = UV_gs_recover.reshape(B,-1,14)
 
         recon_loss = compute_reconstruction_loss(pred_3d, target, B, args.color_loss_weight,
-                                                 valid_mask=vmask_gpu,
-                                                 exclude_scale_rotation=args.no_scale_rotation_loss,
-                                                 use_sigma_loss=args.sigma_loss,
-                                                 sigma_weight=args.sigma_weight,
-                                                 use_render_loss=args.render_loss)
-        # --- RENDER LOSS (external, needs absolute params + mean_color) ----------
-        render_loss = torch.zeros((), device=device)
-        if args.render_loss and _render_module is not None:
-            _pred_abs_render = UV_gs_recover.reshape(B, -1, 14)
-            # The rasteriser path is fp32; bf16 autocast can mix dtypes and crash
-            # gsplat. Disable autocast strictly around the render call.
-            try:
-                with torch.autocast('cuda', enabled=False):
-                    render_loss = _render_module(_pred_abs_render.float(),
-                                                 target_abs.float(),
-                                                 mean_color_gt.float(),
-                                                 vmask_gpu)
-                # One-shot visual sanity check at the very start of training, so
-                # any rasteriser-wiring bug shows up before hours of compute go by.
-                if epoch == start_epoch and i_batch == 0 and accelerator.is_main_process:
-                    _sanity_dir = os.path.join(save_path, 'render_sanity', f'epoch_{epoch:04d}')
-                    _render_module.save_sanity_renders(
-                        _pred_abs_render.float(), target_abs.float(),
-                        mean_color_gt.float(), vmask_gpu,
-                        output_dir=_sanity_dir, num_scenes=min(B, 2))
-            except Exception as _render_err:
-                if accelerator.is_main_process and i_batch == 0:
-                    print(f"  [render_loss] training-step render failed: "
-                          f"{type(_render_err).__name__}: {_render_err}")
-                render_loss = torch.zeros((), device=device)
+                                                 valid_mask=vmask_gpu)
 
         log_var_clamped = log_var.clamp(-10.0, 10.0)
         KL_loss     = -0.5*torch.sum(1+log_var_clamped-mu.pow(2)-log_var_clamped.exp(), dim=1).mean()
@@ -2047,7 +1804,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
                                               threshold=args.scale_penalty_threshold)
 
         total_loss = (recon_loss
-                      + args.render_loss_weight    * render_loss
                       + _kl_current                * KL_loss
                       + args.mean_color_weight       * color_pred_loss
                       + args.scene_semantic_weight   * scene_sem_loss
@@ -2092,7 +1848,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         e['pos'] += ind['position']; e['col'] += ind['color']
         e['opa'] += ind['opacity'];  e['scl'] += ind['scale']
         e['rot'] += ind['rotation']
-        e['render'] += float(render_loss.detach().item()) if args.render_loss else 0.0
 
         if epoch == start_epoch and i_batch == 0 and accelerator.is_main_process:
             print(f"\nEPOCH {epoch} BATCH 0 DIAGNOSTIC:")
@@ -2117,7 +1872,6 @@ for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Training",
         print(f"\nEpoch {epoch:04d} | "
               f"Loss={e['loss']/nb:.4f} | "
               f"Recon={e['recon']/nb:.4f} | "
-              f"Render={e['render']/nb:.4f} | "
               f"KL={e['kl']/nb:.4f} | "
               f"KLw={_kl_log:.2e} | "
               f"ColorPred={e['color_pred']/nb:.6f} | "
@@ -2263,9 +2017,3 @@ if wandb_enabled and accelerator.is_main_process:
     wandb_run.finish()
 
 if accelerator.is_main_process: print("Done.")
-
-# === NO_SCALE_ROTATION_PATCH_APPLIED ===
-# === SIGMA_LOSS_PATCH_APPLIED ===
-# === RENDER_LOSS_PATCH_APPLIED ===
-
-# === TOKEN_LOCAL_SEPARATE_HEADS_PATCH_APPLIED ===

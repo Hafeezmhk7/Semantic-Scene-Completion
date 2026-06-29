@@ -1,0 +1,212 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_overfit_sigma_plus_render
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=10:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=60G
+#SBATCH --output=logs_ss1/can3tok_overfit_sigma_plus_render_%j.out
+#SBATCH --error=logs_ss1/can3tok_overfit_sigma_plus_render_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# OVERFIT DIAGNOSTIC: SIGMA LOSS + RENDER LOSS  (combined)
+# ----------------------------------------------------------------------------
+# QUESTION: Each loss alone fails for a different reason. Can their combination
+# break both failure modes at once?
+#
+# THE STORY SO FAR (each row a separate overfit on the same 4 chunks):
+#   element-wise L2 on (s, q)     -> small isotropic dots
+#   --no_scale_rotation_loss      -> small isotropic dots (no shape gradient at all)
+#   --sigma_loss (Frobenius on Σ) -> small isotropic dots (gauge fix alone not enough)
+#   --render_loss (2 synth cams)  -> NEEDLE Gaussians + a few correctly-anisotropic
+#                                     surface patches in a central blob
+#
+# DIAGNOSIS OF THE TWO FAILURES:
+#   * Element-wise on (s, q) and on Σ both converge to the isotropic conditional
+#     mean of the per-slot shape distribution. The mechanism is: per-slot shape
+#     is not a function of scene identity across rooms (different scenes orient
+#     surfaces differently through the same Hilbert cell), so the L2-optimal
+#     predictor averages over a rotationally-broad distribution, and the
+#     centroid of such a distribution is isotropic. Same destination via two
+#     different roads.
+#   * Render loss on 2 synthesised cameras escapes the isotropic attractor but
+#     introduces an opposite pathology: per-Gaussian shape is massively
+#     under-constrained by 2 viewing directions, so the optimizer collapses
+#     individual Gaussians into needles (thin slivers that project to nearly
+#     a single pixel from most viewpoints and contribute almost nothing to the
+#     loss while burning a slot in the prediction).
+#
+# HYPOTHESIS BEING TESTED:
+#   The two pathologies pull in opposite directions:
+#     sigma loss   pulls shapes toward the isotropic conditional mean
+#     render loss  pulls shapes toward whatever fits the rendered image
+#   Their combination has a non-isotropic, non-needle equilibrium because:
+#     - render loss prevents collapse to isotropic (its gradient says NO to
+#       "make everything a small round blob, the image looks wrong")
+#     - sigma loss prevents collapse to needles (its gradient says NO to
+#       "make a few hair-thin Gaussians, the Σ distribution doesn't have
+#       eigenvalue ratios of 10000:1")
+#   The equilibrium should be: anisotropic but not pathological -- shapes
+#   roughly drawn from the real 3DGS Σ distribution. If true, this is the
+#   thesis-grade finding: "no single per-Gaussian loss recovers 3DGS shape;
+#   the working approach is image supervision regularised by a gauge-invariant
+#   shape prior."
+#
+# WHAT FAILURE MEANS:
+#   Three failure modes are possible. Each tells us something different.
+#     (a) Still isotropic blobs   -> sigma weight too high relative to render;
+#                                    bump --render_loss_weight to 10 or 100 in
+#                                    a follow-up.
+#     (b) Still needles            -> render weight too high relative to sigma;
+#                                    bump --sigma_weight to 5 or 10.
+#     (c) Neither isotropic nor needle but still wrong (e.g. clusters in odd
+#         positions, wrong colors)  -> the per-slot regression target itself
+#                                    is the obstacle; next move is canonical-
+#                                    voxel-snap preprocessing or dropping shape
+#                                    from Stage-1 entirely.
+#
+# DIRECT COMPARABILITY:
+#   Same 4 chunks, same arch flags, same 1000 epochs as the four prior
+#   diagnostic runs. The only changes are --sigma_loss --sigma_weight 1.0 added
+#   to the existing render-loss setup. The PLYs from this run are directly
+#   comparable to all prior PLYs at matching epochs/scenes.
+#
+# READING THE LOG:
+#   Recon  = pos + col + opa + sigma_weight * sigma_Frobenius   (all in one number;
+#                                                                 sigma not broken out)
+#   Render = raw L1 + 0.2 * (1 - SSIM) on the rendered images   (separate column)
+#   Scl    = element-wise L2 on raw (s, q) -- LOGGING ONLY, not used in training
+#   Rot    = element-wise L2 on raw quaternions -- LOGGING ONLY, not used
+#
+#   Render at convergence should be roughly equal to or lower than the
+#   render-only run's 0.20. If significantly higher (say > 0.25), sigma is
+#   suppressing the render gradient and we need to rebalance.
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
+mkdir -p logs_ss1 checkpoints_stage1
+
+export WANDB_API_KEY="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"
+wandb login $WANDB_API_KEY --relogin 2>/dev/null
+
+ACCEL=/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml
+
+# ── PATCH PRE-FLIGHT: both sigma-loss AND render-loss patches must be applied ─
+if ! grep -q "SIGMA_LOSS_PATCH_APPLIED" gs_can3tok_2.py; then
+    echo "ERROR: SIGMA_LOSS_PATCH_APPLIED sentinel not found in gs_can3tok_2.py."
+    echo "       Run:  python apply_sigma_loss_patch.py"
+    exit 2
+fi
+if ! grep -q "RENDER_LOSS_PATCH_APPLIED" gs_can3tok_2.py; then
+    echo "ERROR: RENDER_LOSS_PATCH_APPLIED sentinel not found in gs_can3tok_2.py."
+    echo "       Run:  python apply_render_loss_patch.py"
+    exit 2
+fi
+if [ ! -f "render_loss_helpers.py" ]; then
+    echo "ERROR: render_loss_helpers.py not found next to gs_can3tok_2.py."
+    exit 2
+fi
+echo "  Both patches active in gs_can3tok_2.py, helpers present."
+
+RAST=$(python3 -c "
+try:
+    import gsplat; print('gsplat')
+except ImportError:
+    try:
+        import diff_gaussian_rasterization; print('inria')
+    except ImportError:
+        print('none')
+" 2>/dev/null)
+if [ "$RAST" = "none" ]; then
+    echo "ERROR: no differentiable Gaussian rasteriser found in the python env."
+    exit 2
+fi
+echo "  Rasteriser backend: $RAST"
+
+# ── single-process launch (1 GPU): no DDP for the diagnostic ─────────────────
+accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
+  --train_data chunks \
+  --train_scenes 4 \
+  --chunk_val_scenes 4 \
+  --val_scenes 4 \
+  --batch_size 4 \
+  --num_epochs 1000 \
+  --eval_every 100 \
+  --num_gaussians 40000 \
+  --lr 2e-4 \
+  --kl_weight 0.0 \
+  --kl_anneal_steps 0 \
+  --weight_decay 0.0 \
+  --warmup_steps 50 \
+  --lr_min_ratio 1.0 \
+  --morton_order --order_curve hilbert --order_frame_radius 10.0 \
+  --local_encoder --local_window 1 \
+  --token_local_decoder \
+  --sigma_loss --sigma_weight 1.0 \
+  --render_loss --render_loss_weight 1.0 \
+  --render_num_cameras 2 --render_image_size 128 \
+  --render_fov_deg 60.0 --render_ssim_weight 0.2 \
+  --lr_restart_T0 0 \
+  --color_residual --mean_color_weight 0.5 --color_loss_weight 2.0 \
+  --scale_norm_mode linear \
+  --decoder_fourier_pe \
+  --recon_ply_freq 100 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
+  --pca_vis_freq 100000 \
+  --embed_dim 32 \
+  --no_preload \
+  --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC
+
+echo "Exit: $?  |  End: $(date)"
+echo ""
+echo "WHAT TO LOOK AT (in order of importance):"
+echo ""
+echo "  1. RECONSTRUCTED PLYS at epoch 900:"
+echo "       reconstructed_gaussians_chunk/epoch_0900/scene*.ply"
+echo "     Compare directly against:"
+echo "       (a) the sigma-only run's epoch 900 PLYs  -> expect non-isotropic improvement"
+echo "       (b) the render-only run's epoch 900 PLYs -> expect needle elimination"
+echo "     Diagnosis CONFIRMED if Gaussians look ELLIPSOIDAL (anisotropic but not"
+echo "     pathologically thin), not isotropic and not needles."
+echo ""
+echo "  2. LOSS BALANCE at early epochs:"
+echo "       grep 'Render=' logs_ss1/can3tok_overfit_sigma_plus_render_${SLURM_JOB_ID}.out | head -10"
+echo "       grep 'Render=' logs_ss1/can3tok_overfit_sigma_plus_render_${SLURM_JOB_ID}.out | tail -10"
+echo "     Render value should converge to <= 0.20 (the render-only run's final value)."
+echo "     If significantly higher, sigma is suppressing render's gradient -- bump"
+echo "     --render_loss_weight to 10 in a follow-up run."
+echo ""
+echo "  3. RECON TRAJECTORY:"
+echo "       grep 'Recon=' logs_ss1/can3tok_overfit_sigma_plus_render_${SLURM_JOB_ID}.out | tail -10"
+echo "     Should converge to a value larger than the render-only run's ~56 (because"
+echo "     sigma is now adding to Recon). A reasonable expectation is Recon in the"
+echo "     60-80 range at convergence."
+echo ""
+echo "  4. VAL METRICS:"
+echo "       grep 'Val FULL\\|Val HELD' logs_ss1/can3tok_overfit_sigma_plus_render_${SLURM_JOB_ID}.out -A2 | tail -30"
+echo "     Val Pos should drop from ~1700 -> ~1000, similar to prior runs. Val Scl"
+echo "     and Val Rot are now uninformative under sigma+render."
+echo ""
+echo "  IGNORE Scl=... and Rot=... in the per-epoch print line. Under sigma+render"
+echo "  these are logged values of raw (s, q) L2 which neither loss directly"
+echo "  penalises. The PLYs are the only signal that matters for shape."
+echo ""
+echo "  IF THE COMBINATION ALSO FAILS (still isotropic, still needles, or some new"
+echo "  pathology): the conclusion becomes that per-slot 3DGS shape regression is"
+echo "  fundamentally too under-constrained at this camera coverage; next moves are"
+echo "  (a) bump --render_num_cameras from 2 to 8, or"
+echo "  (b) canonical-voxel-snap preprocessing so per-cell Σ becomes a function of"
+echo "      cell occupancy rather than scene identity, or"
+echo "  (c) drop shape from Stage-1 entirely and predict pos+col+opa only, fixing"
+echo "      scale to small isotropic and rotation to identity, then learn shape in"
+echo "      Stage-2 or a post-hoc render-loss fine-tune."

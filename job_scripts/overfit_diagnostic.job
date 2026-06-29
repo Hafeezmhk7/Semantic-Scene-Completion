@@ -1,53 +1,317 @@
 #!/bin/bash
 #SBATCH --job-name=can3tok_overfit
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus=1
-#SBATCH --time=08:00:00
+#SBATCH --gpus=4
+#SBATCH --time=25:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=9
-#SBATCH --mem=60G
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=90G
 #SBATCH --output=logs_ss1/can3tok_overfit_%j.out
 #SBATCH --error=logs_ss1/can3tok_overfit_%j.err
+
+# =============================================================================
+# CAN3TOK OVERFIT-DIAGNOSTIC RUN
+# =============================================================================
+# Built from can3tok_hypothesis_test_cross_switch.job with TWO targeted changes
+# to support the gauge-ambiguity diagnostic workflow:
+#
+#   1) DETERMINISTIC SCENE SELECTION (was already there, now enforced)
+#      - RANDOM_SUBSET_SEED="" -> training takes the FIRST TRAIN_SCENES sorted
+#        scene directories (a deterministic prefix, reproducible across reruns).
+#      - Chunk val (when TRAIN_DATA=chunks/combined) takes the next
+#        CHUNK_VAL_SCENES sorted chunks after that prefix -> disjoint by
+#        construction and deterministic.
+#      - The script aborts if RANDOM_SUBSET_SEED is set AND TRAIN_VIS_SCENES > 0
+#        (the train-vis loader would then no longer be a subset of training).
+#
+#   2) TRAIN-SET RECONSTRUCTIONS (NEW: TRAIN_VIS_SCENES)
+#      - Builds a SEPARATE, non-augmented, non-shuffled, preloaded loader of the
+#        FIRST TRAIN_VIS_SCENES sorted training scenes -- the same scenes the
+#        model sees during training.
+#      - At every eval epoch the model is run on this loader; the resulting
+#        PLYs land at:
+#          reconstructed_gaussians_train/      -- model output on training scenes
+#          ground_truth_gaussians_train/       -- GT for the SAME scenes (epoch 0 only)
+#          pca_visualisations_train/           -- PCA of latents / per-Gaussian feats
+#        alongside the existing held-out folders.
+#      - The diagnostic question: when val_L2 plateaus, is the model failing to
+#        FIT (train_vis_L2 is also high) or failing to GENERALIZE (train_vis_L2
+#        is low but val_L2 is high)? The new "GENERALIZATION GAP val_L2 /
+#        train_vis_L2" printed at each eval makes that explicit.
+#
+# To run:
+#   1) Apply the patch once: python3 apply_train_vis_patch.py gs_can3tok_2.py
+#   2) sbatch can3tok_overfit.job
+#
+# For a real OVERFIT experiment (fit 10 scenes, see whether the model can
+# memorize them at all), set:
+#   TRAIN_SCENES=10
+#   TRAIN_VIS_SCENES=3
+#   CHUNK_VAL_SCENES=3      # held-out chunks for generalization diagnostic
+#   NUM_EPOCHS=1000+        # long enough to see plateaus
+# With 10 training scenes the model should be able to drive train_vis_L2 very
+# low (it has the capacity to memorize each scene's geometry). If it can't,
+# that points at the gauge problem (the target itself isn't an identifiable
+# function of the scene's identity).
+# =============================================================================
 
 echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
 
 # ============================================================================
-# OVERFIT DIAGNOSTIC  (capability test, NOT a learning test)
-# ----------------------------------------------------------------------------
-# QUESTION: Can this architecture + element-wise-L2 objective produce a SHARP
-# reconstruction AT ALL, when every excuse (compression / generalization / KL /
-# competing losses) is removed?
-#
-# SETUP (every advantage given to the model):
-#   * train on a TINY set (4 chunks) -> near-memorization, no generalization demand
-#   * KL OFF (--kl_weight 0) -> no bottleneck squeezing the latent toward a blurry mean
-#   * NO side losses (semantic / layout / cross-recon / ortho / infoNCE all 0/off)
-#     -> the optimizer spends 100% of capacity on raw reconstruction
-#   * single GPU, batch=4 -> the whole set is one batch, cleanest possible signal
-#   * many epochs -> let it fully converge / memorize
-#   * canonical_voxel ON (the gauge fix we confirmed) so scale/rotation are identifiable
-#   * NO snap -> keep real within-cell positions (avoid grid quantization blur)
-#
-# READING THE RESULT (look at the held-out-chunk recon PLY, and the train Recon):
-#   * Train Recon drives toward ~0 AND the chunk render is SHARP / oriented
-#       -> the objective CAN represent a sharp chunk. The blur in real runs is
-#          capacity / compression / generalization -> fix ARCHITECTURE, keep L2.
-#   * Train Recon plateaus high, OR it memorizes (train Recon low) but the render
-#     is STILL a blurry blob
-#       -> the element-wise-L2-on-parameters objective itself cannot express
-#          sharpness -> the FORMULATION is wrong -> move to a RENDER loss.
-#
-# NOTE (config-only, no code edit): the script's chunk-val is held-out by
-# construction (skip_scenes), so we render the held-out chunk, not the literal
-# trained chunk. With only 4 chunks + KL off + long training the model is pushed
-# hard toward the memorization regime, so the held-out-chunk render is a strong
-# proxy. If it blobs here, the objective is the ceiling.
+# DATASET SELECTION
+# ============================================================================
+TRAIN_DATA="chunks"
+
+# ============================================================================
+# FLAGS
+# ============================================================================
+
+# ── CANONICAL VOXEL GAUGE TEST ───────────────────────────────────────────────
+CANONICAL_VOXEL=False
+VOXEL_RES=64
+VOXEL_SNAP=False
+
+RESUME_CHECKPOINT=""
+RESUME_EPOCH=""
+
+DECODER_LAYOUT_CROSS_ATTN=False
+DECODER_LAYOUT_ADDITIVE=False
+
+TOKEN_LOCAL_DECODER=False
+TOKEN_LOCAL_SEPARATE_HEADS=False
+TOKEN_LOCAL_HEAD_CROSS_STITCH=False
+
+# ── POSITION SCAFFOLD / ANCHORS ──────────────────────────────────────────────
+POSITION_SCAFFOLD=False
+SCAFFOLD_MODE="hilbert_block"
+ANCHOR_RELATIVE_DECODE=False
+ANCHOR_TEACHER_FORCE=False
+OFFSET_SCALE_INIT=2.0
+ANCHOR_LOSS_WEIGHT=1.0
+
+# ── LOCAL ENCODER + LOCAL DISENTANGLEMENT ────────────────────────────────────
+LOCAL_ENCODER=False
+LOCAL_WINDOW=1
+STRUCTURED_LATENT=False
+
+LOCAL_DISENTANGLE=False
+
+SEMANTIC_MODE_OVERRIDE="hidden"
+
+LATENT_DISENTANGLE=False
+SEMANTIC_DIMS=512
+CROSS_RECON_WEIGHT=0.3
+ORTHO_WEIGHT=0.1
+
+COLOR_RESIDUAL=True
+MEAN_COLOR_WEIGHT=0.5
+COLOR_LOSS_WEIGHT=2.0
+
+STRUCTURED_LAYOUT_TOKENS=False
+
+SCENE_SEMANTIC_HEAD=False
+SCENE_SEMANTIC_WEIGHT=0.3
+SCENE_LAYOUT_HEAD=False
+LAYOUT_LOSS_WEIGHT=0.3
+SEMANTIC_TOKEN_HEADS=False
+
+ZS_POOL_INFONCE_WEIGHT=0.0
+ZS_POOL_INFONCE_TEMPERATURE=0.10
+
+ZS_LAYOUT_INFONCE_WEIGHT=0.0
+ZS_LAYOUT_INFONCE_TEMPERATURE=0.07
+ZS_TOKEN_INFONCE_WEIGHT=0.0
+ZS_TOKEN_INFONCE_TEMPERATURE=0.07
+Z_S_INFONCE_WEIGHT=0.0
+Z_S_INFONCE_TEMPERATURE=0.07
+Z_S_INFONCE_DELTA=0.4
+
+SEMANTIC_MODE="$SEMANTIC_MODE_OVERRIDE"
+SEGMENT_WEIGHT=0.4
+INSTANCE_WEIGHT=0.0
+SEMANTIC_TEMP=0.10
+SEMANTIC_SUBSAMPLE=10000
+SAMPLING_STRATEGY="balanced"
+
+DECODER_FOURIER_PE=True
+DECODER_POS_ENC=False
+
+TOKEN_COND=False
+TOKEN_COND_APPROACH="B"
+TOKEN_COND_ADALN=False
+
+SCALE_PENALTY_WEIGHT=0.0
+SCALE_PENALTY_THRESHOLD=0.5
+
+CROP_PERCENTILE=100.0
+
+# ── GAUSSIAN REORDERING (space-filling curve) ────────────────────────────────
+MORTON_ORDER=False
+ORDER_CURVE="hilbert"
+ORDER_FRAME_RADIUS=10.0
+
+AUG_YAW=False
+AUG_YAW_AXIS="z"
+AUG_YAW_MAX_DEG=180.0
+
+BATCH_SIZE=64
+NUM_EPOCHS=2000
+NUM_GAUSSIANS=40000
+POS_COND_HEADS=0
+POS_COND_COLOR=0
+POS_COND_ROTATION=0
+POS_COND_SIGMA=6.0
+POS_COND_POS_SCALE=10.0
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-5
+EMBED_DIM=32
+KL_ANNEAL_STEPS=0
+LR_RESTART_T0=800
+EVAL_EVERY=100
+WEIGHT_DECAY=1e-2
+WARMUP_STEPS=300
+LR_MIN_RATIO=0.1
+FAILURE_THRESHOLD=100
+
+# ── SCENE SELECTION (DETERMINISTIC) ──────────────────────────────────────────
+# Training takes the FIRST TRAIN_SCENES sorted chunks (RANDOM_SUBSET_SEED="").
+# Chunk val takes the next CHUNK_VAL_SCENES sorted chunks after that ->
+# disjoint, deterministic, reproducible. For real overfit experiments drop
+# TRAIN_SCENES to 5-50.
+TRAIN_SCENES=5
+RANDOM_SUBSET_SEED=""        # MUST stay empty when TRAIN_VIS_SCENES > 0
+VAL_SCENES=5               # full-scene val from interior_gs/val
+CHUNK_VAL_SCENES=5          # held-out chunks (sorted AFTER the training range)
+
+# ── NEW: TRAIN-SET RECONSTRUCTIONS ───────────────────────────────────────────
+# Number of TRAINING scenes the eval loop also reconstructs (visualization-
+# only; never used for loss/gradient). Picks the FIRST N sorted training
+# scenes -- guaranteed to be a subset of the training set when
+# RANDOM_SUBSET_SEED="". PLYs go to reconstructed_gaussians_train/ with GT at
+# ground_truth_gaussians_train/ (saved once at epoch 0). At each eval the log
+# prints the "GENERALIZATION GAP val_L2 / train_vis_L2", which makes the
+# fit-vs-generalize question explicit.
+# Set to 0 to disable; 3 is a good default (matches RECON_PLY_NUM_SCENES).
+TRAIN_VIS_SCENES=3
+
+SAMPLING_METHOD="opacity"
+SAMPLE_VOXEL_RES=96
+
+EXTRA_TRAIN_PATHS=""
+EXTRA_TRAIN_SCENES=""
+
+PRELOAD=False
+
+USE_CANONICAL_NORM=True
+CHUNK_NORM_FACTOR=True
+SCALE_NORM_MODE="linear"
+
+PCA_VIS_FREQ=200
+PCA_NUM_SCENES=3
+PCA_BRIGHTNESS=1.25
+RECON_PLY_FREQ=100
+RECON_PLY_NUM_SCENES=3
+RECON_PLY_MAX_SH=3
+
+export WANDB_API_KEY="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"
+USE_WANDB=True
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+_any_B=false
+[ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && _any_B=true
+[ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && _any_B=true
+
+if [ "$SEMANTIC_TOKEN_HEADS" = "True" ] && [ "$LATENT_DISENTANGLE" = "False" ]; then
+    echo "ERROR: SEMANTIC_TOKEN_HEADS requires LATENT_DISENTANGLE=True"; exit 1
+fi
+
+if [ "$LOCAL_DISENTANGLE" = "True" ] && [ "$LOCAL_ENCODER" != "True" ]; then
+    echo "ERROR: LOCAL_DISENTANGLE=True requires LOCAL_ENCODER=True"; exit 1
+fi
+
+if [ "$TOKEN_LOCAL_SEPARATE_HEADS" = "True" ] && [ "$TOKEN_LOCAL_DECODER" != "True" ]; then
+    echo "ERROR: TOKEN_LOCAL_SEPARATE_HEADS=True requires TOKEN_LOCAL_DECODER=True"; exit 1
+fi
+if [ "$TOKEN_LOCAL_HEAD_CROSS_STITCH" = "True" ] && [ "$TOKEN_LOCAL_SEPARATE_HEADS" != "True" ]; then
+    echo "ERROR: TOKEN_LOCAL_HEAD_CROSS_STITCH=True requires TOKEN_LOCAL_SEPARATE_HEADS=True"
+    exit 1
+fi
+
+# Train-vis check: deterministic subset requires deterministic training.
+if [ "$TRAIN_VIS_SCENES" != "0" ] && [ -n "$RANDOM_SUBSET_SEED" ]; then
+    echo "════════════════════════════════════════════════════════════════════════"
+    echo "  ERROR: TRAIN_VIS_SCENES=$TRAIN_VIS_SCENES requires RANDOM_SUBSET_SEED=\"\" (empty)."
+    echo "  The train-vis loader takes the first N SORTED training scenes, which"
+    echo "  only equals the actual training subset when training is also"
+    echo "  sorted-first-N. With RANDOM_SUBSET_SEED=$RANDOM_SUBSET_SEED set, the"
+    echo "  saved 'train' PLYs would NOT be from the model's actual training set."
+    echo "  Fix: unset RANDOM_SUBSET_SEED, or set TRAIN_VIS_SCENES=0."
+    echo "════════════════════════════════════════════════════════════════════════"
+    exit 1
+fi
+
+if [ "$POSITION_SCAFFOLD" = "True" ] && [ "$SCAFFOLD_MODE" = "hilbert_block" ] && [ "$MORTON_ORDER" != "True" ]; then
+    echo "WARNING: SCAFFOLD_MODE=hilbert_block WITHOUT MORTON_ORDER=True"
+fi
+
+if [ "$LOCAL_ENCODER" = "True" ] && [ "$MORTON_ORDER" != "True" ]; then
+    echo "WARNING: LOCAL_ENCODER=True WITHOUT MORTON_ORDER=True"
+fi
+
+_CP_CHECK=$(python3 -c "
+v = float('$CROP_PERCENTILE')
+if v <= 0 or v > 100:
+    raise ValueError(f'CROP_PERCENTILE must be in (0, 100], got {v}')
+print('ok')
+" 2>&1)
+if [ "$_CP_CHECK" != "ok" ]; then
+    echo "ERROR: CROP_PERCENTILE=$CROP_PERCENTILE is invalid: $_CP_CHECK"
+    exit 1
+fi
+
+ACTIVE_STRATEGY="C (baseline)"
+if [ "$LATENT_DISENTANGLE" = "True" ] && [ "$_any_B" = "false" ]; then
+    ACTIVE_STRATEGY="A — 16+496 in sequence"
+elif [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && [ "$DECODER_LAYOUT_ADDITIVE" = "True" ]; then
+    ACTIVE_STRATEGY="B3"
+elif [ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ]; then
+    ACTIVE_STRATEGY="B1"
+elif [ "$DECODER_LAYOUT_ADDITIVE" = "True" ]; then
+    ACTIVE_STRATEGY="B2"
+fi
+if [ "$LOCAL_DISENTANGLE" = "True" ]; then
+    ACTIVE_STRATEGY="LD — local z_g (512) + global z_s (16, cross-attn)"
+fi
+
+echo "========================================================================"
+echo "  CAN3TOK OVERFIT-DIAGNOSTIC — Strategy: $ACTIVE_STRATEGY"
+echo "  TRAIN_DATA=$TRAIN_DATA  TRAIN_SCENES=$TRAIN_SCENES  RANDOM_SUBSET_SEED=\"$RANDOM_SUBSET_SEED\""
+echo "  VAL_SCENES=$VAL_SCENES  CHUNK_VAL_SCENES=$CHUNK_VAL_SCENES  TRAIN_VIS_SCENES=$TRAIN_VIS_SCENES"
+echo "  Recon at every $RECON_PLY_FREQ epochs:"
+echo "    reconstructed_gaussians/         -- val full scenes (held-out, different distribution)"
+echo "    reconstructed_gaussians_chunk/   -- val held-out chunks (in-distribution, disjoint from training)"
+if [ "$TRAIN_VIS_SCENES" != "0" ]; then
+    echo "    reconstructed_gaussians_train/   -- TRAINING scenes (first $TRAIN_VIS_SCENES sorted; SAME as training)"
+    echo "    ground_truth_gaussians_train/    -- GT for the SAME training scenes (epoch 0 only, never overwritten)"
+fi
+if [ "$CANONICAL_VOXEL" = "True" ]; then
+    echo "  CANONICAL VOXEL: ON  R=$VOXEL_RES  snap=$VOXEL_SNAP"
+fi
+echo "========================================================================"
+echo ""
+
+# ============================================================================
+# ENVIRONMENT
 # ============================================================================
 
 module purge && module load 2023 && module load CUDA/12.1.1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
 export PYTHONUTF8=1
 export LC_ALL=C.UTF-8
 export LANG=C.UTF-8
@@ -55,43 +319,175 @@ export LANG=C.UTF-8
 cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
 mkdir -p logs_ss1 checkpoints_stage1
 
-export WANDB_API_KEY="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"
-wandb login $WANDB_API_KEY --relogin 2>/dev/null
+[ "$USE_WANDB" = "True" ] && wandb login $WANDB_API_KEY --relogin 2>/dev/null
 
-ACCEL=/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml
-# --morton_order --order_curve hilbert --order_frame_radius 10.0 \
-# --position_scaffold --anchor_loss_weight 1.0 --scaffold_mode hilbert_block \
-#  --token_local_decoder \
-# --local_encoder --local_window 1 \
-# ── single-process launch (1 GPU): avoids DDP entirely for the diagnostic ──
-accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
-  --train_data chunks \
-  --train_scenes 4 \
-  --chunk_val_scenes 4 \
-  --val_scenes 4 \
-  --batch_size 4 \
-  --num_epochs 4000 \
-  --eval_every 200 \
-  --num_gaussians 40000 \
-  --lr 2e-4 \
-  --kl_weight 0.0 \
-  --kl_anneal_steps 0 \
-  --weight_decay 0.0 \
-  --warmup_steps 50 \
-  --lr_min_ratio 1.0 \
-  --lr_restart_T0 0 \
-  --color_residual --mean_color_weight 0.5 --color_loss_weight 2.0 \
-  --scale_norm_mode linear \
-  --decoder_fourier_pe \
-  --recon_ply_freq 500 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
-  --pca_vis_freq 100000 \
-  --embed_dim 32 \
-  --no_preload \
-  --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC
+YAML_PATH="./model/configs/aligned_shape_latents/shapevae-256.yaml"
+if [ -f "$YAML_PATH" ]; then
+    POINT_FEATS=$(grep "point_feats:" "$YAML_PATH" | awk '{print $2}')
+    [ "$POINT_FEATS" != "11" ] && echo "ERROR: point_feats=$POINT_FEATS, expected 11" && exit 1
+fi
 
-echo "Exit: $?  |  End: $(date)"
+if [ "$TRAIN_DATA" = "chunks" ] || [ "$TRAIN_DATA" = "combined" ]; then
+    CHUNKS_DIR="/home/yli7/scratch/datasets/gaussian_world/preprocessed/interior_gs/train_grid1.0cm_chunk8x8_stride6x6"
+    _NF_COUNT=$(ls "$CHUNKS_DIR" | sort | head -50 | while read d; do
+        [ -f "$CHUNKS_DIR/$d/norm_factor.npy" ] && echo "ok"
+    done | wc -l)
+    if [ "$_NF_COUNT" -ne 50 ]; then
+        echo "ERROR: norm_factor.npy missing from some chunks!"
+        exit 1
+    fi
+fi
+
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+
+ACCELERATE_CONFIG="/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml"
+TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG gs_can3tok_2.py"
+
+TRAIN_CMD="$TRAIN_CMD --train_data $TRAIN_DATA"
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --num_gaussians $NUM_GAUSSIANS"
+if [ "$POS_COND_HEADS" = "1" ]; then
+    TRAIN_CMD="$TRAIN_CMD --pos_cond_heads --pos_cond_color $POS_COND_COLOR --pos_cond_rotation $POS_COND_ROTATION"
+    TRAIN_CMD="$TRAIN_CMD --pos_cond_sigma $POS_COND_SIGMA --pos_cond_pos_scale $POS_COND_POS_SCALE"
+fi
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE --kl_weight $KL_WEIGHT --kl_anneal_steps $KL_ANNEAL_STEPS"
+TRAIN_CMD="$TRAIN_CMD --weight_decay $WEIGHT_DECAY --warmup_steps $WARMUP_STEPS"
+TRAIN_CMD="$TRAIN_CMD --lr_min_ratio $LR_MIN_RATIO --lr_restart_T0 $LR_RESTART_T0 --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES --val_scenes $VAL_SCENES"
+[ -n "$CHUNK_VAL_SCENES" ] && TRAIN_CMD="$TRAIN_CMD --chunk_val_scenes $CHUNK_VAL_SCENES"
+# NEW: pass train-vis scene count to the python side.
+TRAIN_CMD="$TRAIN_CMD --train_vis_scenes $TRAIN_VIS_SCENES"
+TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+TRAIN_CMD="$TRAIN_CMD --sample_voxel_res $SAMPLE_VOXEL_RES"
+
+[ "$DECODER_LAYOUT_CROSS_ATTN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_cross_attn"
+[ "$DECODER_LAYOUT_ADDITIVE"   = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_layout_additive"
+
+[ "$LATENT_DISENTANGLE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --latent_disentangle"
+[ "$LOCAL_DISENTANGLE"  = "True" ] && TRAIN_CMD="$TRAIN_CMD --local_disentangle"
+TRAIN_CMD="$TRAIN_CMD --semantic_dims $SEMANTIC_DIMS"
+TRAIN_CMD="$TRAIN_CMD --cross_recon_weight $CROSS_RECON_WEIGHT --ortho_weight $ORTHO_WEIGHT"
+
+[ "$COLOR_RESIDUAL" = "True" ] && TRAIN_CMD="$TRAIN_CMD --color_residual"
+TRAIN_CMD="$TRAIN_CMD --mean_color_weight $MEAN_COLOR_WEIGHT --color_loss_weight $COLOR_LOSS_WEIGHT"
+
+[ "$SCENE_SEMANTIC_HEAD"      = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_semantic_head"
+TRAIN_CMD="$TRAIN_CMD --scene_semantic_weight $SCENE_SEMANTIC_WEIGHT"
+[ "$SCENE_LAYOUT_HEAD"        = "True" ] && TRAIN_CMD="$TRAIN_CMD --scene_layout_head"
+[ "$STRUCTURED_LAYOUT_TOKENS" = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_layout_tokens"
+TRAIN_CMD="$TRAIN_CMD --layout_loss_weight $LAYOUT_LOSS_WEIGHT"
+[ "$SEMANTIC_TOKEN_HEADS"     = "True" ] && TRAIN_CMD="$TRAIN_CMD --semantic_token_heads"
+
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_weight $ZS_POOL_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_pool_infonce_temperature $ZS_POOL_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_weight $ZS_LAYOUT_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_layout_infonce_temperature $ZS_LAYOUT_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --zs_token_infonce_weight $ZS_TOKEN_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --zs_token_infonce_temperature $ZS_TOKEN_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_weight $Z_S_INFONCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_temperature $Z_S_INFONCE_TEMPERATURE"
+TRAIN_CMD="$TRAIN_CMD --z_s_infonce_delta $Z_S_INFONCE_DELTA"
+
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
+TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
+TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --sampling_strategy $SAMPLING_STRATEGY"
+
+[ "$DECODER_POS_ENC"    = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_pos_enc"
+[ "$DECODER_FOURIER_PE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --decoder_fourier_pe"
+[ "$TOKEN_LOCAL_DECODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_local_decoder"
+[ "$TOKEN_LOCAL_SEPARATE_HEADS"    = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_local_separate_heads"
+[ "$TOKEN_LOCAL_HEAD_CROSS_STITCH" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_local_head_cross_stitch"
+
+[ "$POSITION_SCAFFOLD" = "True" ] && TRAIN_CMD="$TRAIN_CMD --position_scaffold --anchor_loss_weight $ANCHOR_LOSS_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scaffold_mode $SCAFFOLD_MODE"
+[ "$ANCHOR_RELATIVE_DECODE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_relative_decode --offset_scale_init $OFFSET_SCALE_INIT"
+[ "$ANCHOR_TEACHER_FORCE" = "True" ] && TRAIN_CMD="$TRAIN_CMD --anchor_teacher_force"
+[ "$STRUCTURED_LATENT" = "True" ] && TRAIN_CMD="$TRAIN_CMD --structured_latent"
+[ "$LOCAL_ENCODER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --local_encoder --local_window $LOCAL_WINDOW"
+
+[ "$TOKEN_COND"       = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond --token_cond_approach $TOKEN_COND_APPROACH"
+[ "$TOKEN_COND_ADALN" = "True" ] && TRAIN_CMD="$TRAIN_CMD --token_cond_adaln"
+
+TRAIN_CMD="$TRAIN_CMD --scale_penalty_weight $SCALE_PENALTY_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --scale_penalty_threshold $SCALE_PENALTY_THRESHOLD"
+
+TRAIN_CMD="$TRAIN_CMD --scale_norm_mode $SCALE_NORM_MODE"
+[ "$USE_CANONICAL_NORM"  = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_canonical_norm"
+[ "$CHUNK_NORM_FACTOR"   = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_chunk_norm_factor"
+
+TRAIN_CMD="$TRAIN_CMD --pca_vis_freq $PCA_VIS_FREQ --pca_num_scenes $PCA_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --pca_brightness $PCA_BRIGHTNESS"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_freq $RECON_PLY_FREQ --recon_ply_num_scenes $RECON_PLY_NUM_SCENES"
+TRAIN_CMD="$TRAIN_CMD --recon_ply_max_sh $RECON_PLY_MAX_SH"
+
+[ "$USE_WANDB" = "True" ] && TRAIN_CMD="$TRAIN_CMD --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC"
+
+[ -n "$RANDOM_SUBSET_SEED" ] && TRAIN_CMD="$TRAIN_CMD --random_subset_seed $RANDOM_SUBSET_SEED"
+
+TRAIN_CMD="$TRAIN_CMD --crop_percentile $CROP_PERCENTILE"
+
+[ "$MORTON_ORDER" = "True" ] && TRAIN_CMD="$TRAIN_CMD --morton_order"
+TRAIN_CMD="$TRAIN_CMD --order_curve $ORDER_CURVE"
+TRAIN_CMD="$TRAIN_CMD --order_frame_radius $ORDER_FRAME_RADIUS"
+
+[ "$CANONICAL_VOXEL" = "True" ] && TRAIN_CMD="$TRAIN_CMD --canonical_voxel --voxel_res $VOXEL_RES"
+[ "$VOXEL_SNAP" = "True" ] && TRAIN_CMD="$TRAIN_CMD --voxel_snap"
+
+[ -n "$EMBED_DIM" ] && TRAIN_CMD="$TRAIN_CMD --embed_dim $EMBED_DIM"
+
+[ "$AUG_YAW" = "True" ] && TRAIN_CMD="$TRAIN_CMD --aug_yaw --aug_yaw_axis $AUG_YAW_AXIS --aug_yaw_max_deg $AUG_YAW_MAX_DEG"
+
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume_checkpoint $RESUME_CHECKPOINT"
+    [ -n "$RESUME_EPOCH" ] && TRAIN_CMD="$TRAIN_CMD --resume_epoch $RESUME_EPOCH"
+fi
+
+[ -n "$EXTRA_TRAIN_PATHS"  ] && TRAIN_CMD="$TRAIN_CMD --extra_train_paths $EXTRA_TRAIN_PATHS"
+[ -n "$EXTRA_TRAIN_SCENES" ] && TRAIN_CMD="$TRAIN_CMD --extra_train_scenes $EXTRA_TRAIN_SCENES"
+[ "$PRELOAD" = "False" ] && TRAIN_CMD="$TRAIN_CMD --no_preload"
+
+echo "Command: $TRAIN_CMD"
 echo ""
-echo "WHAT TO LOOK AT:"
-echo "  1) Train 'Recon=' over epochs -- does it drive toward ~0 (memorizing) or plateau?"
-echo "  2) reconstructed_gaussians_chunk/epoch_XXXX/ PLY -- SHARP/oriented or blurry blob?"
-echo "  3) Compare to ground_truth_gaussians_chunk/ (saved at epoch 0, same chunk)."
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+SECONDS=0
+eval $TRAIN_CMD
+TRAIN_EXIT=$?
+echo ""
+echo "Exit: $TRAIN_EXIT  |  Duration: $((SECONDS/60))m $((SECONDS%60))s  |  End: $(date)"
+
+if [ $TRAIN_EXIT -eq 0 ]; then
+    echo ""
+    echo "COMPLETED. Strategy: $ACTIVE_STRATEGY | Train: $TRAIN_SCENES | TrainVis: $TRAIN_VIS_SCENES | Chunk val: $CHUNK_VAL_SCENES | Full val: $VAL_SCENES"
+    echo ""
+    echo "  Useful log greps:"
+    echo "  Best model              : grep 'NEW BEST' logs_ss1/can3tok_overfit_${SLURM_JOB_ID}.out | tail -5"
+    echo "  Val FULL scenes         : grep 'Val FULL SCENES'           logs_ss1/can3tok_overfit_${SLURM_JOB_ID}.out"
+    echo "  Val held-out chunks     : grep 'Val HELD-OUT CHUNKS'       logs_ss1/can3tok_overfit_${SLURM_JOB_ID}.out"
+    echo "  Train-set visualization : grep 'TRAIN-SET VISUALIZATION'   logs_ss1/can3tok_overfit_${SLURM_JOB_ID}.out"
+    echo "  Generalization gap      : grep 'GENERALIZATION GAP'        logs_ss1/can3tok_overfit_${SLURM_JOB_ID}.out"
+    echo "  Distribution gap        : grep 'DISTRIBUTION GAP'          logs_ss1/can3tok_overfit_${SLURM_JOB_ID}.out"
+    echo "  Train-vis subset check  : grep 'Train-vis subset verified' logs_ss1/can3tok_overfit_${SLURM_JOB_ID}.out"
+    echo ""
+    echo "  Reconstructed PLYs to compare scene-for-scene:"
+    echo "    reconstructed_gaussians/         + ground_truth_gaussians/         -- held-out full scenes"
+    echo "    reconstructed_gaussians_chunk/   + ground_truth_gaussians_chunk/   -- held-out chunks"
+    if [ "$TRAIN_VIS_SCENES" != "0" ]; then
+        echo "    reconstructed_gaussians_train/   + ground_truth_gaussians_train/   -- TRAINING scenes (NEW)"
+        echo "  Read each pair side-by-side: if the train/ folder shows a clean reconstruction"
+        echo "  but the chunk/ folder is poor, the model fits but does not generalize. If train/"
+        echo "  itself is poor, the bottleneck is upstream (gauge, capacity, sampling) -- not"
+        echo "  generalization."
+    fi
+else
+    echo "FAILED (exit $TRAIN_EXIT)"
+    echo "  Error log: cat logs_ss1/can3tok_overfit_${SLURM_JOB_ID}.err"
+fi

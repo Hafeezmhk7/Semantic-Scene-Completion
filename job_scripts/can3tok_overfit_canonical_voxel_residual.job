@@ -1,0 +1,165 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_overfit_canonical_voxel_residual
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=08:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=60G
+#SBATCH --output=logs_ss1/can3tok_overfit_canonical_voxel_residual_%j.out
+#SBATCH --error=logs_ss1/can3tok_overfit_canonical_voxel_residual_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# OVERFIT DIAGNOSTIC: CANONICAL VOXEL + RESIDUAL OFFSET (option beta)
+# ----------------------------------------------------------------------------
+# QUESTION: Does partial canonicalization (cell anchor + small learned offset)
+# give the benefits of identifiability without sacrificing sub-cell precision?
+#
+# THE STORY SO FAR: see can3tok_overfit_canonical_voxel_snap.job for the
+# full diagnostic chain. Five prior runs all collapsed to either isotropic
+# blobs or needles because per-slot shape is not a function of slot identity
+# across scenes. Canonical-voxel preprocessing fixes identifiability by making
+# slot k = canonical voxel cell k.
+#
+# THE TRADE-OFF THIS RUN EXPLORES:
+# The snap variant (option alpha) discards sub-cell precision -- positions
+# are exactly the cell centers, no further refinement. Reconstruction is lossy.
+# This run keeps the cell anchor (which provides the identifiability benefit)
+# but ADDS a learned small offset (which recovers sub-cell precision):
+#
+#     decoded_position = cell_center + offset_scale * tanh(predicted_offset)
+#
+# The bounded-tanh offset can't escape its cell, so positions stay roughly
+# canonicalized -- slot k still corresponds to a specific spatial region.
+# But the residual prediction reintroduces some per-slot variability into
+# the position target: across scenes, the same cell can have slightly
+# different sub-cell occupancy patterns.
+#
+# THE SCIENTIFIC QUESTION:
+# Is the IDENTIFIABILITY BENEFIT of canonical voxel preserved when we allow
+# residual offsets, or does the residual reintroduce enough per-slot noise
+# to break the conditional-mean identifiability?
+#
+# Two outcomes, each informative:
+#   * Residual variant succeeds (Pos/Scl/Rot drop, recon matches GT): partial
+#     canonicalization is enough; this is the practically-deployable approach
+#     because reconstruction is not lossy.
+#   * Residual variant fails but snap variant succeeds: the residual breaks
+#     identifiability, and snap is the only working approach (lossy but
+#     theoretically clean). Implications for thesis: discuss this as the
+#     fundamental fidelity-vs-identifiability trade-off.
+#
+# WIRING (uses existing flags):
+#   --canonical_voxel        : pad to num_gaussians with valid_mask
+#   --voxel_res 192          : same grid as the snap variant for direct comparison
+#   (NO --voxel_snap)        : keep the small sub-cell residual rather than snap
+#   --position_scaffold      : have the dataloader compute anchor + residual
+#   --anchor_relative_decode : decoder outputs anchor + offset_scale*tanh(offset),
+#                              so the position target is ABSOLUTE and the loss
+#                              grades the full decoded position.
+#   --scaffold_mode voxel    : anchors come from the canonical voxel cells (not
+#                              the Hilbert-block centroids used elsewhere).
+#
+# Same plain L2 objective as the snap variant. No sigma, no render. Direct
+# comparability is the whole point of running both.
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
+mkdir -p logs_ss1 checkpoints_stage1
+
+export WANDB_API_KEY="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"
+wandb login $WANDB_API_KEY --relogin 2>/dev/null
+
+ACCEL=/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml
+
+# ── single-process launch (1 GPU): no DDP for the diagnostic ─────────────────
+accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
+  --train_data chunks \
+  --train_scenes 4 \
+  --chunk_val_scenes 4 \
+  --val_scenes 4 \
+  --batch_size 4 \
+  --num_epochs 1000 \
+  --eval_every 100 \
+  --num_gaussians 40000 \
+  --lr 2e-4 \
+  --kl_weight 0.0 \
+  --kl_anneal_steps 0 \
+  --weight_decay 0.0 \
+  --warmup_steps 50 \
+  --lr_min_ratio 1.0 \
+  --morton_order --order_curve hilbert --order_frame_radius 10.0 \
+  --local_encoder --local_window 1 \
+  --token_local_decoder \
+  --canonical_voxel --voxel_res 192 \
+  --position_scaffold --scaffold_mode voxel \
+  --anchor_relative_decode \
+  --offset_scale_init 0.1 \
+  --lr_restart_T0 0 \
+  --color_residual --mean_color_weight 0.5 --color_loss_weight 2.0 \
+  --scale_norm_mode linear \
+  --decoder_fourier_pe \
+  --recon_ply_freq 100 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
+  --pca_vis_freq 100000 \
+  --embed_dim 32 \
+  --no_preload \
+  --anchor_loss_weight 1.0 \
+  --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC
+
+echo "Exit: $?  |  End: $(date)"
+echo ""
+echo "WHAT TO LOOK AT:"
+echo ""
+echo "  1. SIDE-BY-SIDE COMPARISON with the snap variant. This is the whole"
+echo "     point of running both:"
+echo "       diff <(grep 'Pos=\\|Scl=\\|Rot=' .../canonical_voxel_snap_${SLURM_JOB_ID}.out | tail -30) \\"
+echo "            <(grep 'Pos=\\|Scl=\\|Rot=' .../canonical_voxel_residual_${SLURM_JOB_ID}.out | tail -30)"
+echo "     Or simply read both .out files in parallel."
+echo ""
+echo "  2. RECONSTRUCTED PLYS at epoch 900:"
+echo "       reconstructed_gaussians_chunk/epoch_0900/scene*.ply"
+echo "     The residual variant should reconstruct positions MORE precisely"
+echo "     than snap (no cell-quantization). If Pos at convergence is lower"
+echo "     than the snap variant's Pos, the residual is doing its job."
+echo ""
+echo "  3. CRITICAL: SCALE AND ROTATION TRAJECTORY:"
+echo "       grep 'Scl=\\|Rot=' logs_ss1/can3tok_overfit_canonical_voxel_residual_${SLURM_JOB_ID}.out | tail -20"
+echo "     This is THE diagnostic. If Scl/Rot drop substantially (both well"
+echo "     below the ~700/~570 random-init floor that has been seen in all"
+echo "     non-canonical runs), the residual variant preserves identifiability"
+echo "     benefits and this is the working approach. If Scl/Rot plateau at"
+echo "     the random-init floor, the residual broke identifiability and the"
+echo "     snap variant is the only working approach."
+echo ""
+echo "  4. ANCHOR LOSS:"
+echo "       grep 'Anchor=' logs_ss1/can3tok_overfit_canonical_voxel_residual_${SLURM_JOB_ID}.out | tail -10"
+echo "     Should converge low (model is learning to predict canonical voxel"
+echo "     anchor positions accurately). If high, the scaffold path itself"
+echo "     has trouble and that's a separate issue."
+echo ""
+echo "  INTERPRETATION TABLE:"
+echo "    Both snap and residual succeed -> partial canonicalization is enough;"
+echo "                                       residual is the deployable version."
+echo "    Snap succeeds, residual fails    -> identifiability theory confirmed"
+echo "                                       at its strongest form; the residual"
+echo "                                       prediction reintroduces enough"
+echo "                                       per-slot noise to break it."
+echo "                                       Snap is the only working approach."
+echo "    Snap fails, residual succeeds    -> unexpected; would suggest the"
+echo "                                       offset prediction itself provides"
+echo "                                       useful inductive bias not present"
+echo "                                       in the snap-only formulation."
+echo "    Neither succeeds                  -> identifiability theory incomplete;"
+echo "                                       next move is set-level supervision"
+echo "                                       (Chamfer/Sinkhorn) or drop shape"
+echo "                                       from Stage-1 entirely."

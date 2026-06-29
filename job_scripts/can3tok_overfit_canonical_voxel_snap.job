@@ -1,0 +1,178 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_overfit_canonical_voxel_snap
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=08:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=60G
+#SBATCH --output=logs_ss1/can3tok_overfit_canonical_voxel_snap_%j.out
+#SBATCH --error=logs_ss1/can3tok_overfit_canonical_voxel_snap_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# OVERFIT DIAGNOSTIC: CANONICAL VOXEL SNAP (option alpha)
+# ----------------------------------------------------------------------------
+# QUESTION: Does fixing per-slot identifiability via canonical-voxel
+# preprocessing allow plain element-wise L2 to recover anisotropic 3DGS shape?
+#
+# THE STORY SO FAR (each row a separate overfit on the same 4 chunks):
+#   element-wise L2 on (s, q)     -> small isotropic dots
+#   --no_scale_rotation_loss      -> small isotropic dots (no shape gradient at all)
+#   --sigma_loss (Frobenius on Σ) -> small isotropic dots (gauge fix not enough)
+#   --render_loss (2 synth cams)  -> needle Gaussians + a few correct patches
+#   --sigma_loss + --render_loss  -> small isotropic blobs (pile-of-beads outcome)
+#
+# THE COMMON FAILURE ACROSS ALL FIVE: per-slot shape across scenes is not a
+# function of slot identity. The same Hilbert cell maps to different surfaces
+# in different scenes (wall in scene A, table corner in scene B, chair leg in
+# scene C), so the L2-optimal predictor averages over rotationally-broad
+# distribution and lands on the isotropic conditional mean. Render loss
+# avoids this trap but introduces its own (needles, from sparse cameras).
+# Combining them finds a non-isotropic non-needle middle ground that is
+# still not surface-aligned.
+#
+# THE HYPOTHESIS THIS RUN TESTS:
+# Per-slot supervision fails BECAUSE identifiability fails. If we fix
+# identifiability by canonicalizing position (slot k = canonical voxel cell k,
+# position = cell center), then the per-slot Σ distribution stops being
+# rotationally-broad: the same cell in scene A and scene B both contain surface
+# fragments at the same world location, with similar local orientations
+# (because all scenes are aligned to the canonical frame). The conditional
+# mean of per-cell Σ becomes the actual local surface orientation, not
+# isotropy. Plain element-wise L2 to this conditional mean should now succeed.
+#
+# THE CLEAN TEST:
+# Use plain L2 on the full 14 attributes. NO sigma loss, NO render loss. Any
+# success here can be attributed unambiguously to canonicalization, not to a
+# regularizer. If L2 alone succeeds: identifiability theory confirmed,
+# canonical voxel is the working approach.
+#
+# WHY voxel_snap=ON:
+# Snap ON: position = cell center, no residual. The model does NOT predict
+# position; it just needs to learn shape/color/opacity conditioned on which
+# cells are occupied. This is the strongest form of identifiability.
+# Reconstruction is lossy (sub-cell precision discarded), but the per-slot
+# supervision target becomes fully well-defined.
+#
+# WHY voxel_res=192:
+# At 192^3 cells over [-10, 10], cell side length ~0.1 units. For ~40k input
+# Gaussians, expected occupied cells ~22-30k (the rest get padded), so cell
+# occupancy carries meaningful information (multiple Gaussians per occupied
+# cell merge into one canonical Gaussian). At lower res (64) too lossy (~2k
+# real / 38k padding, GT becomes blobs). At higher res (256) too dense
+# (essentially 1:1 Gaussian-to-cell, no canonicalization benefit).
+#
+# DIRECT COMPARABILITY:
+# Same 4 chunks, same arch flags, same 1000 epochs as all prior diagnostics.
+# Only changes from the original L2 baseline are --canonical_voxel
+# --voxel_res 192 --voxel_snap. No new losses. The PLYs from this run are
+# directly comparable to all prior PLYs at matching epochs.
+#
+# WHAT TO EXPECT IF THE THEORY IS RIGHT:
+# Pos loss should drop sharply (positions are now snapped to cell centers,
+# essentially a lookup). Scl and Rot should ALSO drop meaningfully (not just
+# plateau) because the per-slot targets are now well-defined and L2 can
+# converge to them. Reconstructed PLYs should show ANISOTROPIC, SURFACE-
+# ALIGNED Gaussians at correct cell-snapped positions.
+#
+# WHAT TO EXPECT IF IT FAILS:
+# If Scl/Rot still plateau at high values (similar to the no_scale_rotation
+# baseline ~700 raw L2 floor), the conditional mean of per-cell Σ is still
+# approximately isotropic and identifiability is not the whole story. Next
+# move: try the residual variant (anchor + offset) for comparison, or move
+# to deeper fixes (Chamfer, drop shape from Stage-1).
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
+mkdir -p logs_ss1 checkpoints_stage1
+
+export WANDB_API_KEY="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"
+wandb login $WANDB_API_KEY --relogin 2>/dev/null
+
+ACCEL=/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml
+
+# ── single-process launch (1 GPU): no DDP for the diagnostic ─────────────────
+accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
+  --train_data chunks \
+  --train_scenes 4 \
+  --chunk_val_scenes 4 \
+  --val_scenes 4 \
+  --batch_size 4 \
+  --num_epochs 1000 \
+  --eval_every 100 \
+  --num_gaussians 40000 \
+  --lr 2e-4 \
+  --kl_weight 0.0 \
+  --kl_anneal_steps 0 \
+  --weight_decay 0.0 \
+  --warmup_steps 50 \
+  --lr_min_ratio 1.0 \
+  --morton_order --order_curve hilbert --order_frame_radius 10.0 \
+  --local_encoder --local_window 1 \
+  --token_local_decoder \
+  --canonical_voxel --voxel_res 256 --voxel_snap \
+  --lr_restart_T0 0 \
+  --color_residual --mean_color_weight 0.5 --color_loss_weight 2.0 \
+  --scale_norm_mode linear \
+  --decoder_fourier_pe \
+  --recon_ply_freq 100 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
+  --pca_vis_freq 100000 \
+  --embed_dim 32 \
+  --no_preload \
+  --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC
+
+echo "Exit: $?  |  End: $(date)"
+echo ""
+echo "WHAT TO LOOK AT (in order of importance):"
+echo ""
+echo "  1. GROUND-TRUTH PLYS at epoch 0 (canonical_voxel changes the targets!):"
+echo "       ls checkpoints_stage1/*_${SLURM_JOB_ID}_*/ground_truth_gaussians/"
+echo "     The GT itself is now cell-snapped Gaussians. If these look OK"
+echo "     (recognizable scene structure, anisotropic surfaces, not just"
+echo "     uniform dots), the canonicalization preserved enough information"
+echo "     to make the task solvable. If GT looks blobby/uniform, voxel_res"
+echo "     192 is too lossy and we should retry at 256."
+echo ""
+echo "  2. RECONSTRUCTED PLYS at epoch 900:"
+echo "       reconstructed_gaussians_chunk/epoch_0900/scene*.ply"
+echo "     Compare directly against the GT PLYs at the same scenes. If recon"
+echo "     matches GT (anisotropic, surface-aligned, correctly positioned),"
+echo "     identifiability theory CONFIRMED."
+echo ""
+echo "  3. PER-ATTRIBUTE LOSS TRAJECTORY:"
+echo "       grep 'Pos=\\|Scl=\\|Rot=' logs_ss1/can3tok_overfit_canonical_voxel_snap_${SLURM_JOB_ID}.out | tail -30"
+echo "     Under canonical_voxel + snap:"
+echo "       * Pos should drop FAST (positions are snapped, essentially a lookup)"
+echo "       * Scl should drop MEANINGFULLY (not plateau like prior runs at ~700)"
+echo "       * Rot should drop MEANINGFULLY (this is the key signal -- if it"
+echo "         plateaus at ~570 like every prior run, identifiability didn't"
+echo "         help and the theory is incomplete)"
+echo ""
+echo "  4. VAL METRICS at convergence:"
+echo "       grep 'Val FULL\\|Val HELD' logs_ss1/can3tok_overfit_canonical_voxel_snap_${SLURM_JOB_ID}.out -A2 | tail -30"
+echo "     Pos floor should be much lower than prior runs (was ~1000). Scl/Rot"
+echo "     should also be much lower."
+echo ""
+echo "  CRITICAL CHECK -- ROTATION LOSS:"
+echo "  Rot has been stuck around 570 in EVERY prior run (570.3 sigma-alone,"
+echo "  573.5 render-alone, 568.7 sigma+render). That floor IS the random-init"
+echo "  level. If canonical-voxel snap also leaves Rot at ~570, the model is"
+echo "  not learning rotation at all -- identifiability of position is not"
+echo "  enough to make rotation learnable, and the theory needs revision."
+echo "  Rot dropping below 400 would be the strongest evidence the theory works."
+echo ""
+echo "  Compare side-by-side with the residual variant:"
+echo "    sbatch can3tok_overfit_canonical_voxel_residual.job"
+echo "  Together they tell us whether full canonicalization (snap) is required"
+echo "  or whether partial canonicalization (cell anchor + small residual) is"
+echo "  enough -- the latter would be the practically-deployable version."

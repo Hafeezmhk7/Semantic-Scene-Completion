@@ -1,0 +1,145 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_overfit_sigma_loss
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=08:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=60G
+#SBATCH --output=logs_ss1/can3tok_overfit_sigma_loss_%j.out
+#SBATCH --error=logs_ss1/can3tok_overfit_sigma_loss_%j.err
+
+echo "Job ID: $SLURM_JOB_ID  |  Node: $SLURM_NODELIST  |  Start: $(date)"
+
+# ============================================================================
+# OVERFIT DIAGNOSTIC: GAUGE-INVARIANT SIGMA LOSS (falsifiability test)
+# ----------------------------------------------------------------------------
+# QUESTION: Does replacing element-wise L2 on (s, q) with the gauge-invariant
+# Frobenius norm on Sigma = R(q) * diag(s^2) * R(q)^T eliminate the small-
+# circular-Gaussian failure mode?
+#
+# HYPOTHESIS: The 3DGS factorisation Sigma = R(q)*diag(s^2)*R(q)^T is many-to-
+# one in (s, q): axis-permutation pairs (sigma*s, q*r_sigma), the +/-q double
+# cover, and S^1/S^3 fibres for degenerate scales all give the same Sigma. The
+# upstream 3DGS optimiser picks one orbit representative per slot essentially
+# at random. An element-wise L2 loss on (s, q) is then asked to regress against
+# a gauge-randomised target; the Bayes-optimal estimator is the orbit centroid,
+# which for typical anisotropic Sigma is isotropic in scale and degenerate in
+# rotation -- producing exactly the small spherical splats observed in renders.
+#
+# This run keeps the same setup as the no_scale_rotation overfit reference
+# (4 chunks, KL=0, local encoder + token-local decoder, Hilbert reordering,
+# embed_dim=32) but turns ON --sigma_loss instead of --no_scale_rotation_loss.
+# That way the runs are directly comparable.
+#
+# THE SIGNAL IS THE PLY RENDER, NOT THE TRAINING LOG NUMBERS.
+# Under --sigma_loss the Scl=... Rot=... numbers in the log are computed on
+# raw (s, q) outputs. Since the loss is gauge-INVARIANT, the model is free to
+# pick any orbit representative, so those per-attribute L2 magnitudes can grow
+# or oscillate even as the rendered Gaussians become correctly anisotropic.
+# Open the reconstructed PLYs at epochs 500/1000/1500 and look at SHAPES.
+#
+# READING THE RESULT:
+#   * Reconstructed Gaussians look ANISOTROPIC (elongated, oriented, not small
+#     circles) by epoch 500-1000:
+#       -> GAUGE DIAGNOSIS CONFIRMED. Run the same on full data (7K scenes)
+#          to verify it holds at scale; that becomes the thesis-level result.
+#
+#   * Reconstructed Gaussians stay circular/spherical at epoch 1500:
+#       -> Diagnosis is wrong (or this implementation is wrong). Look at the
+#          model.last_predicted_quat / scale outputs to check the magnitudes
+#          are reasonable; then move on to a render-loss test.
+#
+#   IGNORE training-log Pos/Col/Opa/Scl/Rot for any DIRECT comparison to the
+#   no_scale_rotation baseline numbers. Position and color stay comparable
+#   (same loss for those), but scl/rot are in a different loss space.
+# ============================================================================
+
+module purge && module load 2023 && module load CUDA/12.1.1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+export PYTHONUTF8=1
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+cd /home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion
+mkdir -p logs_ss1 checkpoints_stage1
+
+export WANDB_API_KEY="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"
+wandb login $WANDB_API_KEY --relogin 2>/dev/null
+
+ACCEL=/home/yli11/scratch-project/Hafeez_thesis/Semantic-Scene-Completion/job_scripts/accelerate_config.yaml
+
+# ── PATCH PRE-FLIGHT: refuse to launch if the patch wasn't applied ──────────
+# The sentinel is appended by apply_sigma_loss_patch.py at the very end of
+# gs_can3tok_2.py. If it's missing, --sigma_loss is not a known argument and
+# argparse will fail with an opaque error; check up front instead.
+if ! grep -q "SIGMA_LOSS_PATCH_APPLIED" gs_can3tok_2.py; then
+    echo "ERROR: SIGMA_LOSS_PATCH_APPLIED sentinel not found in gs_can3tok_2.py."
+    echo "       Run:  python apply_sigma_loss_patch.py"
+    echo "       Then resubmit this job."
+    exit 2
+fi
+echo "  Patch sentinel found in gs_can3tok_2.py -- proceeding."
+
+# ── single-process launch (1 GPU): no DDP for the diagnostic ────────────────
+accelerate launch --num_processes 1 --config_file $ACCEL gs_can3tok_2.py \
+  --train_data chunks \
+  --train_scenes 4 \
+  --chunk_val_scenes 4 \
+  --val_scenes 4 \
+  --batch_size 4 \
+  --num_epochs 2000 \
+  --eval_every 100 \
+  --num_gaussians 40000 \
+  --lr 2e-4 \
+  --kl_weight 0.0 \
+  --kl_anneal_steps 0 \
+  --weight_decay 0.0 \
+  --warmup_steps 50 \
+  --lr_min_ratio 1.0 \
+  --morton_order --order_curve hilbert --order_frame_radius 10.0 \
+  --local_encoder --local_window 1 \
+  --token_local_decoder \
+  --sigma_loss --sigma_weight 1.0 \
+  --lr_restart_T0 0 \
+  --color_residual --mean_color_weight 0.5 --color_loss_weight 2.0 \
+  --scale_norm_mode linear \
+  --decoder_fourier_pe \
+  --recon_ply_freq 100 --recon_ply_num_scenes 4 --recon_ply_max_sh 3 \
+  --pca_vis_freq 100000 \
+  --embed_dim 32 \
+  --no_preload \
+  --use_wandb --wandb_project Can3Tok-SceenSplat-7K --wandb_entity 3D-SSC
+
+echo "Exit: $?  |  End: $(date)"
+echo ""
+echo "WHAT TO LOOK AT:"
+echo "  * Reconstructed PLYs are the PRIMARY signal. Open these AND the GT pair:"
+echo "    reconstructed_gaussians_chunk/epoch_0500/scene*.ply"
+echo "    reconstructed_gaussians_chunk/epoch_1000/scene*.ply"
+echo "    reconstructed_gaussians_chunk/epoch_1500/scene*.ply"
+echo "    ground_truth_gaussians_chunk/scene*.ply  (GT, saved once)"
+echo ""
+echo "  * Look at the SHAPES of individual Gaussians under a 3DGS viewer (e.g."
+echo "    SuperSplat / SIBR). The diagnosis is CONFIRMED if by epoch ~1000 the"
+echo "    rendered Gaussians look elongated/oriented like the GT, not like"
+echo "    small spherical dots."
+echo ""
+echo "  * IGNORE the training-log Scl=... Rot=... numbers as a direct measure."
+echo "    They are computed on raw (s, q) outputs which are gauge-invariant"
+echo "    targets under --sigma_loss; the model can pick any orbit"
+echo "    representative, so those numbers may grow even when the renders are"
+echo "    correctly anisotropic. Pos/Col/Opa are still in the same loss space"
+echo "    and directly comparable to the no_scale_rotation baseline."
+echo ""
+echo "  Quick greps:"
+echo "    Patch active            : grep 'SIGMA LOSS' logs_ss1/can3tok_overfit_sigma_loss_${SLURM_JOB_ID}.out"
+echo "    Last train line         : tail -20 logs_ss1/can3tok_overfit_sigma_loss_${SLURM_JOB_ID}.out | grep -A1 'Epoch 1999'"
+echo "    Val full scenes (Pos/Col): grep 'Val FULL SCENES' logs_ss1/can3tok_overfit_sigma_loss_${SLURM_JOB_ID}.out"
+echo "    Val held-out chunks     : grep 'Val HELD-OUT CHUNKS' logs_ss1/can3tok_overfit_sigma_loss_${SLURM_JOB_ID}.out"
+echo ""
+echo "  If anisotropic Gaussians appear by epoch ~1000, scale up:"
+echo "    add --sigma_loss --sigma_weight 1.0 to your normal full-scale job"
+echo "    (the chunks+full mix at 7K scenes / 500 epochs) and rerun."
